@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "variant": "public",
+  "fail_closed": true,
+  "allowed_included_statuses": ["public-allowed"],
+  "documents": [
+    {"id":"synthetic-public","path":"knowledge/fixtures/public-synthetic.json","included":true,"redistribution_status":"public-allowed","license":"CC0-1.0","basis":"Original synthetic fixture dedicated to the public domain."}
+  ],
+  "source_inventory": [
+    {"id":"synthetic-private","included":false,"redistribution_status":"private-only","basis":"Synthetic fixture intentionally restricted to private build policy tests."},
+    {"id":"heidi-parenting-book","included":false,"redistribution_status":"private-only","basis":"Copyrighted source; no redistribution grant."},
+    {"id":"aap-parenting-book","included":false,"redistribution_status":"private-only","basis":"Copyrighted source; no redistribution grant."},
+    {"id":"iycf-model-chapter","included":false,"redistribution_status":"denied","basis":"No complete repo-local public redistribution determination."},
+    {"id":"who-newborn-recommendations","included":false,"redistribution_status":"denied","basis":"CC BY-NC-SA 3.0 IGO terms require product/license review."},
+    {"id":"cdc-milestones","included":false,"redistribution_status":"denied","basis":"No complete repo-local public redistribution determination."},
+    {"id":"nhc-immunization","included":false,"redistribution_status":"denied","basis":"No complete repo-local public redistribution determination."},
+    {"id":"who-growth-expanded-xlsx","included":false,"redistribution_status":"denied","basis":"Build input only; public bundling requires rights review."},
+    {"id":"legacy-vector-seed","included":false,"redistribution_status":"denied","basis":"Explicitly prohibited; contains copyrighted content and obsolete vectors."}
+  ]
+}

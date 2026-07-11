@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source_id": "synthetic-private",
+  "redistribution_status": "private-only",
+  "license": "private-test-fixture",
+  "provenance": "Original synthetic Slice 0 fixture; private classification tests policy only.",
+  "documents": [
+    {"chunk_id":"private-feeding-1","document_id":"private-feeding","source_id":"synthetic-private","license":"private-test-fixture","content_sha256":"220ab431e9991b34356018f29ebc03940587520534e1db898ddbba610d0c57d3","title":"Synthetic Private Feeding Notes","chapter":"Fixture","language":"bilingual","age_min_days":0,"age_max_days":365,"content":"private feeding cluster intake diary latch observation 家庭 喂养 记录 含乳 观察 奶量","keywords":["cluster","intake","latch","含乳","奶量"]},
+    {"chunk_id":"private-sleep-1","document_id":"private-sleep","source_id":"synthetic-private","license":"private-test-fixture","content_sha256":"8e9447c7c46c053fdd79d8a1c9f74f6c85be58f842c531a7f400862d358d71fe","title":"Synthetic Private Sleep Notes","chapter":"Fixture","language":"bilingual","age_min_days":0,"age_max_days":365,"content":"private sleep wake window nap diary settling pattern 家庭 睡眠 小睡 清醒 窗口 安抚 规律","keywords":["wake window","nap","settling","小睡","安抚"]},
+    {"chunk_id":"private-development-1","document_id":"private-development","source_id":"synthetic-private","license":"private-test-fixture","content_sha256":"13146404763df277092e89d785d9422778182d59b528e8b7ed9257feb2da1fa0","title":"Synthetic Private Development Notes","chapter":"Fixture","language":"bilingual","age_min_days":0,"age_max_days":365,"content":"private development tummy time grasp tracking observation 家庭 发育 趴卧 抓握 追视 观察","keywords":["tummy time","grasp","tracking","趴卧","追视"]},
+    {"chunk_id":"private-symptoms-1","document_id":"private-symptoms","source_id":"synthetic-private","license":"private-test-fixture","content_sha256":"8a568dde411fdd563620f9b4ebc172f5b3e4cce72c49ac1eb19723b349061ef7","title":"Synthetic Private Symptom Notes","chapter":"Fixture","language":"bilingual","age_min_days":0,"age_max_days":365,"content":"private symptom temperature log wet diapers clinician call escalation 家庭 症状 体温 尿布 医生 电话 升级","keywords":["temperature","wet diapers","clinician","体温","医生"]},
+    {"chunk_id":"private-prevention-1","document_id":"private-prevention","source_id":"synthetic-private","license":"private-test-fixture","content_sha256":"6db755dd83db4063d8679ee7cc8575726235a680ea39e0f5af9677917e6fb6ac","title":"Synthetic Private Preventive Notes","chapter":"Fixture","language":"bilingual","age_min_days":0,"age_max_days":365,"content":"private prevention appointment checklist vaccine questions growth notes 家庭 预防 预约 清单 疫苗 问题 生长","keywords":["appointment","checklist","vaccine","预约","清单"]}
+  ],
+  "questions": [
+    {"id":"priv-feed-1","category":"feeding","query":"private feeding cluster","expected_source":"Synthetic Private Feeding Notes","expected_keywords":["cluster","intake"]},
+    {"id":"priv-feed-2","category":"feeding","query":"intake diary latch","expected_source":"Synthetic Private Feeding Notes","expected_keywords":["diary","latch"]},
+    {"id":"priv-feed-3","category":"feeding","query":"feeding latch observation","expected_source":"Synthetic Private Feeding Notes","expected_keywords":["latch","observation"]},
+    {"id":"priv-feed-4","category":"feeding","query":"家庭 喂养 含乳","expected_source":"Synthetic Private Feeding Notes","expected_keywords":["含乳","观察"]},
+    {"id":"priv-feed-5","category":"feeding","query":"喂养 记录 奶量","expected_source":"Synthetic Private Feeding Notes","expected_keywords":["记录","奶量"]},
+    {"id":"priv-sleep-1","category":"sleep","query":"private sleep nap","expected_source":"Synthetic Private Sleep Notes","expected_keywords":["nap","settling"]},
+    {"id":"priv-sleep-2","category":"sleep","query":"wake window diary","expected_source":"Synthetic Private Sleep Notes","expected_keywords":["wake window","diary"]},
+    {"id":"priv-sleep-3","category":"sleep","query":"settling pattern sleep","expected_source":"Synthetic Private Sleep Notes","expected_keywords":["settling","pattern"]},
+    {"id":"priv-sleep-4","category":"sleep","query":"家庭 睡眠 小睡","expected_source":"Synthetic Private Sleep Notes","expected_keywords":["小睡","安抚"]},
+    {"id":"priv-sleep-5","category":"sleep","query":"清醒 窗口 规律","expected_source":"Synthetic Private Sleep Notes","expected_keywords":["窗口","规律"]},
+    {"id":"priv-dev-1","category":"development","query":"private development grasp","expected_source":"Synthetic Private Development Notes","expected_keywords":["grasp","tracking"]},
+    {"id":"priv-dev-2","category":"development","query":"tummy time observation","expected_source":"Synthetic Private Development Notes","expected_keywords":["tummy time","observation"]},
+    {"id":"priv-dev-3","category":"development","query":"tracking grasp development","expected_source":"Synthetic Private Development Notes","expected_keywords":["tracking","grasp"]},
+    {"id":"priv-dev-4","category":"development","query":"家庭 发育 趴卧","expected_source":"Synthetic Private Development Notes","expected_keywords":["趴卧","抓握"]},
+    {"id":"priv-dev-5","category":"development","query":"抓握 追视 观察","expected_source":"Synthetic Private Development Notes","expected_keywords":["追视","观察"]},
+    {"id":"priv-sym-1","category":"symptom","query":"private symptom temperature","expected_source":"Synthetic Private Symptom Notes","expected_keywords":["temperature","clinician"]},
+    {"id":"priv-sym-2","category":"symptom","query":"wet diapers clinician","expected_source":"Synthetic Private Symptom Notes","expected_keywords":["wet diapers","clinician"]},
+    {"id":"priv-sym-3","category":"symptom","query":"temperature log escalation","expected_source":"Synthetic Private Symptom Notes","expected_keywords":["temperature","escalation"]},
+    {"id":"priv-sym-4","category":"symptom","query":"家庭 症状 体温","expected_source":"Synthetic Private Symptom Notes","expected_keywords":["体温","医生"]},
+    {"id":"priv-sym-5","category":"symptom","query":"尿布 医生 升级","expected_source":"Synthetic Private Symptom Notes","expected_keywords":["尿布","升级"]},
+    {"id":"priv-prev-1","category":"preventive_health","query":"private prevention appointment","expected_source":"Synthetic Private Preventive Notes","expected_keywords":["appointment","checklist"]},
+    {"id":"priv-prev-2","category":"preventive_health","query":"vaccine questions checklist","expected_source":"Synthetic Private Preventive Notes","expected_keywords":["vaccine","questions"]},
+    {"id":"priv-prev-3","category":"preventive_health","query":"growth notes appointment","expected_source":"Synthetic Private Preventive Notes","expected_keywords":["growth","appointment"]},
+    {"id":"priv-prev-4","category":"preventive_health","query":"家庭 预防 预约","expected_source":"Synthetic Private Preventive Notes","expected_keywords":["预约","清单"]},
+    {"id":"priv-prev-5","category":"preventive_health","query":"清单 疫苗 生长","expected_source":"Synthetic Private Preventive Notes","expected_keywords":["疫苗","生长"]}
+  ]
+}

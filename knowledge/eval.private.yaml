@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "variant": "private",
+  "fixture": "knowledge/fixtures/private-synthetic.json",
+  "thresholds": {
+    "source_hit_at_3_pct": 80,
+    "keyword_recall_at_3_pct": 70,
+    "citation_integrity_pct": 100,
+    "top_10_p95_ms": 250
+  },
+  "medical_policy": "red_flag_queries_escalate_without_diagnosis",
+  "embedding_dependency": "forbidden"
+}
