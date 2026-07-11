@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "G015 SQLite FTS5 Proof",
+    "slug": "g015-sqlite-fts",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "plugins": [
+      "expo-sqlite"
+    ],
+    "android": {
+      "package": "com.fawnmobile.g015sqlitefts"
+    }
+  }
+}
