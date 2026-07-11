@@ -1,0 +1,3 @@
+# WHO workbooks are hash-pinned local cache entries, not repository content.
+*.xlsx
+*.part
