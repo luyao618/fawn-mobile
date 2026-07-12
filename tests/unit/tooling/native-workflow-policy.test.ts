@@ -49,6 +49,12 @@ const expectedShaInput = "${{ inputs.expected_sha }}";
 const exactStaticShaAssertion = `test "$(git rev-parse HEAD)" = "${exactHeadSha}"`;
 const exactChildShaAssertion = `test "$(git rev-parse HEAD)" = "${expectedShaInput}"`;
 const exactStaticCollector = `node tools/collect-ci-evidence.mjs --expected-sha "${exactHeadSha}" --platform host --flavor static --test-result pass --test-result-file .artifacts/test-results/static-gates.log --output .artifacts/static.json`;
+const whoProvisionStepName = "Populate hash-pinned WHO cache";
+const whoDownloadCommand = "PYTHONDONTWRITEBYTECODE=1 python3 tools/knowledge/download_who_sources.py";
+const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
+const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
+const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n";
+const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -303,6 +309,20 @@ function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
   assert.ok(typeof preflightRun === "string", "Preflight must have an enabled run script");
   assertPreflightSemanticPolicy(preflightRun);
 
+  const whoProvisionIndexes = steps.flatMap((step, index) => step.name === whoProvisionStepName ? [index] : []);
+  assert.equal(whoProvisionIndexes.length, 1, "Static job must contain exactly one named WHO cache provision step");
+  const whoProvisionIndex = whoProvisionIndexes[0];
+  const whoProvision = steps[whoProvisionIndex];
+  assert.equal(whoProvision.run, exactWhoProvisionScript, "WHO cache provision script must remain exact");
+  assert.equal(Object.hasOwn(whoProvision, "if"), false, "WHO cache provision step must not be conditionally disabled");
+  assert.equal(Object.hasOwn(whoProvision, "continue-on-error"), false, "WHO cache provision step must fail closed");
+  const nodeGateIndex = stepIndex(steps, (step) => step.run === "npm run test:node", "Node test gate");
+  const knowledgeGateIndex = stepIndex(steps, (step) => step.run === "npm run test:knowledge", "Knowledge test gate");
+  const slice0Index = stepIndex(steps, (step) => step.run === "npm run slice0", "Slice 0 gate");
+  assert.equal(whoProvisionIndex, nodeGateIndex + 1, "WHO cache provision must immediately follow the Node test gate");
+  assert.equal(knowledgeGateIndex, whoProvisionIndex + 1, "Knowledge tests must immediately follow WHO cache provision");
+  assert.ok(whoProvisionIndex < slice0Index, "WHO cache provision must precede Slice 0");
+
   let previousGateIndex = preflightIndex;
   for (const run of originalStaticGateRuns) {
     const gateIndex = stepIndex(steps, (step) => step.run === run, run);
@@ -314,6 +334,17 @@ function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
   const collectorIndex = stepIndex(steps, (step) => step.run === exactStaticCollector, "Static evidence collector");
   assert.ok(collectorIndex > previousGateIndex, "Static evidence must be collected after all original gates");
   assertArtifactName(steps, `static-evidence-${exactHeadSha}`);
+  const staticUploadIndexes = steps.flatMap((step, index) =>
+    typeof step.uses === "string" && step.uses.startsWith("actions/upload-artifact@") ? [index] : []
+  );
+  assert.equal(staticUploadIndexes.length, 1, "Static job must contain exactly one artifact upload");
+  const staticUpload = steps[staticUploadIndexes[0]];
+  assert.equal(staticUpload.uses, uploadArtifactAction, "Static evidence upload action must remain pinned");
+  assert.equal(staticUpload.with?.name, `static-evidence-${exactHeadSha}`, "Static evidence upload name must remain exact");
+  const staticUploadPath = staticUpload.with?.path;
+  assert.ok(typeof staticUploadPath === "string", "Static evidence upload path must be a string");
+  assert.doesNotMatch(staticUploadPath, forbiddenStaticUploadPath, "Static evidence upload must not include raw or generated WHO data");
+  assert.equal(staticUploadPath, exactStaticUploadPath, "Static evidence upload path must remain exactly the two approved files");
 
   for (const [jobName, workflowPath] of [["android-e2e", "./.github/workflows/e2e-android.yml"], ["ios-e2e", "./.github/workflows/e2e-ios.yml"]] as const) {
     const reusableJob = requiredJob(workflows.ci, jobName);
@@ -489,6 +520,27 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
   assert.ok(disabledStep);
   disabledStep.if = "${{ false }}";
   assert.throws(() => assertNativeWorkflowPolicy(disabledPreflight), /conditionally disabled/);
+
+  const missingOfflineVerification = structuredClone(workflows);
+  const missingOfflineStep = requiredSteps(requiredJob(missingOfflineVerification.ci, "static"), "static")
+    .find((step) => step.name === whoProvisionStepName);
+  assert.ok(missingOfflineStep && typeof missingOfflineStep.run === "string");
+  missingOfflineStep.run = missingOfflineStep.run.replace(`${whoOfflineVerificationCommand}\n`, "");
+  assert.throws(() => assertNativeWorkflowPolicy(missingOfflineVerification), /WHO cache provision script must remain exact/);
+
+  const disabledWhoProvision = structuredClone(workflows);
+  const disabledWhoStep = requiredSteps(requiredJob(disabledWhoProvision.ci, "static"), "static")
+    .find((step) => step.name === whoProvisionStepName);
+  assert.ok(disabledWhoStep);
+  disabledWhoStep.if = "${{ false }}";
+  assert.throws(() => assertNativeWorkflowPolicy(disabledWhoProvision), /WHO cache provision step must not be conditionally disabled/);
+
+  const rawWhoUpload = structuredClone(workflows);
+  const rawWhoUploadStep = requiredSteps(requiredJob(rawWhoUpload.ci, "static"), "static")
+    .find((step) => step.uses === uploadArtifactAction && step.with?.name === `static-evidence-${exactHeadSha}`);
+  assert.ok(rawWhoUploadStep?.with && typeof rawWhoUploadStep.with.path === "string");
+  rawWhoUploadStep.with.path += "knowledge/sources/who-growth/**\n";
+  assert.throws(() => assertNativeWorkflowPolicy(rawWhoUpload), /must not include raw or generated WHO data/);
 
   const camouflagedNdkSelector = structuredClone(workflows);
   const camouflagedPreflight = requiredSteps(requiredJob(camouflagedNdkSelector.ci, "static"), "static")

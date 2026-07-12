@@ -112,6 +112,10 @@ jobs:
       - run: npm run lint
       - run: npm test -- --runInBand
       - run: npm run test:node
+      - name: Populate hash-pinned WHO cache
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 tools/knowledge/download_who_sources.py
+          PYTHONDONTWRITEBYTECODE=1 python3 tools/knowledge/download_who_sources.py --offline
       - run: npm run test:knowledge
       - run: npm run test:config
       - run: npm run test:licenses
