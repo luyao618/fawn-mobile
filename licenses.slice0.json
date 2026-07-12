@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "direct_dependencies": [
+    {
+      "name": "expo",
+      "version": "57.0.4",
+      "license": "MIT",
+      "purpose": "Spike-only Expo runtime and expo/fetch transport",
+      "removal_path": "Delete spikes/model-transport after the production adapter is integrated.",
+      "maintenance_status": "active",
+      "platform_support": "Android and iOS runtime"
+    },
+    {
+      "name": "eventsource-parser",
+      "version": "3.1.0",
+      "license": "MIT",
+      "purpose": "Bounded SSE framing parser",
+      "removal_path": "Replace only inside the provider transport boundary while preserving fixtures.",
+      "maintenance_status": "active",
+      "platform_support": "Platform-independent JavaScript used on Android and iOS"
+    },
+    {
+      "name": "react",
+      "version": "19.2.3",
+      "license": "MIT",
+      "purpose": "Disposable proof harness rendering",
+      "removal_path": "Remove with the disposable Expo transport spike.",
+      "maintenance_status": "active",
+      "platform_support": "Android and iOS proof harness"
+    },
+    {
+      "name": "react-native",
+      "version": "0.86.0",
+      "license": "MIT",
+      "purpose": "Disposable proof harness native runtime",
+      "removal_path": "Remove with the disposable Expo transport spike.",
+      "maintenance_status": "active",
+      "platform_support": "Android and iOS proof harness native runtime"
+    }
+  ],
+  "development_dependencies": [
+    {
+      "name": "@types/node",
+      "version": "24.3.0",
+      "license": "MIT",
+      "maintenance_status": "active",
+      "platform_support": "Host-side Node.js tooling only; excluded from the mobile runtime",
+      "removal_path": "Remove when the repository no longer typechecks Node.js verification tools."
+    },
+    {
+      "name": "@types/react",
+      "version": "19.2.14",
+      "license": "MIT",
+      "maintenance_status": "active",
+      "platform_support": "Type declarations for the Android and iOS React proof harness",
+      "removal_path": "Remove with the disposable Expo transport spike."
+    },
+    {
+      "name": "tsx",
+      "version": "4.20.5",
+      "license": "MIT",
+      "maintenance_status": "active",
+      "platform_support": "Host-side test and mock tooling on supported Node.js platforms",
+      "removal_path": "Replace the TypeScript execution scripts with compiled JavaScript before removal."
+    },
+    {
+      "name": "typescript",
+      "version": "5.9.3",
+      "license": "Apache-2.0",
+      "maintenance_status": "active",
+      "platform_support": "Host-side static analysis for shared and Android/iOS proof sources",
+      "removal_path": "Remove only after an equivalent static typecheck replaces it."
+    }
+  ],
+  "audit_policy": {
+    "fail_levels": [
+      "high",
+      "critical"
+    ],
+    "documented_moderate": "Expo 57.0.4 inherits ten moderate CLI/config/xcode/uuid advisories. npm proposes an unsafe downgrade to Expo 46.0.21; force-downgrade is rejected because the frozen runtime is Expo 57.0.4."
+  },
+  "excluded": [
+    {
+      "name": "expo-sqlite",
+      "reason": "G015 is already merged and is intentionally outside the G017 transport package."
+    },
+    {
+      "name": "@noble/hashes",
+      "reason": "G016 is already merged and is intentionally outside the G017 transport package."
+    },
+    {
+      "name": "@noble/ciphers",
+      "reason": "G016 is already merged and is intentionally outside the G017 transport package."
+    },
+    {
+      "name": "openai",
+      "reason": "V1 uses a narrow Chat Completions adapter over expo/fetch, not a provider SDK."
+    }
+  ]
+}

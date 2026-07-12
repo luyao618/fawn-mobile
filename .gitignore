@@ -1,0 +1,9 @@
+node_modules/
+.expo/
+coverage/
+*.log
+spikes/model-transport/android/
+spikes/model-transport/ios/
+spikes/model-transport/.expo-export/
+spikes/sqlite-fts/*.db
+knowledge/generated/
