@@ -1,0 +1,11 @@
+{
+  "contract_id": "for-mobile-fmbk-v1",
+  "passphrase_utf8": "for-mobile-vector-1",
+  "salt_hex": "000102030405060708090a0b0c0d0e0f",
+  "nonce_prefix_hex": "1011121314151617",
+  "derived_key_hex": "176127f861b5ece1d97ecea67a17e176cc0fe3f4ed378fee6950fef8f50ee561",
+  "plaintext_length": 383,
+  "plaintext_sha256": "97008c5408e25cedaf61233947179163b11f348af8a703015a3a3c0f23798ec6",
+  "archive_length": 790,
+  "archive_sha256": "231f64bf4045b430ca0de6c18b215f9a4414293683021528c411ae85d0010231"
+}

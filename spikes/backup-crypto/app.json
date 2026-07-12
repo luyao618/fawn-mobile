@@ -1,0 +1,34 @@
+{
+  "expo": {
+    "name": "G016 FMBK Crypto Proof",
+    "slug": "g016-backup-crypto",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "bundleIdentifier": "com.fawnmobile.g016backupcrypto",
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "com.fawnmobile.g016backupcrypto"
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "16.4"
+          },
+          "useHermesV1": true
+        }
+      ],
+      "react-native-quick-crypto"
+    ],
+    "extra": {
+      "g016BuildContract": {
+        "jsEngine": "hermes",
+        "newArchEnabled": true
+      }
+    }
+  }
+}
