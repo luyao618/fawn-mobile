@@ -1,0 +1,30 @@
+{
+  "name": "@fawn-mobile/slice0-device-proof",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.ts",
+  "expo": {
+    "install": {
+      "exclude": ["typescript"]
+    }
+  },
+  "scripts": {
+    "start": "expo start",
+    "ios": "expo run:ios",
+    "android": "expo run:android",
+    "typecheck": "tsc --noEmit",
+    "export:android": "node ../../tools/export-g017.mjs android",
+    "export:ios": "node ../../tools/export-g017.mjs ios"
+  },
+  "dependencies": {
+    "eventsource-parser": "3.1.0",
+    "expo": "57.0.4",
+    "react": "19.2.3",
+    "react-native": "0.86.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "typescript": "5.9.3"
+  }
+}

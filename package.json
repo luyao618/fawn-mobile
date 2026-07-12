@@ -1,0 +1,36 @@
+{
+  "name": "fawn-mobile-slice-0",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "spikes/model-transport"
+  ],
+  "engines": {
+    "node": ">=22.18.0",
+    "npm": ">=10.9.3"
+  },
+  "scripts": {
+    "slice0": "node tools/run-slice0.mjs",
+    "mock:provider": "tsx tools/start-mock-provider.mts",
+    "test:node": "tsx --test tests/unit/model/*.test.ts tests/unit/backup/*.test.ts tests/unit/tooling/*.test.ts spikes/sqlite-fts/*.test.ts",
+    "test:g017": "tsx --test tests/unit/model/*.test.ts tests/unit/tooling/*.test.ts",
+    "test:knowledge": "python3 -m unittest discover -s tools/knowledge/tests -p 'test_*.py'",
+    "test:fts": "python3 spikes/sqlite-fts/benchmark.py --all",
+    "test:licenses": "node tools/check-licenses.mjs",
+    "test:audit": "node tools/check-audit.mjs",
+    "typecheck": "node tools/run-typecheck.mjs",
+    "expo:doctor": "node tools/run-expo-doctor-isolated.mjs",
+    "g017:install": "cd spikes/model-transport && npm ci --workspaces=false",
+    "g017:export:android": "npm --prefix spikes/model-transport run export:android",
+    "g017:export:ios": "npm --prefix spikes/model-transport run export:ios",
+    "spike:ios": "npm --workspace @fawn-mobile/slice0-device-proof run ios",
+    "spike:android": "npm --workspace @fawn-mobile/slice0-device-proof run android"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "@types/react": "19.2.14",
+    "tsx": "4.20.5",
+    "typescript": "5.9.3"
+  }
+}

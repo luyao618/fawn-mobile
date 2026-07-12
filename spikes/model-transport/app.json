@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "Fawn G017 Transport Proof",
+    "slug": "fawn-g017-transport-proof",
+    "version": "0.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "bundleIdentifier": "com.luyao618.fawn.g017transportproof",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "package": "com.luyao618.fawn.g017transportproof"
+    },
+    "plugins": ["./plugins/withLocalMockNetwork.cjs"]
+  }
+}
