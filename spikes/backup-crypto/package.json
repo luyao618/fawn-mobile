@@ -1,0 +1,36 @@
+{
+  "name": "@fawn-mobile/g016-backup-crypto",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android --device fawn_pixel_api33",
+    "ios": "expo run:ios",
+    "test": "node --import tsx --test ../../tests/unit/backup/fmbk-and-recovery.test.ts ../../tests/unit/backup/g016-proof-and-validator.test.ts",
+    "typecheck": "tsc --noEmit",
+    "doctor": "expo-doctor",
+    "export:android": "expo export --platform android",
+    "export:ios": "expo export --platform ios",
+    "validate:device-evidence": "node deviceEvidenceValidator.mjs",
+    "check:licenses": "node licenseCheck.mjs"
+  },
+  "dependencies": {
+    "expo": "57.0.4",
+    "expo-build-properties": "57.0.3",
+    "expo-crypto": "57.0.0",
+    "react": "19.2.3",
+    "react-native": "0.86.0",
+    "react-native-nitro-modules": "0.36.1",
+    "react-native-quick-base64": "3.0.1",
+    "react-native-quick-crypto": "1.1.6"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "@types/react": "19.2.14",
+    "expo-doctor": "1.20.0",
+    "tsx": "4.20.5",
+    "typescript": "6.0.3"
+  }
+}

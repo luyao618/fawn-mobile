@@ -1,0 +1,15 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "types": ["node", "react"]
+  },
+  "include": [
+    "*.ts",
+    "*.tsx",
+    "../../tests/support/nodeCryptoPort.ts",
+    "../../tests/unit/backup/fmbk-and-recovery.test.ts",
+    "../../tests/unit/backup/g016-proof-and-validator.test.ts"
+  ]
+}
