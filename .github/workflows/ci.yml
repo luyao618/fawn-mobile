@@ -11,13 +11,98 @@ permissions:
 
 jobs:
   static:
-    runs-on: ubuntu-latest
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22.18.0
           cache: npm
+      - name: Preflight frozen native tooling
+        run: |
+          set -euo pipefail
+          host_os="$(uname -s)"
+          host_arch="$(uname -m)"
+          if [[ "$host_os" != "Darwin" || "$host_arch" != "x86_64" ]]; then
+            printf 'Unsupported static runner: %s/%s; expected Darwin/x86_64\n' "$host_os" "$host_arch" >&2
+            exit 1
+          fi
+
+          node - <<'NODE'
+          const { accessSync, constants, readdirSync } = require("node:fs");
+          const { homedir } = require("node:os");
+          const { join } = require("node:path");
+
+          const sdk = process.env.ANDROID_HOME ?? process.env.ANDROID_SDK_ROOT ?? join(homedir(), "Library/Android/sdk");
+          const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];
+          const buildTools = readdirSync(join(sdk, "build-tools")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];
+          const platform = readdirSync(join(sdk, "platforms")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];
+          if (ndk === undefined || buildTools === undefined || platform === undefined) {
+            console.error(`Android SDK selection failed: ndk=${ndk ?? "missing"}, build-tools=${buildTools ?? "missing"}, platform=${platform ?? "missing"}`);
+            process.exit(1);
+          }
+
+          const toolchainBin = join(sdk, "ndk", ndk, "toolchains/llvm/prebuilt/darwin-x86_64/bin");
+          const executableTools = [
+            join(toolchainBin, "aarch64-linux-android35-clang"),
+            join(toolchainBin, "aarch64-linux-android35-clang++"),
+            join(toolchainBin, "llvm-nm"),
+            join(toolchainBin, "llvm-readelf"),
+            join(sdk, "build-tools", buildTools, "aapt"),
+            join(sdk, "build-tools", buildTools, "zipalign"),
+            join(sdk, "build-tools", buildTools, "apksigner"),
+            join(sdk, "cmdline-tools", "latest", "bin", "apkanalyzer"),
+          ];
+          for (const tool of executableTools) {
+            try {
+              accessSync(tool, constants.X_OK);
+            } catch {
+              console.error(`Required Android executable is unavailable: ${tool}`);
+              process.exit(1);
+            }
+          }
+
+          const androidJar = join(sdk, "platforms", platform, "android.jar");
+          try {
+            accessSync(androidJar, constants.R_OK);
+          } catch {
+            console.error(`Selected Android platform jar is unreadable: ${androidJar}`);
+            process.exit(1);
+          }
+          console.log(`Android preflight passed: SDK=${sdk || "<empty>"}, NDK=${ndk}, build-tools=${buildTools}, platform=${platform}`);
+          NODE
+
+          required_tools=(
+            "/usr/bin/xcrun"
+            "/usr/bin/codesign"
+            "/usr/bin/keytool"
+            "/usr/bin/zip"
+            "/usr/bin/unzip"
+            "/usr/bin/nm"
+            "/usr/bin/lipo"
+            "/usr/bin/otool"
+            "/usr/bin/zipinfo"
+            "/usr/bin/plutil"
+          )
+          for tool in "${required_tools[@]}"; do
+            if [[ ! -x "$tool" ]]; then
+              printf 'Required executable is unavailable: %s\n' "$tool" >&2
+              exit 1
+            fi
+          done
+
+          simulator_clang=$(/usr/bin/xcrun --sdk iphonesimulator --find clang)
+          simulator_clangxx=$(/usr/bin/xcrun --sdk iphonesimulator --find clang++)
+          for compiler in "$simulator_clang" "$simulator_clangxx"; do
+            if [[ ! -x "$compiler" ]]; then
+              printf 'iPhone Simulator compiler is unavailable: %s\n' "$compiler" >&2
+              exit 1
+            fi
+          done
+          printf 'Static preflight passed: %s/%s, Node %s, simulator compilers resolved\n' "$host_os" "$host_arch" "$(node --version)"
       - run: npm ci --workspaces --include-workspace-root
       - run: npm --prefix spikes/sqlite-fts ci --ignore-scripts --workspaces=false
       - run: npm --prefix spikes/backup-crypto ci --ignore-scripts --workspaces=false
@@ -45,10 +130,10 @@ jobs:
         run: |
           mkdir -p .artifacts/test-results
           printf 'static gates passed for %s\n' "$(git rev-parse HEAD)" > .artifacts/test-results/static-gates.log
-      - run: node tools/collect-ci-evidence.mjs --expected-sha "${{ github.sha }}" --platform host --flavor static --test-result pass --test-result-file .artifacts/test-results/static-gates.log --output .artifacts/static.json
+      - run: node tools/collect-ci-evidence.mjs --expected-sha "${{ github.event.pull_request.head.sha || github.sha }}" --platform host --flavor static --test-result pass --test-result-file .artifacts/test-results/static-gates.log --output .artifacts/static.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: static-evidence-${{ github.sha }}
+          name: static-evidence-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             .artifacts/static.json
             .artifacts/test-results/static-gates.log
@@ -58,10 +143,10 @@ jobs:
     needs: static
     uses: ./.github/workflows/e2e-android.yml
     with:
-      expected_sha: ${{ github.sha }}
+      expected_sha: ${{ github.event.pull_request.head.sha || github.sha }}
 
   ios-e2e:
     needs: static
     uses: ./.github/workflows/e2e-ios.yml
     with:
-      expected_sha: ${{ github.sha }}
+      expected_sha: ${{ github.event.pull_request.head.sha || github.sha }}
