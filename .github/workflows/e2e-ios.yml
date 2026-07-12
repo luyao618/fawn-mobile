@@ -13,6 +13,8 @@ permissions:
 jobs:
   ios:
     runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -22,6 +24,26 @@ jobs:
           node-version: 22.18.0
           cache: npm
       - run: test "$(git rev-parse HEAD)" = "${{ inputs.expected_sha }}"
+      - name: Preflight pinned Xcode and Swift
+        run: |
+          set -euo pipefail
+          test "$DEVELOPER_DIR" = "/Applications/Xcode_26.3.app/Contents/Developer"
+          test -d "$DEVELOPER_DIR"
+          xcode_version=$(/usr/bin/xcodebuild -version)
+          printf '%s\n' "$xcode_version"
+          test "$(printf '%s\n' "$xcode_version" | sed -n '1p')" = "Xcode 26.3"
+          swift_version=$(/usr/bin/xcrun swift --version)
+          printf '%s\n' "$swift_version"
+          SWIFT_VERSION="$swift_version" node - <<'NODE'
+          const match = /^Apple Swift version (\d+)\.(\d+)(?:\.\d+)?/m.exec(process.env.SWIFT_VERSION ?? "");
+          if (match === null) throw new Error("Unable to parse Apple Swift version");
+          const major = Number(match[1]);
+          const minor = Number(match[2]);
+          if (major < 6 || (major === 6 && minor < 2)) {
+            throw new Error("Apple Swift 6.2 or newer is required; found " + major + "." + minor);
+          }
+          console.log("Apple Swift preflight passed: " + major + "." + minor);
+          NODE
       - run: npm ci --workspaces --include-workspace-root
       - name: Install pinned Maestro
         run: |
@@ -56,7 +78,7 @@ jobs:
             Booted) ;;
             *) echo "Unexpected simulator state: $simulator_state" >&2; exit 1 ;;
           esac
-          open -a Simulator --args -CurrentDeviceUDID "$simulator_udid"
+          open "$DEVELOPER_DIR/Applications/Simulator.app" --args -CurrentDeviceUDID "$simulator_udid"
           xcrun simctl bootstatus "$simulator_udid" -b
 
           npm run prebuild:ios:production
@@ -75,7 +97,7 @@ jobs:
           app_path=$(find /tmp/g018-ios-e2e/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' -print -quit)
           test -n "$app_path"
           xcrun simctl install "$simulator_udid" "$app_path"
-          REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e CI=1 npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &
+          CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &
           metro_pid=$!
           trap 'kill "$metro_pid" 2>/dev/null || true; cat /tmp/metro.log' EXIT
           for attempt in $(seq 1 60); do curl --silent --fail http://127.0.0.1:8081/status >/dev/null && break; sleep 2; done
@@ -83,6 +105,7 @@ jobs:
           dev_client_url='formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081'
           printf 'device=%s\nurl=%s\n' "$simulator_udid" "$dev_client_url" | tee .artifacts/launch/ios-dev-client.log
           xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log
+          maestro --device "$simulator_udid" test e2e/maestro/ios-open-confirmation.yaml 2>&1 | tee .artifacts/launch/ios-open-confirmation.log
           maestro --device "$simulator_udid" test e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/launch/ios-readiness.log
           maestro --device "$simulator_udid" test e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log
           mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log

@@ -24,6 +24,7 @@ type WorkflowStep = {
 
 type WorkflowJob = {
   "runs-on"?: unknown;
+  env?: Record<string, unknown>;
   needs?: unknown;
   uses?: unknown;
   with?: Record<string, unknown>;
@@ -48,6 +49,28 @@ const exactHeadSha = "${{ github.event.pull_request.head.sha || github.sha }}";
 const expectedShaInput = "${{ inputs.expected_sha }}";
 const exactStaticShaAssertion = `test "$(git rev-parse HEAD)" = "${exactHeadSha}"`;
 const exactChildShaAssertion = `test "$(git rev-parse HEAD)" = "${expectedShaInput}"`;
+const iosDeveloperDir = "/Applications/Xcode_26.3.app/Contents/Developer";
+const iosPreflightStepName = "Preflight pinned Xcode and Swift";
+const exactIosJobEnv = { DEVELOPER_DIR: iosDeveloperDir };
+const exactIosPreflightScript = String.raw`set -euo pipefail
+test "$DEVELOPER_DIR" = "/Applications/Xcode_26.3.app/Contents/Developer"
+test -d "$DEVELOPER_DIR"
+xcode_version=$(/usr/bin/xcodebuild -version)
+printf '%s\n' "$xcode_version"
+test "$(printf '%s\n' "$xcode_version" | sed -n '1p')" = "Xcode 26.3"
+swift_version=$(/usr/bin/xcrun swift --version)
+printf '%s\n' "$swift_version"
+SWIFT_VERSION="$swift_version" node - <<'NODE'
+const match = /^Apple Swift version (\d+)\.(\d+)(?:\.\d+)?/m.exec(process.env.SWIFT_VERSION ?? "");
+if (match === null) throw new Error("Unable to parse Apple Swift version");
+const major = Number(match[1]);
+const minor = Number(match[2]);
+if (major < 6 || (major === 6 && minor < 2)) {
+  throw new Error("Apple Swift 6.2 or newer is required; found " + major + "." + minor);
+}
+console.log("Apple Swift preflight passed: " + major + "." + minor);
+NODE
+`;
 const exactStaticCollector = `node tools/collect-ci-evidence.mjs --expected-sha "${exactHeadSha}" --platform host --flavor static --test-result pass --test-result-file .artifacts/test-results/static-gates.log --output .artifacts/static.json`;
 const whoProvisionStepName = "Populate hash-pinned WHO cache";
 const whoDownloadCommand = "PYTHONDONTWRITEBYTECODE=1 python3 tools/knowledge/download_who_sources.py";
@@ -273,6 +296,18 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
   const assertionIndex = stepIndex(steps, (step) => step.run === exactChildShaAssertion, `${jobName} SHA assertion`);
   const installIndex = stepIndex(steps, (step) => step.run === "npm ci --workspaces --include-workspace-root", `${jobName} npm install`);
   assert.ok(checkoutIndex < assertionIndex && assertionIndex < installIndex, `${jobName} must assert the checked-out SHA before install`);
+  if (jobName === "ios") {
+    assert.deepEqual(job.env, exactIosJobEnv, "iOS job environment must remain exactly pinned to Xcode 26.3");
+    const preflightIndexes = steps.flatMap((step, index) => step.name === iosPreflightStepName ? [index] : []);
+    assert.equal(preflightIndexes.length, 1, "iOS must contain exactly one pinned Xcode and Swift preflight");
+    const preflightIndex = preflightIndexes[0];
+    const preflight = steps[preflightIndex];
+    assert.equal(preflightIndex, assertionIndex + 1, "iOS toolchain preflight must immediately follow the SHA assertion");
+    assert.equal(installIndex, preflightIndex + 1, "iOS install must immediately follow the toolchain preflight");
+    assert.equal(preflight.run, exactIosPreflightScript, "iOS Xcode and Swift preflight must remain exact");
+    assert.equal(Object.hasOwn(preflight, "if"), false, "iOS toolchain preflight must not be conditional");
+    assert.equal(Object.hasOwn(preflight, "continue-on-error"), false, "iOS toolchain preflight must fail closed");
+  }
 
   const collectorIndexes = steps.flatMap((step, index) => step.name === "Collect same-SHA evidence" ? [index] : []);
   assert.equal(collectorIndexes.length, 1, `${jobName} must contain exactly one same-SHA evidence collector`);
@@ -382,8 +417,28 @@ function parsePinnedActionScript(rawScript: string) {
 }
 
 const encodedDevClientUrl = "formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081";
+type NativePlatform = "Android" | "iOS";
+
+const exactHeadlessMetroCommand = "CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &";
+const iosOpenConfirmationFlow = "e2e/maestro/ios-open-confirmation.yaml";
 const readinessFlow = "e2e/maestro/shell-readiness.yaml";
 const smokeFlow = "e2e/maestro/shell-smoke.yaml";
+const exactReadinessCommands: Record<NativePlatform, string> = {
+  Android: `maestro --device "$emulator_serial" test ${readinessFlow} 2>&1 | tee .artifacts/launch/android-readiness.log`,
+  iOS: `maestro --device "$simulator_udid" test ${readinessFlow} 2>&1 | tee .artifacts/launch/ios-readiness.log`,
+};
+const exactPinnedSimulatorOpenLine = 'open "$DEVELOPER_DIR/Applications/Simulator.app" --args -CurrentDeviceUDID "$simulator_udid"';
+
+const exactIosOpenConfirmationFlow = `appId: com.luyao618.formobile
+---
+- tapOn:
+    text: "Open"
+    label: "Open For Mobile from the first-use system dialog"
+    optional: true
+- extendedWaitUntil:
+    visible: "照护空间尚未设置"
+    timeout: 120000
+`;
 
 const exactReadinessFlow = `appId: com.luyao618.formobile
 ---
@@ -408,6 +463,37 @@ const exactSmokeFlow = `appId: com.luyao618.formobile
 - assertVisible: "照护空间尚未设置"
 `;
 
+function assertExactHeadlessMetroLaunch(script: string, platform: NativePlatform): void {
+  const launchLines = script.split("\n").filter((line) => line.includes("expo start"));
+  assert.deepEqual(
+    launchLines,
+    [exactHeadlessMetroCommand],
+    `${platform} Metro launch must remain the exact loopback-only fail-closed headless command`,
+  );
+}
+
+function assertExactReadinessCommand(script: string, platform: NativePlatform): void {
+  const readinessLines = script.split("\n").filter((line) => line.includes(readinessFlow));
+  assert.deepEqual(
+    readinessLines,
+    [exactReadinessCommands[platform]],
+    `${platform} readiness must appear exactly once as the exact fail-closed command`,
+  );
+}
+
+function assertExactPinnedSimulatorOpen(script: string): void {
+  const simulatorOpenLines = script.split("\n").filter((line) => line.includes("-CurrentDeviceUDID"));
+  assert.deepEqual(
+    simulatorOpenLines,
+    [exactPinnedSimulatorOpenLine],
+    "iOS must open the pinned Xcode Simulator app on the exact selected UDID",
+  );
+}
+
+function assertIosOpenConfirmationFlow(flow: string): void {
+  assert.equal(flow, exactIosOpenConfirmationFlow, "iOS open-confirmation flow bytes must remain exact");
+}
+
 test("pinned Android action receives exactly one Bash command and the runner is valid ordered Bash", async () => {
   const [workflow, runner] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
@@ -417,17 +503,19 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assert.deepEqual(commands, ["bash scripts/e2e/run-android-emulator.sh"]);
   assert.equal(spawnSync("bash", ["-n", "scripts/e2e/run-android-emulator.sh"]).status, 0);
   assert.match(runner, /^#!\/usr\/bin\/env bash\nset -euo pipefail\n/);
+  assertExactHeadlessMetroLaunch(runner, "Android");
+  assertExactReadinessCommand(runner, "Android");
   ordered(runner,
     "mapfile -t emulator_serials",
     'emulator_serial="${emulator_serials[0]}"',
     ":app:assembleDebug",
     'adb -s "$emulator_serial" install -r',
     'adb -s "$emulator_serial" reverse tcp:8081 tcp:8081',
-    "expo start --dev-client --localhost --port 8081",
+    exactHeadlessMetroCommand,
     "curl --silent --fail http://127.0.0.1:8081/status",
     encodedDevClientUrl,
     'adb -s "$emulator_serial" shell am start -W -a android.intent.action.VIEW -d "$dev_client_url" -p com.luyao618.formobile',
-    `maestro --device "$emulator_serial" test ${readinessFlow}`,
+    exactReadinessCommands.Android,
     `maestro --device "$emulator_serial" test ${smokeFlow}`,
     "mv .artifacts/test-results/android-maestro.attempt.log .artifacts/test-results/android-maestro.log",
   );
@@ -462,9 +550,18 @@ test("Android retains both native flavors and records smoke provenance after exa
 
 test("iOS opens on the exact UDID, requires readiness, then records unchanged smoke provenance", async () => {
   const workflow = await readFile(".github/workflows/e2e-ios.yml", "utf8");
+  const parsedWorkflow = parseWorkflow(workflow, ".github/workflows/e2e-ios.yml");
+  const iosSteps = requiredSteps(requiredJob(parsedWorkflow, "ios"), "ios");
+  const smokeIndex = stepIndex(iosSteps, (step) => step.name === "Serial production and E2E builds, install, and smoke", "iOS device smoke");
+  const smokeRun = iosSteps[smokeIndex].run;
+  assert.ok(typeof smokeRun === "string", "iOS device smoke must have an enabled run script");
+  assertExactHeadlessMetroLaunch(smokeRun, "iOS");
+  assertExactReadinessCommand(smokeRun, "iOS");
+  assertExactPinnedSimulatorOpen(smokeRun);
   ordered(workflow,
     "simulator_udid=$(xcrun simctl list devices available -j",
     'simctl boot "$simulator_udid"',
+    exactPinnedSimulatorOpenLine,
     'simctl bootstatus "$simulator_udid" -b',
     "prebuild:ios:production",
     "cp ios/ForMobile/Info.plist .artifacts/native/ios/production/Info.plist",
@@ -474,10 +571,11 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
     "cp ios/ForMobile/Info.plist .artifacts/native/ios/e2e/Info.plist",
     "--flavor e2e --input .artifacts/native/ios/e2e/Info.plist",
     'simctl install "$simulator_udid"',
-    "expo start --dev-client --localhost --port 8081",
+    exactHeadlessMetroCommand,
     encodedDevClientUrl,
     'simctl openurl "$simulator_udid" "$dev_client_url"',
-    `maestro --device "$simulator_udid" test ${readinessFlow} 2>&1 | tee .artifacts/launch/ios-readiness.log`,
+    `maestro --device "$simulator_udid" test ${iosOpenConfirmationFlow} 2>&1 | tee .artifacts/launch/ios-open-confirmation.log`,
+    exactReadinessCommands.iOS,
     `maestro --device "$simulator_udid" test ${smokeFlow} 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log`,
     "mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log",
     "collect-ci-evidence.mjs",
@@ -489,19 +587,77 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
   assert.match(workflow, /\.artifacts\/launch\/\*\.log/);
 });
 
-test("readiness never launches the app and the tracked smoke flow remains byte-unchanged", async () => {
-  const [readiness, smoke] = await Promise.all([
+test("iOS confirmation is exact while readiness and smoke retain their required behavior", async () => {
+  const [confirmation, readiness, smoke] = await Promise.all([
+    readFile(iosOpenConfirmationFlow, "utf8"),
     readFile(readinessFlow, "utf8"),
     readFile(smokeFlow, "utf8"),
   ]);
+  assertIosOpenConfirmationFlow(confirmation);
   assert.equal(readiness, exactReadinessFlow);
   assert.doesNotMatch(readiness, /launchApp|stopApp|openLink/);
   assert.equal(smoke, exactSmokeFlow);
 });
 
+test("headless Metro, readiness, and iOS confirmation policies reject hostile counterexamples", async () => {
+  const [androidRunner, iosSource, confirmation] = await Promise.all([
+    readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
+    readFile(".github/workflows/e2e-ios.yml", "utf8"),
+    readFile(iosOpenConfirmationFlow, "utf8"),
+  ]);
+  const iosWorkflow = parseWorkflow(iosSource, ".github/workflows/e2e-ios.yml");
+  const iosSteps = requiredSteps(requiredJob(iosWorkflow, "ios"), "ios");
+  const iosSmoke = iosSteps.find((step) => step.name === "Serial production and E2E builds, install, and smoke");
+  assert.ok(iosSmoke && typeof iosSmoke.run === "string");
+
+  for (const [platform, script] of [["Android", androidRunner], ["iOS", iosSmoke.run]] as const) {
+    const lanBound = script.replace("--localhost", "--lan");
+    assert.notEqual(lanBound, script);
+    assert.throws(
+      () => assertExactHeadlessMetroLaunch(lanBound, platform),
+      /exact loopback-only fail-closed headless command/,
+    );
+
+    const withoutHeadless = script.replace("EXPO_UNSTABLE_HEADLESS=1 ", "");
+    assert.notEqual(withoutHeadless, script);
+    assert.throws(
+      () => assertExactHeadlessMetroLaunch(withoutHeadless, platform),
+      /exact loopback-only fail-closed headless command/,
+    );
+
+    const exactReadinessCommand = exactReadinessCommands[platform];
+    const readinessMutations = [
+      script.replace(exactReadinessCommand, `${exactReadinessCommand} || true`),
+      script.replace(exactReadinessCommand, `# ${exactReadinessCommand}`),
+      script.replace(exactReadinessCommand, ""),
+    ];
+    for (const mutatedScript of readinessMutations) {
+      assert.notEqual(mutatedScript, script);
+      assert.throws(
+        () => assertExactReadinessCommand(mutatedScript, platform),
+        /readiness must appear exactly once as the exact fail-closed command/,
+      );
+    }
+  }
+
+  const withoutOptionalTap = confirmation.replace("    optional: true\n", "");
+  assert.notEqual(withoutOptionalTap, confirmation);
+  assert.throws(() => assertIosOpenConfirmationFlow(withoutOptionalTap), /flow bytes must remain exact/);
+
+  const requiredWait = `- extendedWaitUntil:
+    visible: "照护空间尚未设置"
+    timeout: 120000
+`;
+  const withoutRequiredWait = confirmation.replace(requiredWait, "");
+  assert.notEqual(withoutRequiredWait, confirmation);
+  assert.throws(() => assertIosOpenConfirmationFlow(withoutRequiredWait), /flow bytes must remain exact/);
+});
+
 test("native workflows enforce the parsed Intel runner, exact SHA boundaries, and frozen tool preflight", async () => {
   const workflows = await loadNativeWorkflows();
   assertNativeWorkflowPolicy(workflows);
+  const syntax = spawnSync("bash", ["-n"], { encoding: "utf8", input: exactIosPreflightScript });
+  assert.equal(syntax.status, 0, syntax.stderr);
 });
 
 test("parsed workflow policy rejects hostile structural counterexamples", async () => {
@@ -553,6 +709,26 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
   assert.ok(camouflagedPreflight.run.includes(divergentNdkSelector));
   assert.ok(camouflagedPreflight.run.includes(`// ${exactNdkSelector}`));
   assert.throws(() => assertNativeWorkflowPolicy(camouflagedNdkSelector), /Embedded Android preflight Node program/);
+
+  const unpinnedIos = structuredClone(workflows);
+  const unpinnedIosJob = requiredJob(unpinnedIos.ios, "ios");
+  assert.ok(unpinnedIosJob.env);
+  delete unpinnedIosJob.env.DEVELOPER_DIR;
+  assert.throws(() => assertNativeWorkflowPolicy(unpinnedIos), /iOS job environment must remain exactly pinned/);
+
+  const disabledIosPreflight = structuredClone(workflows);
+  const disabledIosPreflightStep = requiredSteps(requiredJob(disabledIosPreflight.ios, "ios"), "ios")
+    .find((step) => step.name === iosPreflightStepName);
+  assert.ok(disabledIosPreflightStep);
+  disabledIosPreflightStep.if = "${{ false }}";
+  assert.throws(() => assertNativeWorkflowPolicy(disabledIosPreflight), /iOS toolchain preflight must not be conditional/);
+
+  const weakenedSwiftFloor = structuredClone(workflows);
+  const weakenedSwiftFloorStep = requiredSteps(requiredJob(weakenedSwiftFloor.ios, "ios"), "ios")
+    .find((step) => step.name === iosPreflightStepName);
+  assert.ok(weakenedSwiftFloorStep && typeof weakenedSwiftFloorStep.run === "string");
+  weakenedSwiftFloorStep.run = weakenedSwiftFloorStep.run.replace("major < 6", "major < 5");
+  assert.throws(() => assertNativeWorkflowPolicy(weakenedSwiftFloor), /iOS Xcode and Swift preflight must remain exact/);
 
   for (const [child, jobName] of [["android", "android"], ["ios", "ios"]] as const) {
     const wrongChildRef = structuredClone(workflows);

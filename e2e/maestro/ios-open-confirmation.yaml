@@ -1,0 +1,9 @@
+appId: com.luyao618.formobile
+---
+- tapOn:
+    text: "Open"
+    label: "Open For Mobile from the first-use system dialog"
+    optional: true
+- extendedWaitUntil:
+    visible: "照护空间尚未设置"
+    timeout: 120000
