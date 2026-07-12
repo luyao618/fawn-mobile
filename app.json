@@ -1,0 +1,27 @@
+{
+  "expo": {
+    "name": "For Mobile",
+    "slug": "for-mobile",
+    "version": "0.1.0",
+    "userInterfaceStyle": "light",
+    "android": {
+      "package": "com.luyao618.formobile",
+      "softwareKeyboardLayoutMode": "resize"
+    },
+    "ios": {
+      "bundleIdentifier": "com.luyao618.formobile",
+      "supportsTablet": true
+    },
+    "plugins": [
+      "@react-native-vector-icons/lucide",
+      [
+        "expo-dev-client",
+        {
+          "toolsButton": false,
+          "skipOnboarding": true,
+          "showMenuAtLaunch": false
+        }
+      ]
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+[
+  "turn.after_user_commit",
+  "turn.after_response_commit",
+  "job.after_lease",
+  "backup.after_db_snapshot",
+  "backup.after_album_copy",
+  "restore.after_journal_prepared",
+  "restore.after_live_db_closed",
+  "restore.after_live_move_before_phase",
+  "restore.after_live_moved",
+  "restore.after_promote_before_phase",
+  "restore.after_staged_promoted",
+  "restore.after_verified",
+  "restore.after_committed_before_cleanup"
+]

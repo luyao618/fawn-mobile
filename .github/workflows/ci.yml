@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.18.0
+          cache: npm
+      - run: npm ci --workspaces --include-workspace-root
+      - run: npm --prefix spikes/sqlite-fts ci --ignore-scripts --workspaces=false
+      - run: npm --prefix spikes/backup-crypto ci --ignore-scripts --workspaces=false
+      - run: npm --prefix spikes/model-transport ci --ignore-scripts --workspaces=false
+      - run: npm run test:dependencies
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test -- --runInBand
+      - run: npm run test:node
+      - run: npm run test:knowledge
+      - run: npm run test:config
+      - run: npm run test:licenses
+      - run: npm run test:audit
+      - run: npm audit signatures --workspaces=false
+      - run: npx --no-install expo install --check
+      - run: npm run expo:doctor
+      - run: npm run test:fault-scaffold
+      - run: npm run slice0
+      - run: npm run test:g017
+      - run: npm run expo:doctor:g017
+      - run: npm run g017:export:android
+      - run: npm run g017:export:ios
+      - run: node spikes/model-transport/deviceEvidenceValidator.mjs --fingerprint
+      - name: Record completed static gates
+        run: |
+          mkdir -p .artifacts/test-results
+          printf 'static gates passed for %s\n' "$(git rev-parse HEAD)" > .artifacts/test-results/static-gates.log
+      - run: node tools/collect-ci-evidence.mjs --expected-sha "${{ github.sha }}" --platform host --flavor static --test-result pass --test-result-file .artifacts/test-results/static-gates.log --output .artifacts/static.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: static-evidence-${{ github.sha }}
+          path: |
+            .artifacts/static.json
+            .artifacts/test-results/static-gates.log
+          if-no-files-found: error
+
+  android-e2e:
+    needs: static
+    uses: ./.github/workflows/e2e-android.yml
+    with:
+      expected_sha: ${{ github.sha }}
+
+  ios-e2e:
+    needs: static
+    uses: ./.github/workflows/e2e-ios.yml
+    with:
+      expected_sha: ${{ github.sha }}

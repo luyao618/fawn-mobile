@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "registry": "https://registry.npmjs.org",
+  "packages": [
+    {"name":"@react-native-vector-icons/lucide","version":"13.1.2","kind":"runtime","integrity":"sha512-7JG85gyzjumwyOvapf6zE35m4spdkPPRzLdmYqP9fiClDR4wI6tbm1YAbQYftFbtCI/Dnalh3lS2rEXS2nQMTw=="},
+    {"name":"@react-navigation/bottom-tabs","version":"7.18.8","kind":"runtime","integrity":"sha512-7KCsBtwCRwQQSTEw9SLglZCEkxWc+EqgdRKyUOgII+6+xEnemOyg8aDlnLIM2yk9ip6uE+Oxvm0jdpQU2vsu2w=="},
+    {"name":"@react-navigation/native","version":"7.3.8","kind":"runtime","integrity":"sha512-zHmQcxWBT8GOwsofEOmHqpdM5twkwE/esa9JFGlW4hpXeQTTe/dRcPSLjwsvePtolbDKz0YZbK+I5KrW3j63LQ=="},
+    {"name":"expo","version":"57.0.4","kind":"runtime","integrity":"sha512-5wW0SR6OnGUh+UPb3JWlFTAL22IgBcX36RqofjLAH2AuFqxAIpYIdwr9BYR9Wl3xyIe0t9lCoMQIZlAIZUNQvg=="},
+    {"name":"expo-dev-client","version":"57.0.5","kind":"runtime","integrity":"sha512-OOQJHb4Cf403AhZAbcZg0OOVJKLc1HArVck92LHd9PO2HuTadj/6YAlWIyXXYfeYYdjoVgLd/cAXnaEAwp6HKg=="},
+    {"name":"react","version":"19.2.3","kind":"runtime","integrity":"sha512-Ku/hhYbVjOQnXDZFv2+RibmLFGwFdeeKHFcOTlrt7xplBnya5OGn/hIRDsqDiSUcfORsDC7MPxwork8jBwsIWA=="},
+    {"name":"react-native","version":"0.86.0","kind":"runtime","integrity":"sha512-17ALh/dd6AO4pgOVmOO5Axll5PbErEo3XFyLokyzW6usyi+OShIEPwUW26wLPlhVifgSOIfECCH0WN+0IqtJ1w=="},
+    {"name":"react-native-safe-area-context","version":"5.7.0","kind":"runtime","integrity":"sha512-/9/MtQz8ODphjsLdZ+GZAIcC/RtoqW9EeShf7Uvnfgm/pzYrJ75y3PV/J1wuAV1T5Dye5ygq4EAW20RoBq0ABQ=="},
+    {"name":"react-native-screens","version":"4.25.2","kind":"runtime","integrity":"sha512-1Nj1fusFd+rIMKU/qC9yGKVG+3ofh11d3OdBQKL1iVvQfKvcB8vhvTGQf2TkfxW3bamxN+hCZIXmNuU0mRkyDg=="},
+    {"name":"@testing-library/react-native","version":"13.3.3","kind":"development","integrity":"sha512-k6Mjsd9dbZgvY4Bl7P1NIpePQNi+dfYtlJ5voi9KQlynxSyQkfOgJmYGCYmw/aSgH/rUcFvG8u5gd4npzgRDyg=="},
+    {"name":"@types/jest","version":"29.5.14","kind":"development","integrity":"sha512-ZN+4sdnLUbo8EVvVc2ao0GFW6oVrQRPn4K2lglySj7APvSrgzxHiNNK99us4WDMi57xxA2yggblIAMNhXOotLQ=="},
+    {"name":"@types/node","version":"24.3.0","kind":"development","integrity":"sha512-aPTXCrfwnDLj4VvXrm+UUCQjNEvJgNA8s5F1cvwQU+3KNltTOkBm1j30uNLyqqPNe7gE3KFzImYoZEfLhp4Yow=="},
+    {"name":"@types/react","version":"19.2.14","kind":"development","integrity":"sha512-ilcTH/UniCkMdtexkoCN0bI7pMcJDvmQFPvuPvmEaYA/NSfFTAgdUSLAoVjaRJm7+6PvcM+q1zYOwS4wTYMF9w=="},
+    {"name":"eslint","version":"9.39.5","kind":"development","integrity":"sha512-DgZS62aPLXKlnxILS/AYCoRvHaZeXceIzlXPkkGGzJWSow1aEk0lbTlxUSlyjC8jcaKxAdOnTDz+o1JFSBsyjw=="},
+    {"name":"eslint-config-expo","version":"57.0.0","kind":"development","integrity":"sha512-T7OTN9xrSZYjLw4qTkL1Mn2WfAUVmMGY38+OYAcraI1uiTFVH6jfkSkv84WLTqnneblLcb6AsMDV+SHcUj3hGw=="},
+    {"name":"expo-doctor","version":"1.20.0","kind":"development","integrity":"sha512-YL0uGQGZ65tWOCOiDH6BFzBkx/9N46MyBUdRfa4t6iuG4tbLg/phRrhmuaNm99QJVMqYtt3ksRbFCzuYOuX20Q=="},
+    {"name":"jest","version":"29.7.0","kind":"development","integrity":"sha512-NIy3oAFp9shda19hy4HK0HRTWKtPJmGdnvywu01nOqNC2vZg+Z+fvJDxpMQA88eb2I9EcafcdjYgsDthnYTvGw=="},
+    {"name":"jest-expo","version":"57.0.1","kind":"development","integrity":"sha512-7Kj8X08M6dpRvg0Noz91iiPdCgN1Z/V8VgCdWu+HBZoYfvc75uw50HleiVcjiXomW2gz8wZ1G0SgBYlGzwhzRg=="},
+    {"name":"react-test-renderer","version":"19.2.3","kind":"development","integrity":"sha512-TMR1LnSFiWZMJkCgNf5ATSvAheTT2NvKIwiVwdBPHxjBI7n/JbWd4gaZ16DVd9foAXdvDz+sB5yxZTwMjPRxpw=="},
+    {"name":"tsx","version":"4.20.5","kind":"development","integrity":"sha512-+wKjMNU9w/EaQayHXb7WA7ZaHY6hN8WgfvHNQ3t1PnU91/7O8TcTnIhCDYTZwnt8JsO9IBqZ30Ln1r7pPF52Aw=="},
+    {"name":"typescript","version":"6.0.3","kind":"development","integrity":"sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="}
+  ]
+}

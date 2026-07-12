@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "allowJs": true,
+    "checkJs": false,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "lib": ["ES2023", "DOM"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2023",
+    "types": ["node"]
+  },
+  "include": [
+    "tests/fixtures/**/*.ts",
+    "tests/support/**/*.ts",
+    "tests/unit/**/*.ts",
+    "tools/**/*.mjs",
+    "tools/**/*.mts",
+    "tools/**/*.d.mts"
+  ],
+  "exclude": ["tests/app", "spikes"]
+}
