@@ -13,6 +13,8 @@ permissions:
 jobs:
   android:
     runs-on: ubuntu-latest
+    env:
+      MAESTRO_DRIVER_STARTUP_TIMEOUT: "60000"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -81,6 +83,7 @@ jobs:
         with:
           name: android-e2e-diagnostics-${{ inputs.expected_sha }}
           path: |
-            .artifacts/launch/*.log
-            .artifacts/test-results/*.log
+            .artifacts/launch/**
+            .artifacts/test-results/**
+          include-hidden-files: true
           if-no-files-found: ignore

@@ -421,7 +421,10 @@ function parsePinnedActionScript(rawScript: string) {
 const encodedDevClientUrl = "formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081";
 type NativePlatform = "Android" | "iOS";
 
-const exactHeadlessMetroCommand = "CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &";
+const exactHeadlessMetroCommands: Record<NativePlatform, string> = {
+  Android: 'CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > "$metro_log" 2>&1 &',
+  iOS: "CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &",
+};
 const exactMetroStatusLines = [
   "for attempt in $(seq 1 60); do curl --silent --fail http://127.0.0.1:8081/status >/dev/null && break; sleep 2; done",
   "curl --silent --fail http://127.0.0.1:8081/status",
@@ -433,13 +436,20 @@ const exactIosFailureLogCommand = `    xcrun simctl spawn "$simulator_udid" log 
 const iosOpenConfirmationFlow = "e2e/maestro/ios-open-confirmation.yaml";
 const readinessFlow = "e2e/maestro/shell-readiness.yaml";
 const smokeFlow = "e2e/maestro/shell-smoke.yaml";
+const exactAndroidMaestroTimeout = "60000";
 const exactReadinessCommands: Record<NativePlatform, string> = {
-  Android: `maestro --device "$emulator_serial" test ${readinessFlow} 2>&1 | tee .artifacts/launch/android-readiness.log`,
+  Android: `maestro --device "$emulator_serial" test --debug-output .artifacts/launch/maestro/android-readiness ${readinessFlow} 2>&1 | tee .artifacts/launch/android-readiness.log`,
   iOS: `maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-readiness ${readinessFlow} 2>&1 | tee .artifacts/launch/ios-readiness.log`,
 };
 const exactIosOpenUrlCommand = 'xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log';
 const exactIosConfirmationCommand = `maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-open-confirmation ${iosOpenConfirmationFlow} 2>&1 | tee .artifacts/launch/ios-open-confirmation.log`;
+const exactAndroidSmokeCommand = `maestro --device "$emulator_serial" test --debug-output .artifacts/launch/maestro/android-smoke ${smokeFlow} 2>&1 | tee .artifacts/test-results/android-maestro.attempt.log`;
 const exactIosSmokeCommand = `maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-smoke ${smokeFlow} 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log`;
+const exactAndroidFailureScreenshotCommand = '    adb -s "$emulator_serial" exec-out screencap -p > .artifacts/launch/device/android-failure.png';
+const exactAndroidFailureHierarchyCommand = '    adb -s "$emulator_serial" exec-out uiautomator dump /dev/tty > .artifacts/launch/device/android-ui-hierarchy.xml 2>&1';
+const exactAndroidFailurePidCommand = String.raw`    app_pid=$(adb -s "$emulator_serial" shell pidof -s com.luyao618.formobile 2>/dev/null | tr -d "\r")`;
+const exactAndroidFailureLogCommand = '      adb -s "$emulator_serial" logcat -d --pid="$app_pid" > .artifacts/launch/device/android-app.log 2>&1';
+const exactAndroidFallbackLogCommand = "      adb -s \"$emulator_serial\" logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V '*:S' > .artifacts/launch/device/android-app.log 2>&1";
 const exactPinnedSimulatorOpenLine = 'open "$DEVELOPER_DIR/Applications/Simulator.app" --args -CurrentDeviceUDID "$simulator_udid"';
 
 const exactIosOpenConfirmationFlow = `appId: com.luyao618.formobile
@@ -481,7 +491,7 @@ function assertExactHeadlessMetroLaunch(script: string, platform: NativePlatform
   const launchLines = script.split("\n").filter((line) => line.includes("expo start"));
   assert.deepEqual(
     launchLines,
-    [exactHeadlessMetroCommand],
+    [exactHeadlessMetroCommands[platform]],
     `${platform} Metro launch must remain the exact loopback-only fail-closed headless command`,
   );
 }
@@ -505,7 +515,7 @@ function assertExactMetroStartupPolicy(script: string, platform: NativePlatform)
     [exactDevClientUrlAssignment],
     `${platform} dev-client URL assignment must appear exactly once as the exact full line`,
   );
-  const launchIndex = lines.indexOf(exactHeadlessMetroCommand);
+  const launchIndex = lines.indexOf(exactHeadlessMetroCommands[platform]);
   const retryIndex = lines.indexOf(exactMetroStatusLines[0]);
   const finalProbeIndex = lines.indexOf(exactMetroStatusLines[1]);
   const devClientUrlIndex = lines.indexOf(exactDevClientUrlAssignment);
@@ -531,6 +541,56 @@ function assertExactAndroidInstallPolicy(script: string): void {
     [exactAndroidInstallCommand],
     "Android runner must contain exactly one exact --no-streaming -r install command",
   );
+}
+
+function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): void {
+  const job = requiredJob(workflow, "android");
+  assert.deepEqual(
+    job.env,
+    { MAESTRO_DRIVER_STARTUP_TIMEOUT: exactAndroidMaestroTimeout },
+    "Android Maestro driver startup timeout must remain exactly bounded at 60000ms",
+  );
+  const lines = script.split(/\r\n|\n|\r/);
+  const maestroLines = lines.filter((line) => /^maestro /.test(line));
+  assert.deepEqual(
+    maestroLines,
+    [exactReadinessCommands.Android, exactAndroidSmokeCommand],
+    "Android Maestro commands must retain distinct exact debug-output directories",
+  );
+  const cleanupLines = [
+    "cleanup() {",
+    "  status=$?",
+    "  trap - EXIT",
+    "  set +e",
+    '  if [ "$status" -ne 0 ]; then',
+    exactAndroidFailureScreenshotCommand,
+    exactAndroidFailureHierarchyCommand,
+    exactAndroidFailurePidCommand,
+    '    if [ -n "$app_pid" ]; then',
+    exactAndroidFailureLogCommand,
+    "    else",
+    exactAndroidFallbackLogCommand,
+    "    fi",
+    "  fi",
+    '  kill "$metro_pid" 2>/dev/null',
+    '  wait "$metro_pid" 2>/dev/null',
+    '  cat "$metro_log"',
+    '  exit "$status"',
+    "}",
+    "trap cleanup EXIT",
+  ];
+  const cleanupIndexes = cleanupLines.map((line) => lines.indexOf(line));
+  assert.ok(
+    cleanupIndexes.every((index, position) => index >= 0 && (position === 0 || index > cleanupIndexes[position - 1])),
+    "Android cleanup must preserve exact status, failure diagnostics, teardown, retained Metro log, and exit order",
+  );
+  const diagnosticUploads = requiredSteps(job, "android")
+    .filter((step) => step.with?.name === `android-e2e-diagnostics-${expectedShaInput}`);
+  assert.equal(diagnosticUploads.length, 1, "Android must retain exactly one diagnostics upload");
+  const upload = diagnosticUploads[0];
+  assert.equal(upload.if, "always()", "Android diagnostics upload must run after failure");
+  assert.equal(upload.with?.path, ".artifacts/launch/**\n.artifacts/test-results/**\n");
+  assert.equal(upload.with?.["include-hidden-files"], true, "Android diagnostics upload must retain hidden Maestro files");
 }
 
 function assertExactIosUrlHandoff(script: string): void {
@@ -630,17 +690,19 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assertExactMetroStartupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
   assertExactAndroidInstallPolicy(runner);
+  assertAndroidDiagnosticsPolicy(runner, parseWorkflow(workflow, ".github/workflows/e2e-android.yml"));
   ordered(runner,
     "mapfile -t emulator_serials",
     'emulator_serial="${emulator_serials[0]}"',
     ":app:assembleDebug",
     exactAndroidInstallCommand,
     'adb -s "$emulator_serial" reverse tcp:8081 tcp:8081',
-    exactHeadlessMetroCommand,
+    "metro_log=.artifacts/launch/metro/android-metro.log",
+    exactHeadlessMetroCommands.Android,
     exactDevClientUrlAssignment,
     'adb -s "$emulator_serial" shell am start -W -a android.intent.action.VIEW -d "$dev_client_url" -p com.luyao618.formobile',
     exactReadinessCommands.Android,
-    `maestro --device "$emulator_serial" test ${smokeFlow}`,
+    exactAndroidSmokeCommand,
     "mv .artifacts/test-results/android-maestro.attempt.log .artifacts/test-results/android-maestro.log",
   );
 });
@@ -716,6 +778,65 @@ exit 97
   }
 });
 
+test("Android EXIT cleanup preserves success and failure status with failure-only diagnostics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "g018-android-exit-"));
+  try {
+    const runner = await readFile("scripts/e2e/run-android-emulator.sh", "utf8");
+    const start = runner.indexOf("cleanup() {");
+    const end = runner.indexOf("trap cleanup EXIT", start);
+    assert.ok(start >= 0 && end > start, "Android cleanup function and EXIT trap must be extractable");
+    const cleanup = runner.slice(start, end + "trap cleanup EXIT".length);
+    const adbLog = join(root, "adb.log");
+    const runCleanup = async (status: number) => {
+      const deviceDir = join(root, ".artifacts/launch/device");
+      const metroLog = join(root, `metro-${status}.log`);
+      await rm(deviceDir, { recursive: true, force: true });
+      await mkdir(deviceDir, { recursive: true });
+      await writeFile(adbLog, "");
+      await writeFile(metroLog, "metro-sentinel\n");
+      const harness = `set -euo pipefail
+cd "$HARNESS_ROOT"
+emulator_serial=emulator-5554
+metro_pid=424242
+metro_log="$HARNESS_METRO_LOG"
+adb() {
+  printf '%s\\n' "$*" >> "$HARNESS_ADB_LOG"
+  case "$*" in
+    *"screencap -p") printf 'png-sentinel' ;;
+    *"uiautomator dump /dev/tty") printf 'hierarchy-sentinel' ;;
+    *"logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V *:S") printf 'logcat-sentinel' ;;
+  esac
+}
+kill() { printf 'kill %s\\n' "$*" >> "$HARNESS_ADB_LOG"; }
+wait() { printf 'wait %s\\n' "$*" >> "$HARNESS_ADB_LOG"; }
+${cleanup}
+exit ${status}
+`;
+      return spawnSync("bash", { encoding: "utf8", input: harness, env: {
+        ...process.env,
+        HARNESS_ROOT: root,
+        HARNESS_ADB_LOG: adbLog,
+        HARNESS_METRO_LOG: metroLog,
+      } });
+    };
+
+    const success = await runCleanup(0);
+    assert.equal(success.status, 0, success.stderr);
+    await assert.rejects(readFile(join(root, ".artifacts/launch/device/android-failure.png")));
+    await assert.rejects(readFile(join(root, ".artifacts/launch/device/android-ui-hierarchy.xml")));
+    await assert.rejects(readFile(join(root, ".artifacts/launch/device/android-app.log")));
+
+    const failure = await runCleanup(37);
+    assert.equal(failure.status, 37, failure.stderr);
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-failure.png"), "utf8"), "png-sentinel");
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-ui-hierarchy.xml"), "utf8"), "hierarchy-sentinel");
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-app.log"), "utf8"), "logcat-sentinel");
+    assert.match(await readFile(adbLog, "utf8"), /logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V \*:S/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Android retains both native flavors and records smoke provenance after exact-device readiness", async () => {
   const [workflow, runner] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
@@ -735,12 +856,12 @@ test("Android retains both native flavors and records smoke provenance after exa
   );
   ordered(runner,
     'adb -s "$emulator_serial" shell am start -W',
-    `maestro --device "$emulator_serial" test ${readinessFlow} 2>&1 | tee .artifacts/launch/android-readiness.log`,
-    `maestro --device "$emulator_serial" test ${smokeFlow} 2>&1 | tee .artifacts/test-results/android-maestro.attempt.log`,
+    exactReadinessCommands.Android,
+    exactAndroidSmokeCommand,
   );
   assert.match(runner, /grep -q '\^Status: ok'/);
   assert.match(workflow, /\.artifacts\/native\/android\/\*\*/);
-  assert.match(workflow, /\.artifacts\/launch\/\*\.log/);
+  assert.match(workflow, /\.artifacts\/launch\/\*\*/);
 });
 
 test("iOS opens on the exact UDID, requires readiness, then records unchanged smoke provenance", async () => {
@@ -768,7 +889,7 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
     "cp ios/ForMobile/Info.plist .artifacts/native/ios/e2e/Info.plist",
     "--flavor e2e --input .artifacts/native/ios/e2e/Info.plist",
     'simctl install "$simulator_udid"',
-    exactHeadlessMetroCommand,
+    exactHeadlessMetroCommands.iOS,
     exactDevClientUrlAssignment,
     exactIosOpenUrlCommand,
     exactIosConfirmationCommand,
@@ -867,8 +988,8 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
       .filter((line) => !exactMetroStatusLines.some((statusLine) => line === statusLine))
       .join("\n");
     const statusProbesBeforeLaunch = withoutApprovedStatusLines.replace(
-      exactHeadlessMetroCommand,
-      `${exactMetroStatusLines.join("\n")}\n${exactHeadlessMetroCommand}`,
+      exactHeadlessMetroCommands[platform],
+      `${exactMetroStatusLines.join("\n")}\n${exactHeadlessMetroCommands[platform]}`,
     );
     assert.notEqual(statusProbesBeforeLaunch, script);
     assert.throws(
@@ -951,6 +1072,42 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
       /exactly two identical exact simctl openurl commands|confirmation must appear exactly twice as the exact fail-closed command|must preserve assignment, open, confirmation, open, confirmation, readiness, and smoke order/,
     );
   }
+
+  const androidWorkflow = parseWorkflow(
+    await readFile(".github/workflows/e2e-android.yml", "utf8"),
+    ".github/workflows/e2e-android.yml",
+  );
+  const androidPolicyMutations = [
+    androidRunner.replace(exactAndroidFailureScreenshotCommand, `    # ${exactAndroidFailureScreenshotCommand.trim()}`),
+    androidRunner.replace("  status=$?", "  status=0"),
+    androidRunner.replace('  wait "$metro_pid" 2>/dev/null\n', ""),
+    androidRunner.replace(`${exactAndroidFallbackLogCommand}\n`, ""),
+    androidRunner.replace(".artifacts/launch/maestro/android-smoke", ".artifacts/launch/maestro/android-readiness"),
+  ];
+  for (const mutatedScript of androidPolicyMutations) {
+    assert.notEqual(mutatedScript, androidRunner);
+    assert.throws(
+      () => assertAndroidDiagnosticsPolicy(mutatedScript, androidWorkflow),
+      /Android cleanup must preserve|distinct exact debug-output directories/,
+    );
+  }
+
+  const unboundedAndroidTimeout = structuredClone(androidWorkflow);
+  requiredJob(unboundedAndroidTimeout, "android").env = { MAESTRO_DRIVER_STARTUP_TIMEOUT: "120000" };
+  assert.throws(
+    () => assertAndroidDiagnosticsPolicy(androidRunner, unboundedAndroidTimeout),
+    /must remain exactly bounded at 60000ms/,
+  );
+
+  const androidWithoutHiddenDiagnostics = structuredClone(androidWorkflow);
+  const androidDiagnosticsUpload = requiredSteps(requiredJob(androidWithoutHiddenDiagnostics, "android"), "android")
+    .find((step) => step.with?.name === `android-e2e-diagnostics-${expectedShaInput}`);
+  assert.ok(androidDiagnosticsUpload?.with);
+  delete androidDiagnosticsUpload.with["include-hidden-files"];
+  assert.throws(
+    () => assertAndroidDiagnosticsPolicy(androidRunner, androidWithoutHiddenDiagnostics),
+    /must retain hidden Maestro files/,
+  );
 
   const iosWithoutHiddenDiagnostics = structuredClone(iosWorkflow);
   const diagnosticsUpload = requiredSteps(requiredJob(iosWithoutHiddenDiagnostics, "ios"), "ios")
