@@ -89,7 +89,7 @@ const exactChildPrimaryUploadPaths = {
   ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "50a90d259c18654a61c926d52228ec9a409cd0219ed75fa42aff425e083f2429";
+const exactAndroidRunnerSha256 = "e272007ff603cc226494cf21f1f0707205b8de43430c1dc7721e0ae662440449";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -536,6 +536,7 @@ const exactReadinessCommands: Record<NativePlatform, string> = {
   Android: `maestro --device "$emulator_serial" test --debug-output .artifacts/launch/maestro/android-readiness ${readinessFlow} 2>&1 | tee .artifacts/launch/android-readiness.log`,
   iOS: `maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-readiness ${readinessFlow} 2>&1 | tee .artifacts/launch/ios-readiness.log`,
 };
+const exactAndroidOpenUrlCommand = 'adb -s "$emulator_serial" shell am start -a android.intent.action.VIEW -d "$dev_client_url" -p com.luyao618.formobile 2>&1 | tee -a .artifacts/launch/android-dev-client.log';
 const exactIosOpenUrlCommand = 'xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log';
 const exactIosConfirmationCommand = `maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-open-confirmation ${iosOpenConfirmationFlow} 2>&1 | tee .artifacts/launch/ios-open-confirmation.log`;
 const exactAndroidSmokeCommand = `maestro --device "$emulator_serial" test --debug-output .artifacts/launch/maestro/android-smoke ${smokeFlow} 2>&1 | tee .artifacts/test-results/android-maestro.attempt.log`;
@@ -626,6 +627,28 @@ function assertExactReadinessCommand(script: string, platform: NativePlatform): 
     readinessLines,
     [exactReadinessCommands[platform]],
     `${platform} readiness must appear exactly once as the exact fail-closed command`,
+  );
+}
+
+function assertExactAndroidUrlHandoff(script: string): void {
+  const lines = script.split(/\r\n|\n|\r/);
+  const launchLines = lines.filter((line) => /\badb\b.*\bshell\b.*\bam\b.*\bstart\b/.test(line));
+  assert.deepEqual(
+    launchLines,
+    [exactAndroidOpenUrlCommand],
+    "Android deep-link handoff must be the exact non-waiting am start command",
+  );
+  assert.deepEqual(
+    lines.filter((line) => /\bgrep\b.*Status:/.test(line)),
+    [],
+    "Android launch must not gate on textual am start status",
+  );
+  const urlIndex = lines.indexOf(exactDevClientUrlAssignment);
+  const launchIndex = lines.indexOf(exactAndroidOpenUrlCommand);
+  const readinessIndex = lines.indexOf(exactReadinessCommands.Android);
+  assert.ok(
+    urlIndex < launchIndex && launchIndex < readinessIndex,
+    "Android must assign the URL, issue non-waiting am start, then fail closed on Maestro readiness",
   );
 }
 
@@ -841,6 +864,7 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assertExactAndroidRunnerSha256(runner);
   assertExactMetroStartupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
+  assertExactAndroidUrlHandoff(runner);
   assertExactAndroidPackageServicePolicy(runner);
   assertExactAndroidInstallPolicy(runner);
   assertAndroidDiagnosticsPolicy(runner, parsedWorkflow);
@@ -863,11 +887,27 @@ test("pinned Android action receives exactly one Bash command and the runner is 
     'adb -s "$emulator_serial" reverse tcp:8081 tcp:8081',
     exactHeadlessMetroCommands.Android,
     exactDevClientUrlAssignment,
-    'adb -s "$emulator_serial" shell am start -W -a android.intent.action.VIEW -d "$dev_client_url" -p com.luyao618.formobile',
+    exactAndroidOpenUrlCommand,
     exactReadinessCommands.Android,
     exactAndroidSmokeCommand,
     "mv .artifacts/test-results/android-maestro.attempt.log .artifacts/test-results/android-maestro.log",
   );
+});
+
+test("Android deep-link handoff rejects waiting, textual status gates, and hostile readiness ordering", async () => {
+  const runner = await readFile("scripts/e2e/run-android-emulator.sh", "utf8");
+  const hostileMutations = [
+    runner.replace(" shell am start -a ", " shell am start -W -a "),
+    runner.replace(`${exactAndroidOpenUrlCommand}\n`, `${exactAndroidOpenUrlCommand}\ngrep -q '^Status: ok' .artifacts/launch/android-dev-client.log\n`),
+    runner.replace(
+      `${exactAndroidOpenUrlCommand}\n${exactReadinessCommands.Android}`,
+      `${exactReadinessCommands.Android}\n${exactAndroidOpenUrlCommand}`,
+    ),
+  ];
+  for (const mutatedRunner of hostileMutations) {
+    assert.notEqual(mutatedRunner, runner, "hostile Android launch fixture must change the runner");
+    assert.throws(() => assertExactAndroidUrlHandoff(mutatedRunner));
+  }
 });
 
 test("Android runner lock and cleanup cardinality reject hostile whole-file mutations", async () => {
@@ -953,7 +993,7 @@ elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "install" ]; then
 elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "service" ]; then
   printf '%s\\r\\n' 'Service package: found'
 elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "am" ] && [ "\${5:-}" = "start" ]; then
-  printf '%s\\n' 'Status: ok'
+  printf '%s\\n' 'Status: timeout'
 elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "screencap" ]; then
   printf 'png-sentinel'
 elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "uiautomator" ]; then
@@ -993,6 +1033,22 @@ exit 97
   });
   return { root, adbLog, downstreamLog, result };
 }
+
+test("Android am start timeout text remains nonblocking until bounded Maestro readiness", async () => {
+  const harness = await runAndroidTransientInstallHarness("Failure calling service package: Broken pipe (32)");
+  try {
+    assert.equal(harness.result.status, 97, "am start timeout text must reach the deliberately failing Maestro readiness stub");
+    assert.match(harness.result.stdout, /Status: timeout/);
+    const adbCalls = (await readFile(harness.adbLog, "utf8")).trim().split("\n");
+    assert.equal(
+      adbCalls.filter((call) => call.includes(" shell am start ")).at(0),
+      '-s emulator-5554 shell am start -a android.intent.action.VIEW -d formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081 -p com.luyao618.formobile',
+    );
+    assert.match(await readFile(harness.downstreamLog, "utf8"), /maestro --device emulator-5554 test --debug-output .*android-readiness/);
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
 
 test("Android retries one broken package transport install after renewed readiness and then continues", async () => {
   const harness = await runAndroidTransientInstallHarness("Failure calling service package: Broken pipe (32)");
@@ -1349,11 +1405,11 @@ test("Android retains both native flavors and records smoke provenance after exa
     "--test-result pass --test-result-file .artifacts/test-results/android-maestro.log",
   );
   ordered(runner,
-    'adb -s "$emulator_serial" shell am start -W',
+    exactAndroidOpenUrlCommand,
     exactReadinessCommands.Android,
     exactAndroidSmokeCommand,
   );
-  assert.match(runner, /grep -q '\^Status: ok'/);
+  assertExactAndroidUrlHandoff(runner);
   assert.match(workflow, /\.artifacts\/native\/android\/\*\*/);
   assert.match(workflow, /\.artifacts\/launch\/\*\*/);
 });
