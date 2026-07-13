@@ -5,7 +5,7 @@ mkdir -p .artifacts/launch/device .artifacts/launch/maestro .artifacts/launch/me
 mapfile -t emulator_serials < <(adb devices | awk '$1 ~ /^emulator-/ && $2 == "device" { print $1 }')
 test "${#emulator_serials[@]}" -eq 1
 emulator_serial="${emulator_serials[0]}"
-cd android && ./gradlew :app:assembleDebug --no-daemon && cd ..
+cd android && ./gradlew :app:assembleDebug -PreactNativeArchitectures=x86_64 --no-daemon && cd ..
 metro_log=.artifacts/launch/metro/android-metro.log
 metro_pid=
 cleanup() {
@@ -32,9 +32,27 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-for attempt in $(seq 1 60); do adb -s "$emulator_serial" shell service check package 2>/dev/null | tr -d '\r' | grep -Fxq 'Service package: found' && break; sleep 2; done
-adb -s "$emulator_serial" shell service check package 2>/dev/null | tr -d '\r' | grep -Fxq 'Service package: found'
-adb -s "$emulator_serial" install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk
+wait_for_package_service() {
+  for attempt in $(seq 1 60); do adb -s "$emulator_serial" shell service check package 2>/dev/null | tr -d '\r' | grep -Fxq 'Service package: found' && break; sleep 2; done
+  adb -s "$emulator_serial" shell service check package 2>/dev/null | tr -d '\r' | grep -Fxq 'Service package: found'
+}
+install_apk() {
+  set +e
+  install_output=$(adb -s "$emulator_serial" install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk 2>&1)
+  install_status=$?
+  set -e
+  printf '%s\n' "$install_output"
+  return "$install_status"
+}
+wait_for_package_service
+if ! install_apk; then
+  if grep -Eq -e "^Can't find service: package$" -e '^Failure calling service package: Broken pipe( \([0-9]+\))?$' <<< "${install_output//$'\r'/}"; then
+    wait_for_package_service
+    install_apk
+  else
+    exit "$install_status"
+  fi
+fi
 adb -s "$emulator_serial" reverse tcp:8081 tcp:8081
 CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > "$metro_log" 2>&1 &
 metro_pid=$!

@@ -89,7 +89,7 @@ const exactChildPrimaryUploadPaths = {
   ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "c2ee52204a421a9bd18bc6f91bbb449a0eabc9bb46feb7ed1c9b69c281084d0c";
+const exactAndroidRunnerSha256 = "6757f74773447f1d575c1327e4559646e466984a3b818bfdc4dce7cae958b45d";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -505,11 +505,16 @@ const exactMetroStatusLines = [
   "curl --silent --fail http://127.0.0.1:8081/status",
 ] as const;
 const exactDevClientUrlAssignment = `dev_client_url='${encodedDevClientUrl}'`;
-const exactAndroidInstallCommand = 'adb -s "$emulator_serial" install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk';
+const exactAndroidBuildCommand = "cd android && ./gradlew :app:assembleDebug -PreactNativeArchitectures=x86_64 --no-daemon && cd ..";
+const exactAndroidInstallCommand = '  install_output=$(adb -s "$emulator_serial" install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk 2>&1)';
 const exactAndroidPackageServiceLines = [
-  "for attempt in $(seq 1 60); do adb -s \"$emulator_serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found' && break; sleep 2; done",
-  "adb -s \"$emulator_serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found'",
+  "  for attempt in $(seq 1 60); do adb -s \"$emulator_serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found' && break; sleep 2; done",
+  "  adb -s \"$emulator_serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found'",
 ] as const;
+const exactAndroidPackageServiceCall = "wait_for_package_service";
+const exactAndroidPackageServiceRetryCall = "    wait_for_package_service";
+const exactAndroidInstallCall = "install_apk";
+const exactAndroidTransientInstallClassifier = `  if grep -Eq -e "^Can't find service: package$" -e '^Failure calling service package: Broken pipe( \\([0-9]+\\))?$' <<< "\${install_output//$'\\r'/}"; then`;
 const exactIosFailureScreenshotCommand = '    xcrun simctl io "$simulator_udid" screenshot .artifacts/launch/simulator/ios-failure.png';
 const exactIosFailureLogCommand = `    xcrun simctl spawn "$simulator_udid" log show --style compact --last 15m --predicate 'process == "ForMobile" OR process == "SpringBoard"' > .artifacts/launch/simulator/ios-simulator-app.log 2>&1`;
 const iosOpenConfirmationFlow = "e2e/maestro/ios-open-confirmation.yaml";
@@ -618,7 +623,13 @@ function assertExactAndroidInstallPolicy(script: string): void {
   assert.deepEqual(
     installLines,
     [exactAndroidInstallCommand],
-    "Android runner must contain exactly one exact --no-streaming -r install command",
+    "Android runner must contain exactly one captured --no-streaming -r install command",
+  );
+  assert.match(script, /printf '%s\\n' "\$install_output"/);
+  assert.deepEqual(
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes("grep -Eq")),
+    [exactAndroidTransientInstallClassifier],
+    "Android retry classification must remain pipeline-free, CR-tolerant, and match only exact transport-failure lines",
   );
 }
 
@@ -630,13 +641,19 @@ function assertExactAndroidPackageServicePolicy(script: string): void {
     exactAndroidPackageServiceLines,
     "Android package service readiness must remain the exact bounded loop and final fail-closed probe",
   );
+  assert.deepEqual(
+    lines.filter((line) => line.trim() === exactAndroidPackageServiceCall),
+    [exactAndroidPackageServiceCall, exactAndroidPackageServiceRetryCall],
+    "Android must call the bounded package-service wait initially and before the sole transient retry",
+  );
   const trapIndex = lines.indexOf("trap cleanup EXIT");
-  const loopIndex = lines.indexOf(exactAndroidPackageServiceLines[0]);
-  const finalProbeIndex = lines.indexOf(exactAndroidPackageServiceLines[1]);
-  const installIndex = lines.indexOf(exactAndroidInstallCommand);
+  const initialWaitIndex = lines.indexOf(exactAndroidPackageServiceCall);
+  const firstInstallIndex = lines.indexOf(`if ! ${exactAndroidInstallCall}; then`);
+  const retryWaitIndex = lines.indexOf(exactAndroidPackageServiceRetryCall);
+  const retryInstallIndex = lines.indexOf(`    ${exactAndroidInstallCall}`);
   assert.ok(
-    trapIndex < loopIndex && loopIndex < finalProbeIndex && finalProbeIndex < installIndex,
-    "Android must register cleanup before package readiness and install only after the final probe",
+    trapIndex < initialWaitIndex && initialWaitIndex < firstInstallIndex && firstInstallIndex < retryWaitIndex && retryWaitIndex < retryInstallIndex,
+    "Android must register cleanup, wait before the first install, and wait again before the sole retry",
   );
 }
 
@@ -819,13 +836,14 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   ordered(runner,
     "mapfile -t emulator_serials",
     'emulator_serial="${emulator_serials[0]}"',
-    ":app:assembleDebug",
+    exactAndroidBuildCommand,
     "metro_log=.artifacts/launch/metro/android-metro.log",
     "metro_pid=",
     "trap cleanup EXIT",
-    exactAndroidPackageServiceLines[0],
-    exactAndroidPackageServiceLines[1],
-    exactAndroidInstallCommand,
+    exactAndroidPackageServiceCall,
+    `if ! ${exactAndroidInstallCall}; then`,
+    exactAndroidPackageServiceRetryCall,
+    `    ${exactAndroidInstallCall}`,
     'adb -s "$emulator_serial" reverse tcp:8081 tcp:8081',
     exactHeadlessMetroCommands.Android,
     exactDevClientUrlAssignment,
@@ -877,6 +895,163 @@ test("Android runner lock and cleanup cardinality reject hostile whole-file muta
       /must match the reviewed SHA-256/,
       label,
     );
+  }
+});
+
+async function runAndroidTransientInstallHarness(firstFailure: string, secondFailure?: string) {
+  const root = await mkdtemp(join(tmpdir(), "g018-android-transient-install-"));
+  const fakeBin = join(root, "bin");
+  const android = join(root, "android");
+  const adbLog = join(root, "adb.log");
+  const installCount = join(root, "install-count");
+  const firstInstallOutput = join(root, "first-install-output.log");
+  const downstreamLog = join(root, "downstream.log");
+  const bashEnv = join(root, "bash-env");
+  await mkdir(fakeBin);
+  await mkdir(android);
+  await writeFile(adbLog, "");
+  await writeFile(installCount, "0\n");
+  await writeFile(firstInstallOutput, `${firstFailure}\n`);
+  await writeFile(downstreamLog, "");
+  await writeFile(bashEnv, `mapfile() {
+  test "$1" = "-t"
+  local array_name="$2"
+  local values=()
+  local line
+  while IFS= read -r line; do values[\${#values[@]}]="$line"; done
+  eval "$array_name=(\\"\${values[@]}\\")"
+}
+`);
+  await writeFile(join(fakeBin, "adb"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$ANDROID_ADB_LOG"
+if [ "\${1:-}" = "devices" ]; then
+  printf 'List of devices attached\\nemulator-5554\\tdevice\\n'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "install" ]; then
+  count=$(cat "$ANDROID_INSTALL_COUNT")
+  count=$((count + 1))
+  printf '%s\\n' "$count" > "$ANDROID_INSTALL_COUNT"
+  if [ "$count" -eq 1 ]; then
+    cat "$ANDROID_FIRST_INSTALL_OUTPUT" >&2
+    exit 1
+  fi
+  ${secondFailure === undefined ? "printf '%s\\n' 'Success'" : `printf '%s\\n' ${JSON.stringify(secondFailure)} >&2\n  exit 1`}
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "service" ]; then
+  printf '%s\\r\\n' 'Service package: found'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "am" ] && [ "\${5:-}" = "start" ]; then
+  printf '%s\\n' 'Status: ok'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "screencap" ]; then
+  printf 'png-sentinel'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "uiautomator" ]; then
+  printf 'hierarchy-sentinel'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "pidof" ]; then
+  :
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "logcat" ]; then
+  printf 'logcat-sentinel'
+fi
+`);
+  await writeFile(join(android, "gradlew"), `#!/usr/bin/env bash
+test "$*" = ':app:assembleDebug -PreactNativeArchitectures=x86_64 --no-daemon'
+`);
+  await writeFile(join(fakeBin, "curl"), "#!/usr/bin/env bash\nexit 0\n");
+  for (const command of ["npx", "maestro"]) {
+    await writeFile(join(fakeBin, command), `#!/usr/bin/env bash
+printf '%s %s\\n' ${JSON.stringify(command)} "$*" >> "$ANDROID_DOWNSTREAM_LOG"
+exit 97
+`);
+  }
+  await Promise.all([
+    chmod(join(fakeBin, "adb"), 0o755),
+    chmod(join(fakeBin, "curl"), 0o755),
+    chmod(join(fakeBin, "npx"), 0o755),
+    chmod(join(fakeBin, "maestro"), 0o755),
+    chmod(join(android, "gradlew"), 0o755),
+  ]);
+  const result = spawnSync("bash", [resolve("scripts/e2e/run-android-emulator.sh")], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ANDROID_ADB_LOG: adbLog,
+      ANDROID_FIRST_INSTALL_OUTPUT: firstInstallOutput,
+      ANDROID_INSTALL_COUNT: installCount,
+      ANDROID_DOWNSTREAM_LOG: downstreamLog,
+      BASH_ENV: bashEnv,
+      PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+    },
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return { root, adbLog, downstreamLog, result };
+}
+
+test("Android retries one broken package transport install after renewed readiness and then continues", async () => {
+  const harness = await runAndroidTransientInstallHarness("Failure calling service package: Broken pipe (32)");
+  try {
+    assert.equal(harness.result.status, 97, "successful retry must reach the deliberately failing Maestro stub");
+    assert.match(harness.result.stdout, /Failure calling service package: Broken pipe \(32\)\nSuccess/);
+    const adbCalls = (await readFile(harness.adbLog, "utf8")).trim().split("\n");
+    assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 shell service check package").length, 4);
+    assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 2);
+    assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 reverse tcp:8081 tcp:8081").length, 1);
+    assert.match(await readFile(harness.downstreamLog, "utf8"), /maestro --device emulator-5554 test --debug-output .*android-readiness/);
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android retries an exact transport line followed by a large benign diagnostic", async () => {
+  const largeDiagnostic = `diagnostic: ${"x".repeat(512 * 1024)}`;
+  const harness = await runAndroidTransientInstallHarness(
+    `Failure calling service package: Broken pipe (32)\n${largeDiagnostic}`,
+  );
+  try {
+    assert.equal(harness.result.status, 97, "large output after an exact transport line must still retry and continue");
+    assert.match(harness.result.stdout, /Failure calling service package: Broken pipe \(32\)\ndiagnostic: x+/);
+    const adbCalls = (await readFile(harness.adbLog, "utf8")).trim().split("\n");
+    assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 2);
+    assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 reverse tcp:8081 tcp:8081").length, 1);
+    assert.match(await readFile(harness.downstreamLog, "utf8"), /maestro --device emulator-5554 test --debug-output .*android-readiness/);
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android stops after a second transient package transport install failure", async () => {
+  const harness = await runAndroidTransientInstallHarness(
+    "Can't find service: package",
+    "Failure calling service package: Broken pipe (32)",
+  );
+  try {
+    assert.notEqual(harness.result.status, 0);
+    assert.match(harness.result.stdout, /Can't find service: package\nFailure calling service package: Broken pipe \(32\)/);
+    const adbCalls = (await readFile(harness.adbLog, "utf8")).trim().split("\n");
+    assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 shell service check package").length, 4);
+    assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 2);
+    assert.equal(adbCalls.some((call) => call.includes(" reverse ")), false);
+    assert.equal(await readFile(harness.downstreamLog, "utf8"), "");
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android does not retry transport-signature supersets or content failures", async () => {
+  const terminalFailures = [
+    "Can't find service: package manager unavailable",
+    "Failure calling service package: Broken pipeline parser",
+    "Failure [INSTALL_FAILED_INVALID_APK]: Can't find service: package metadata",
+  ];
+  for (const terminalFailure of terminalFailures) {
+    const harness = await runAndroidTransientInstallHarness(terminalFailure);
+    try {
+      assert.notEqual(harness.result.status, 0, `${terminalFailure} must fail closed`);
+      assert.match(harness.result.stdout, new RegExp(terminalFailure.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      const adbCalls = (await readFile(harness.adbLog, "utf8")).trim().split("\n");
+      assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 1, `${terminalFailure} must not retry`);
+      assert.equal(adbCalls.some((call) => call.includes(" reverse ")), false, `${terminalFailure} must stop before reverse`);
+      assert.equal(await readFile(harness.downstreamLog, "utf8"), "", `${terminalFailure} must stop before downstream execution`);
+    } finally {
+      await rm(harness.root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -947,7 +1122,7 @@ exit 97
       },
     });
     assert.notEqual(result.status, 0, "invalid APK install must fail closed");
-    assert.match(result.stderr, /Failure \[INSTALL_FAILED_INVALID_APK\]/);
+    assert.match(result.stdout, /Failure \[INSTALL_FAILED_INVALID_APK\]/);
     const adbCalls = (await readFile(adbLog, "utf8")).trim().split("\n");
     assert.equal(adbCalls[0], "devices");
     assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 shell service check package").length, 2);
@@ -1315,22 +1490,32 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
   assert.notEqual(duplicateAndroidInstall, androidRunner);
   assert.throws(
     () => assertExactAndroidInstallPolicy(duplicateAndroidInstall),
-    /exactly one exact --no-streaming -r install command/,
+    /exactly one captured --no-streaming -r install command/,
+  );
+
+  const wrongAndroidArchitecture = androidRunner.replace(
+    exactAndroidBuildCommand,
+    exactAndroidBuildCommand.replace("x86_64", "arm64-v8a"),
+  );
+  assert.notEqual(wrongAndroidArchitecture, androidRunner);
+  assert.throws(
+    () => assertExactAndroidRunnerSha256(wrongAndroidArchitecture),
+    /must match the reviewed SHA-256/,
   );
 
   const packageServiceMutations = [
     androidRunner.replace("seq 1 60", "seq 1 59"),
     androidRunner.replace(exactAndroidPackageServiceLines[1], ""),
     androidRunner.replace(
-      `trap cleanup EXIT\n${exactAndroidPackageServiceLines[0]}`,
-      `${exactAndroidPackageServiceLines[0]}\ntrap cleanup EXIT`,
+      `trap cleanup EXIT\n${exactAndroidPackageServiceCall}`,
+      `${exactAndroidPackageServiceCall}\ntrap cleanup EXIT`,
     ),
   ];
   for (const mutatedScript of packageServiceMutations) {
     assert.notEqual(mutatedScript, androidRunner);
     assert.throws(
       () => assertExactAndroidPackageServicePolicy(mutatedScript),
-      /exact bounded loop and final fail-closed probe|register cleanup before package readiness/,
+      /exact bounded loop and final fail-closed probe|call the bounded package-service wait|register cleanup, wait before the first install/,
     );
   }
 
