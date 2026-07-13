@@ -275,6 +275,7 @@ function pinnedAndroidActionScript(workflow: Workflow): string {
     arch: "x86_64",
     profile: "pixel_6",
     "disable-linux-hw-accel": false,
+    "emulator-options": "-no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -accel on",
     script: "bash scripts/e2e/run-android-emulator.sh",
   }, "Android emulator action inputs must remain exact");
   assertUnconditionalFailClosed(step, "Android emulator action");
@@ -365,6 +366,12 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
     assert.equal(kvmStep.run, exactAndroidKvmScript, "Android KVM hardware acceleration setup must remain exact and fail closed");
     assertUnconditionalFailClosed(kvmStep, "Android KVM hardware acceleration setup");
     const emulatorIndex = stepIndex(steps, (step) => usesActionRepository(step, androidEmulatorRepository), "Android emulator");
+    const kvmLaunchProbeIndexes = steps.flatMap((step, index) => step.name === androidKvmLaunchProbeStepName ? [index] : []);
+    assert.equal(kvmLaunchProbeIndexes.length, 1, "Android must contain exactly one launch-adjacent KVM verification step");
+    const kvmLaunchProbeIndex = kvmLaunchProbeIndexes[0];
+    const kvmLaunchProbeStep = steps[kvmLaunchProbeIndex];
+    assert.equal(kvmLaunchProbeStep.run, exactAndroidKvmLaunchProbeScript, "Android launch-adjacent KVM verification must remain exact and fail closed");
+    assertUnconditionalFailClosed(kvmLaunchProbeStep, "Android launch-adjacent KVM verification");
     const e2ePrebuild = steps[e2ePrebuildIndex];
     assert.ok(typeof e2ePrebuild.run === "string", "Android E2E prebuild must have an enabled run script");
     assert.deepEqual(
@@ -374,7 +381,8 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
     );
     assert.equal(kvmIndex, assertionIndex + 1, "Android KVM setup must immediately follow the exact SHA assertion");
     assert.equal(installIndex, kvmIndex + 1, "Android npm install must immediately follow the exact KVM setup");
-    assert.ok(e2ePrebuildIndex < emulatorIndex, "Android x86_64 E2E build must complete before the emulator action");
+    assert.ok(e2ePrebuildIndex < kvmLaunchProbeIndex, "Android x86_64 E2E build must complete before launch-adjacent KVM verification");
+    assert.equal(kvmLaunchProbeIndex, emulatorIndex - 1, "Android KVM verification must immediately precede the emulator action");
   }
 
   const collectorIndexes = steps.flatMap((step, index) => step.name === "Collect same-SHA evidence" ? [index] : []);
@@ -549,9 +557,15 @@ const smokeFlow = "e2e/maestro/shell-smoke.yaml";
 const exactAndroidMaestroTimeout = "60000";
 const exactAndroidRunner = "ubuntu-latest";
 const androidKvmStepName = "Enable KVM hardware acceleration";
+const androidKvmLaunchProbeStepName = "Verify KVM immediately before emulator launch";
 const exactAndroidKvmScript = `set -euo pipefail
 test -c /dev/kvm
 sudo chmod 0666 /dev/kvm
+test -r /dev/kvm
+test -w /dev/kvm
+`;
+const exactAndroidKvmLaunchProbeScript = `set -euo pipefail
+test -c /dev/kvm
 test -r /dev/kvm
 test -w /dev/kvm
 `;
@@ -1906,6 +1920,11 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
       assert.ok(typeof step.run === "string");
       step.run = step.run.replace("sudo chmod 0666 /dev/kvm", "sudo chmod 0660 /dev/kvm");
     }],
+    ["missing-character-probe", (candidate) => {
+      const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex];
+      assert.ok(typeof step.run === "string");
+      step.run = step.run.replace("test -c /dev/kvm\n", "");
+    }],
     ["missing-read-probe", (candidate) => {
       const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex];
       assert.ok(typeof step.run === "string");
@@ -1938,6 +1957,49 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
     );
   }
 
+  const androidKvmLaunchProbeIndex = androidSteps.findIndex((step) => step.name === androidKvmLaunchProbeStepName);
+  assert.notEqual(androidKvmLaunchProbeIndex, -1);
+  const hostileKvmLaunchProbeMutations: [string, (candidate: NativeWorkflows) => void][] = [
+    ["removed", (candidate) => {
+      requiredSteps(requiredJob(candidate.android, "android"), "android").splice(androidKvmLaunchProbeIndex, 1);
+    }],
+    ["missing-character-probe", (candidate) => {
+      const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmLaunchProbeIndex];
+      assert.ok(typeof step.run === "string");
+      step.run = step.run.replace("test -c /dev/kvm\n", "");
+    }],
+    ["missing-read-probe", (candidate) => {
+      const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmLaunchProbeIndex];
+      assert.ok(typeof step.run === "string");
+      step.run = step.run.replace("test -r /dev/kvm\n", "");
+    }],
+    ["missing-write-probe", (candidate) => {
+      const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmLaunchProbeIndex];
+      assert.ok(typeof step.run === "string");
+      step.run = step.run.replace("test -w /dev/kvm\n", "");
+    }],
+    ["conditional", (candidate) => {
+      requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmLaunchProbeIndex].if = "${{ false }}";
+    }],
+    ["continue-on-error", (candidate) => {
+      requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmLaunchProbeIndex]["continue-on-error"] = true;
+    }],
+    ["reordered", (candidate) => {
+      const steps = requiredSteps(requiredJob(candidate.android, "android"), "android");
+      const [step] = steps.splice(androidKvmLaunchProbeIndex, 1);
+      steps.unshift(step);
+    }],
+  ];
+  for (const [label, mutate] of hostileKvmLaunchProbeMutations) {
+    const candidate = structuredClone(workflows);
+    mutate(candidate);
+    assert.throws(
+      () => assertNativeWorkflowPolicy(candidate),
+      /launch-adjacent KVM verification|KVM verification must immediately precede/,
+      `hostile launch-adjacent KVM ${label} mutation must be rejected`,
+    );
+  }
+
   const wrongAndroidRunner = structuredClone(workflows);
   requiredJob(wrongAndroidRunner.android, "android")["runs-on"] = "ubuntu-24.04";
   assert.throws(() => assertNativeWorkflowPolicy(wrongAndroidRunner), /Android runner must remain ubuntu-latest/);
@@ -1953,6 +2015,20 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
       () => assertNativeWorkflowPolicy(unsafeAccelerationFallback),
       /Android emulator action inputs must remain exact/,
       `Android emulator must reject disable-linux-hw-accel fallback ${String(fallback)}`,
+    );
+  }
+
+  for (const hostileOptions of [undefined, "-accel auto", "-accel off"] as const) {
+    const unsafeAccelerationOptions = structuredClone(workflows);
+    const emulator = requiredSteps(requiredJob(unsafeAccelerationOptions.android, "android"), "android")
+      .find((step) => step.uses === androidEmulatorAction);
+    assert.ok(emulator?.with);
+    if (hostileOptions === undefined) delete emulator.with["emulator-options"];
+    else emulator.with["emulator-options"] = hostileOptions;
+    assert.throws(
+      () => assertNativeWorkflowPolicy(unsafeAccelerationOptions),
+      /Android emulator action inputs must remain exact/,
+      `Android emulator must reject acceleration options ${String(hostileOptions)}`,
     );
   }
 
