@@ -233,6 +233,14 @@ function requiredJob(workflow: Workflow, name: string): WorkflowJob {
   return job;
 }
 
+function assertExactJobKeys(workflow: Workflow, expected: string[], label: string): void {
+  assert.deepEqual(
+    Object.keys(workflow.jobs).sort(),
+    [...expected].sort(),
+    `${label} workflow jobs must contain only the approved exact keys`,
+  );
+}
+
 function requiredSteps(job: WorkflowJob, name: string): WorkflowStep[] {
   assert.ok(Array.isArray(job.steps), `Workflow job ${name} has no parsed steps`);
   return job.steps;
@@ -321,6 +329,7 @@ function assertPreflightSemanticPolicy(script: string): void {
 }
 
 function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios"): void {
+  assertExactJobKeys(workflow, [jobName], jobName);
   const job = requiredJob(workflow, jobName);
   assertUnconditionalFailClosed(job, `${jobName} job`);
   const steps = requiredSteps(job, jobName);
@@ -374,7 +383,9 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
   const diagnosticsUploadName = `${jobName}-e2e-diagnostics-${expectedShaInput}`;
   const diagnosticsUploadIndexes = uploadIndexes.filter((index) => steps[index].with?.name === diagnosticsUploadName);
   assert.equal(diagnosticsUploadIndexes.length, 1, `${jobName} must retain exactly one diagnostics upload`);
-  const diagnosticsUpload = steps[diagnosticsUploadIndexes[0]];
+  const diagnosticsUploadIndex = diagnosticsUploadIndexes[0];
+  const diagnosticsUpload = steps[diagnosticsUploadIndex];
+  assert.equal(diagnosticsUpload.uses, uploadArtifactAction, `${jobName} diagnostics upload must remain pinned`);
   assert.equal(diagnosticsUpload.if, "always()", `${jobName} diagnostics upload must always run`);
   assert.equal(Object.hasOwn(diagnosticsUpload, "continue-on-error"), false, `${jobName} diagnostics upload must fail closed`);
   assert.deepEqual(diagnosticsUpload.with, {
@@ -383,10 +394,15 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
     "include-hidden-files": true,
     "if-no-files-found": "ignore",
   }, `${jobName} diagnostics upload inputs must remain exact`);
+  assert.ok(
+    diagnosticsUploadIndex > primaryUploadIndex,
+    `${jobName} diagnostics upload must follow the primary evidence upload`,
+  );
   if (jobName === "android") pinnedAndroidActionScript(workflow);
 }
 
 function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
+  assertExactJobKeys(workflows.ci, ["static", "android-e2e", "ios-e2e"], "CI");
   const staticJob = requiredJob(workflows.ci, "static");
   assertUnconditionalFailClosed(staticJob, "Static job");
   assert.equal(staticJob["runs-on"], "macos-15-intel", "Static runner must be the Intel macOS image");
@@ -440,15 +456,21 @@ function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
     usesActionRepository(step, uploadArtifactRepository) ? [index] : []
   );
   assert.equal(staticUploadIndexes.length, 1, "Static job must contain exactly one artifact upload");
-  const staticUpload = steps[staticUploadIndexes[0]];
+  const staticUploadIndex = staticUploadIndexes[0];
+  const staticUpload = steps[staticUploadIndex];
   assert.equal(staticUpload.uses, uploadArtifactAction, "Static evidence upload action must remain pinned");
-  assert.equal(staticUpload.with?.name, `static-evidence-${exactHeadSha}`, "Static evidence upload name must remain exact");
   assertUnconditionalFailClosed(staticUpload, "Static evidence upload");
+  assert.ok(staticUploadIndex > collectorIndex, "Static evidence upload must follow the static evidence collector");
   const staticUploadPath = staticUpload.with?.path;
   assert.ok(typeof staticUploadPath === "string", "Static evidence upload path must be a string");
   assert.ok(staticUploadPath.split("\n").includes(".artifacts/static.json"), "Static evidence upload must retain static.json");
   assert.doesNotMatch(staticUploadPath, forbiddenStaticUploadPath, "Static evidence upload must not include raw or generated WHO data");
   assert.equal(staticUploadPath, exactStaticUploadPath, "Static evidence upload path must retain only the approved evidence and text bundles");
+  assert.deepEqual(staticUpload.with, {
+    name: `static-evidence-${exactHeadSha}`,
+    path: exactStaticUploadPath,
+    "if-no-files-found": "error",
+  }, "Static evidence upload inputs must remain exact");
 
   for (const [jobName, workflowPath] of [["android-e2e", "./.github/workflows/e2e-android.yml"], ["ios-e2e", "./.github/workflows/e2e-ios.yml"]] as const) {
     const reusableJob = requiredJob(workflows.ci, jobName);
@@ -1387,6 +1409,22 @@ test("native workflows enforce the parsed Intel runner, exact SHA boundaries, an
 test("parsed workflow policy rejects hostile structural counterexamples", async () => {
   const workflows = await loadNativeWorkflows();
 
+  for (const [workflowKey, hostileJobName, hostileUses] of [
+    ["ci", "hostile-upload", "actions/upload-artifact@main"],
+    ["android", "hostile-emulator", "rEaCtIvEcIrCuS/AnDrOiD-EmUlAtOr-RuNnEr@main"],
+    ["ios", "hostile-upload", "AcTiOnS/UpLoAd-ArTiFaCt@main"],
+  ] as const) {
+    const extraJob = structuredClone(workflows);
+    extraJob[workflowKey].jobs[hostileJobName] = {
+      "runs-on": "ubuntu-latest",
+      steps: [{ uses: hostileUses }],
+    };
+    assert.throws(
+      () => assertNativeWorkflowPolicy(extraJob),
+      /workflow jobs must contain only the approved exact keys/,
+    );
+  }
+
   for (const run of originalStaticGateRuns) {
     for (const field of ["if", "continue-on-error"] as const) {
       const hostileGate = structuredClone(workflows);
@@ -1483,6 +1521,38 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
   assert.ok(missingStaticJsonUpload?.with && typeof missingStaticJsonUpload.with.path === "string");
   missingStaticJsonUpload.with.path = missingStaticJsonUpload.with.path.replace(".artifacts/static.json\n", "");
   assert.throws(() => assertNativeWorkflowPolicy(missingStaticJson), /must retain static.json/);
+
+  const missingStaticUploadError = structuredClone(workflows);
+  const staticUploadWithoutError = requiredSteps(requiredJob(missingStaticUploadError.ci, "static"), "static")
+    .find((step) => step.uses === uploadArtifactAction);
+  assert.ok(staticUploadWithoutError?.with);
+  delete staticUploadWithoutError.with["if-no-files-found"];
+  assert.throws(
+    () => assertNativeWorkflowPolicy(missingStaticUploadError),
+    /Static evidence upload inputs must remain exact/,
+  );
+
+  const hostileStaticPath = structuredClone(workflows);
+  const staticUploadWithHostilePath = requiredSteps(requiredJob(hostileStaticPath.ci, "static"), "static")
+    .find((step) => step.uses === uploadArtifactAction);
+  assert.ok(staticUploadWithHostilePath?.with);
+  staticUploadWithHostilePath.with.path = `${exactStaticUploadPath}.artifacts/hostile/**\n`;
+  assert.throws(
+    () => assertNativeWorkflowPolicy(hostileStaticPath),
+    /Static evidence upload path must retain only the approved evidence and text bundles/,
+  );
+
+  const reorderedStaticUpload = structuredClone(workflows);
+  const reorderedStaticSteps = requiredSteps(requiredJob(reorderedStaticUpload.ci, "static"), "static");
+  const reorderedStaticUploadIndex = reorderedStaticSteps.findIndex((step) => step.uses === uploadArtifactAction);
+  const reorderedStaticCollectorIndex = reorderedStaticSteps.findIndex((step) => step.run === exactStaticCollector);
+  assert.ok(reorderedStaticUploadIndex > reorderedStaticCollectorIndex);
+  const [movedStaticUpload] = reorderedStaticSteps.splice(reorderedStaticUploadIndex, 1);
+  reorderedStaticSteps.splice(reorderedStaticCollectorIndex, 0, movedStaticUpload);
+  assert.throws(
+    () => assertNativeWorkflowPolicy(reorderedStaticUpload),
+    /Static evidence upload must follow the static evidence collector/,
+  );
 
   for (const hostileUses of [
     "actions/upload-artifact@main",
@@ -1596,6 +1666,19 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
     assert.throws(
       () => assertNativeWorkflowPolicy(missingPlatformJson),
       new RegExp(`${jobName} primary evidence upload inputs must remain exact`),
+    );
+
+    const diagnosticsBeforeExecution = structuredClone(workflows);
+    const reorderedChildSteps = requiredSteps(requiredJob(diagnosticsBeforeExecution[child], jobName), jobName);
+    const diagnosticsIndex = reorderedChildSteps.findIndex(
+      (step) => step.with?.name === `${jobName}-e2e-diagnostics-${expectedShaInput}`,
+    );
+    assert.ok(diagnosticsIndex > 0);
+    const [movedDiagnostics] = reorderedChildSteps.splice(diagnosticsIndex, 1);
+    reorderedChildSteps.unshift(movedDiagnostics);
+    assert.throws(
+      () => assertNativeWorkflowPolicy(diagnosticsBeforeExecution),
+      new RegExp(`${jobName} diagnostics upload must follow the primary evidence upload`),
     );
 
     for (const hostileUses of ["actions/upload-artifact@main", "AcTiOnS/UpLoAd-ArTiFaCt@main"]) {
