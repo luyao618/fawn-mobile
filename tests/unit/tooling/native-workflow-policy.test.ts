@@ -567,7 +567,12 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
   const cleanupStart = lines.indexOf("cleanup() {");
   const cleanupEnd = lines.indexOf("trap cleanup EXIT", cleanupStart + 1);
   assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart, "Android cleanup function and EXIT trap must remain exact");
-  const logicalLines = script.replace(/\\(?:\r\n|\n|\r)/g, "").split(/\r\n|\n|\r/);
+  const logicalLines = script
+    .split(/\r\n|\n|\r/)
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n")
+    .replace(/\\\n/g, "")
+    .split("\n");
   const logicalCleanupStart = logicalLines.indexOf("cleanup() {");
   const logicalCleanupEnd = logicalLines.indexOf("trap cleanup EXIT", logicalCleanupStart + 1);
   assert.ok(
@@ -575,8 +580,7 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
     "Android logical cleanup function and EXIT trap must remain exact",
   );
   const diagnosticCommands = logicalLines.slice(logicalCleanupStart, logicalCleanupEnd + 1).filter(
-    (line) => !/^\s*#/.test(line)
-      && /\badb\b/.test(line)
+    (line) => /\badb\b/.test(line)
       && /\b(?:screencap|uiautomator|pidof|logcat)\b/.test(line),
   );
   assert.deepEqual(
@@ -1193,9 +1197,24 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
   assert.notEqual(commentedExtraAndroidDiagnostic, androidRunner);
   assert.doesNotThrow(() => assertAndroidDiagnosticsPolicy(commentedExtraAndroidDiagnostic, androidWorkflow));
 
+  const bashCommentBoundary = spawnSync("/bin/bash", ["-c", String.raw`# comment \
+printf 'next-line-ran'`], { encoding: "utf8" });
+  assert.equal(bashCommentBoundary.status, 0);
+  assert.equal(bashCommentBoundary.stdout, "next-line-ran");
+
+  const commentFollowedByExecutableAndroidDiagnostic = androidRunner.replace(
+    exactAndroidFailureScreenshotCommand,
+    `${exactAndroidFailureScreenshotCommand}\n    # a full-line comment ending in backslash \\\n    adb -s "$emulator_serial" logcat -d > .artifacts/launch/device/comment-boundary.log 2>&1`,
+  );
+  assert.notEqual(commentFollowedByExecutableAndroidDiagnostic, androidRunner);
+  assert.throws(
+    () => assertAndroidDiagnosticsPolicy(commentFollowedByExecutableAndroidDiagnostic, androidWorkflow),
+    /executable Android diagnostic adb command inventory must exactly match/,
+  );
+
   const continuedCommentOnlyAndroidDiagnostic = androidRunner.replace(
     exactAndroidFailureScreenshotCommand,
-    `${exactAndroidFailureScreenshotCommand}\n    # adb -s "$emulator_serial" \\\n+      logcat -d > .artifacts/launch/device/comment-only-continued.log 2>&1`,
+    `${exactAndroidFailureScreenshotCommand}\n    # adb -s "$emulator_serial" \\\n    # logcat -d > .artifacts/launch/device/comment-only-continued.log 2>&1`,
   );
   assert.notEqual(continuedCommentOnlyAndroidDiagnostic, androidRunner);
   assert.doesNotThrow(() => assertAndroidDiagnosticsPolicy(continuedCommentOnlyAndroidDiagnostic, androidWorkflow));
