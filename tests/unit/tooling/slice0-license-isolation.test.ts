@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { validateSlice0LicenseArtifacts } from "../../../tools/check-licenses.mjs";
+import { APPROVED_SLICE0_SPDX, validateSlice0LicenseArtifacts } from "../../../tools/check-licenses.mjs";
 
 async function fixtures() {
   return Promise.all([
@@ -59,4 +59,21 @@ test("spike lock root and package integrity drift fail closed", async () => {
   const integrityDrift = clone(basePackageLock);
   integrityDrift.packages["node_modules/eventsource-parser"].integrity = "sha512-forged";
   assert.throws(() => validateSlice0LicenseArtifacts(inventory, artifact, manifest, integrityDrift), /integrity drifted/);
+});
+
+test("all eight approved Slice 0 SPDX identities reject hostile GPL relabeling independently", async () => {
+  const [baseInventory, artifact, manifest, packageLock] = await fixtures();
+  assert.equal(Object.keys(APPROVED_SLICE0_SPDX).length, 8);
+  for (const name of Object.keys(APPROVED_SLICE0_SPDX)) {
+    const inventory = clone(baseInventory);
+    const entry = [...inventory.direct_dependencies, ...inventory.development_dependencies]
+      .find((item: { name: string }) => item.name === name);
+    assert.ok(entry, name);
+    entry.license = "GPL-3.0-only";
+    assert.throws(
+      () => validateSlice0LicenseArtifacts(inventory, artifact, manifest, packageLock),
+      new RegExp(`${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} SPDX identity drifted`),
+      name,
+    );
+  }
 });

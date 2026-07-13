@@ -98,6 +98,8 @@ export async function validateFaultBundleProof(proof, options = {}) {
       assert.equal(entry.metadata.sha256, sha256(metadataBytes), `${label} metadata hash disagrees`);
       const metadata = JSON.parse(metadataBytes.toString("utf8"));
       assert(hasExactKeys(metadata, ["version", "bundler", "fileMetadata"]), `${label} Expo metadata contains unknown or missing root fields`);
+      assert.equal(metadata.version, 0, `${label} Expo metadata version must remain 0`);
+      assert.equal(metadata.bundler, "metro", `${label} Expo metadata bundler must remain metro`);
       assert(hasExactKeys(metadata.fileMetadata, [platform]), `${label} Expo metadata contains unknown or missing platform fields`);
       assert(hasExactKeys(metadata.fileMetadata[platform], ["bundle", "assets"]), `${label} Expo metadata platform entry contains unknown or missing fields`);
       assert(Array.isArray(metadata.fileMetadata[platform].assets), `${label} Expo metadata assets must be an array`);

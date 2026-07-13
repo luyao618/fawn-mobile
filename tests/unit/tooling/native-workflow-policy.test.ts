@@ -32,6 +32,8 @@ type WorkflowJob = {
   uses?: unknown;
   with?: Record<string, unknown>;
   steps?: WorkflowStep[];
+  if?: unknown;
+  "continue-on-error"?: unknown;
 };
 
 type Workflow = {
@@ -236,16 +238,17 @@ function stepIndex(steps: WorkflowStep[], predicate: (step: WorkflowStep) => boo
   return index;
 }
 
-function assertUnconditionalFailClosed(step: WorkflowStep, label: string): void {
-  assert.equal(Object.hasOwn(step, "if"), false, `${label} must not be conditional`);
-  assert.equal(Object.hasOwn(step, "continue-on-error"), false, `${label} must fail closed`);
+function assertUnconditionalFailClosed(node: WorkflowStep | WorkflowJob, label: string): void {
+  assert.equal(Object.hasOwn(node, "if"), false, `${label} must not be conditional`);
+  assert.equal(Object.hasOwn(node, "continue-on-error"), false, `${label} must fail closed`);
 }
 
 function pinnedAndroidActionScript(workflow: Workflow): string {
   const steps = requiredSteps(requiredJob(workflow, "android"), "android");
-  const matches = steps.filter((step) => step.uses === androidEmulatorAction);
-  assert.equal(matches.length, 1, "Android must contain exactly one pinned emulator action step");
+  const matches = steps.filter((step) => typeof step.uses === "string" && step.uses.startsWith("ReactiveCircus/android-emulator-runner@"));
+  assert.equal(matches.length, 1, "Android must contain exactly one emulator action family step");
   const step = matches[0];
+  assert.equal(step.uses, androidEmulatorAction, "Android emulator action must remain pinned to the reviewed SHA");
   assert.deepEqual(step.with, {
     "api-level": 35,
     arch: "x86_64",
@@ -315,6 +318,7 @@ function assertPreflightSemanticPolicy(script: string): void {
 
 function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios"): void {
   const job = requiredJob(workflow, jobName);
+  assertUnconditionalFailClosed(job, `${jobName} job`);
   const steps = requiredSteps(job, jobName);
   const checkoutIndex = stepIndex(steps, (step) => step.uses === checkoutAction, `${jobName} checkout`);
   assert.equal(steps[checkoutIndex].with?.ref, expectedShaInput, `${jobName} checkout must use inputs.expected_sha`);
@@ -351,6 +355,7 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
 
 function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
   const staticJob = requiredJob(workflows.ci, "static");
+  assertUnconditionalFailClosed(staticJob, "Static job");
   assert.equal(staticJob["runs-on"], "macos-15-intel", "Static runner must be the Intel macOS image");
   const steps = requiredSteps(staticJob, "static");
   const checkoutIndex = stepIndex(steps, (step) => step.uses === checkoutAction, "Static checkout");
@@ -397,6 +402,7 @@ function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
 
   const collectorIndex = stepIndex(steps, (step) => step.run === exactStaticCollector, "Static evidence collector");
   assert.ok(collectorIndex > previousGateIndex, "Static evidence must be collected after all original gates");
+  assertUnconditionalFailClosed(steps[collectorIndex], "Static evidence collector");
   assertArtifactName(steps, `static-evidence-${exactHeadSha}`);
   const staticUploadIndexes = steps.flatMap((step, index) =>
     typeof step.uses === "string" && step.uses.startsWith("actions/upload-artifact@") ? [index] : []
@@ -405,13 +411,16 @@ function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
   const staticUpload = steps[staticUploadIndexes[0]];
   assert.equal(staticUpload.uses, uploadArtifactAction, "Static evidence upload action must remain pinned");
   assert.equal(staticUpload.with?.name, `static-evidence-${exactHeadSha}`, "Static evidence upload name must remain exact");
+  assertUnconditionalFailClosed(staticUpload, "Static evidence upload");
   const staticUploadPath = staticUpload.with?.path;
   assert.ok(typeof staticUploadPath === "string", "Static evidence upload path must be a string");
+  assert.ok(staticUploadPath.split("\n").includes(".artifacts/static.json"), "Static evidence upload must retain static.json");
   assert.doesNotMatch(staticUploadPath, forbiddenStaticUploadPath, "Static evidence upload must not include raw or generated WHO data");
   assert.equal(staticUploadPath, exactStaticUploadPath, "Static evidence upload path must retain only the approved evidence and text bundles");
 
   for (const [jobName, workflowPath] of [["android-e2e", "./.github/workflows/e2e-android.yml"], ["ios-e2e", "./.github/workflows/e2e-ios.yml"]] as const) {
     const reusableJob = requiredJob(workflows.ci, jobName);
+    assertUnconditionalFailClosed(reusableJob, `${jobName} reusable CI job`);
     assert.equal(reusableJob.needs, "static");
     assert.equal(reusableJob.uses, workflowPath);
     assert.equal(reusableJob.with?.expected_sha, exactHeadSha);
@@ -1363,7 +1372,17 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
   assert.doesNotThrow(() => parseWorkflow(commentDecoy, "comment-decoy Android"));
   assert.throws(
     () => pinnedAndroidActionScript(parseWorkflow(commentDecoy, "comment-decoy Android")),
-    /exactly one pinned emulator action step/,
+    /must remain pinned to the reviewed SHA/,
+  );
+
+  const extraUnpinnedFamilyAction = structuredClone(workflows);
+  requiredSteps(requiredJob(extraUnpinnedFamilyAction.android, "android"), "android").push({
+    uses: "ReactiveCircus/android-emulator-runner@main",
+    with: { script: "echo hostile" },
+  });
+  assert.throws(
+    () => assertNativeWorkflowPolicy(extraUnpinnedFamilyAction),
+    /exactly one emulator action family step/,
   );
 
   const heredocDecoyStep = `      - run: |\n          cat <<'YAML'\n          - uses: ${androidEmulatorAction}\n            with:\n              script: bash scripts/e2e/run-android-emulator.sh\n          YAML\n`;
@@ -1410,6 +1429,40 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
   assert.ok(rawWhoUploadStep?.with && typeof rawWhoUploadStep.with.path === "string");
   rawWhoUploadStep.with.path += "knowledge/sources/who-growth/**\n";
   assert.throws(() => assertNativeWorkflowPolicy(rawWhoUpload), /must not include raw or generated WHO data/);
+
+  const missingStaticJson = structuredClone(workflows);
+  const missingStaticJsonUpload = requiredSteps(requiredJob(missingStaticJson.ci, "static"), "static")
+    .find((step) => step.uses === uploadArtifactAction && step.with?.name === `static-evidence-${exactHeadSha}`);
+  assert.ok(missingStaticJsonUpload?.with && typeof missingStaticJsonUpload.with.path === "string");
+  missingStaticJsonUpload.with.path = missingStaticJsonUpload.with.path.replace(".artifacts/static.json\n", "");
+  assert.throws(() => assertNativeWorkflowPolicy(missingStaticJson), /must retain static.json/);
+
+  for (const [label, select] of [
+    ["Static job", (candidate: NativeWorkflows) => requiredJob(candidate.ci, "static")],
+    ["android job", (candidate: NativeWorkflows) => requiredJob(candidate.android, "android")],
+    ["ios job", (candidate: NativeWorkflows) => requiredJob(candidate.ios, "ios")],
+    ["android-e2e reusable CI job", (candidate: NativeWorkflows) => requiredJob(candidate.ci, "android-e2e")],
+    ["ios-e2e reusable CI job", (candidate: NativeWorkflows) => requiredJob(candidate.ci, "ios-e2e")],
+  ] as const) {
+    for (const field of ["if", "continue-on-error"] as const) {
+      const hostileJob = structuredClone(workflows);
+      select(hostileJob)[field] = field === "if" ? "${{ false }}" : true;
+      assert.throws(() => assertNativeWorkflowPolicy(hostileJob), new RegExp(`${label} must`));
+    }
+  }
+
+  for (const [label, select] of [
+    ["Static evidence collector", (candidate: NativeWorkflows) => requiredSteps(requiredJob(candidate.ci, "static"), "static").find((step) => step.run === exactStaticCollector)],
+    ["Static evidence upload", (candidate: NativeWorkflows) => requiredSteps(requiredJob(candidate.ci, "static"), "static").find((step) => step.uses === uploadArtifactAction)],
+  ] as const) {
+    for (const field of ["if", "continue-on-error"] as const) {
+      const hostileStep = structuredClone(workflows);
+      const selected = select(hostileStep);
+      assert.ok(selected);
+      selected[field] = field === "if" ? "${{ false }}" : true;
+      assert.throws(() => assertNativeWorkflowPolicy(hostileStep), new RegExp(`${label} must`));
+    }
+  }
 
   const camouflagedNdkSelector = structuredClone(workflows);
   const camouflagedPreflight = requiredSteps(requiredJob(camouflagedNdkSelector.ci, "static"), "static")

@@ -6,6 +6,16 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const exactVersion = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const registryIntegrity = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
+export const APPROVED_SLICE0_SPDX = Object.freeze({
+  "@types/node": "MIT",
+  "@types/react": "MIT",
+  "eventsource-parser": "MIT",
+  expo: "MIT",
+  react: "MIT",
+  "react-native": "MIT",
+  tsx: "MIT",
+  typescript: "Apache-2.0",
+});
 
 function exactEntries(value, label) {
   assert(value && typeof value === "object" && !Array.isArray(value), `${label} must be an object`);
@@ -25,6 +35,7 @@ export function validateSlice0LicenseArtifacts(inventory, artifactLock, manifest
   assert.equal(inventoried.size, inventoriedItems.length, "Slice 0 license inventory contains duplicate packages");
   assert.equal(locked.size, artifactLock.packages.length, "Slice 0 artifact lock contains duplicate packages");
   assert.deepEqual([...inventoried.keys()].sort(), [...locked.keys()].sort(), "Frozen Slice 0 inventories disagree on package ownership");
+  assert.deepEqual([...inventoried.keys()].sort(), Object.keys(APPROVED_SLICE0_SPDX).sort(), "Slice 0 package identities drifted from the approved SPDX policy");
 
   const runtimeManifest = exactEntries(manifest.dependencies, "spikes/model-transport runtime dependencies");
   const developmentManifest = exactEntries(manifest.devDependencies, "spikes/model-transport development dependencies");
@@ -37,7 +48,7 @@ export function validateSlice0LicenseArtifacts(inventory, artifactLock, manifest
 
   for (const [name, entry] of inventoried) {
     assert.match(entry.version, exactVersion, `${name} must be exact-pinned`);
-    assert(entry.license, `${name} has no recorded license`);
+    assert.equal(entry.license, APPROVED_SLICE0_SPDX[name], `${name} SPDX identity drifted from the approved Slice 0 policy`);
     assert.match(entry.maintenance_status ?? "", /^(active|maintenance|deprecated)$/, `${name} has no valid maintenance status`);
     assert.equal(typeof entry.platform_support, "string", `${name} has no platform support metadata`);
     assert(entry.platform_support.trim(), `${name} has empty platform support metadata`);

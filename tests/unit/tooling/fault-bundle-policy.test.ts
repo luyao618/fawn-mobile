@@ -197,3 +197,25 @@ test("text-bundle proof binds retained metadata to its claimed platform and cano
     }
   }
 });
+
+test("text-bundle proof rejects hostile retained Expo metadata version and bundler values", async () => {
+  for (const [field, value, message] of [
+    ["version", 1, /metadata version must remain 0/],
+    ["bundler", "webpack", /metadata bundler must remain metro/],
+  ] as const) {
+    const { root, proof } = await fixture("production-no-op", `e2e:${FAULT_CONTROLLER_SENTINEL}`);
+    try {
+      const entry = proof.bundles.android.e2e;
+      const metadataPath = join(root, entry.metadata.path);
+      const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
+      metadata[field] = value;
+      const bytes = Buffer.from(JSON.stringify(metadata));
+      await writeFile(metadataPath, bytes);
+      entry.metadata.bytes = bytes.length;
+      entry.metadata.sha256 = createHash("sha256").update(bytes).digest("hex");
+      await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), message);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});

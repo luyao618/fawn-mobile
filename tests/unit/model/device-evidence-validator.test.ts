@@ -10,6 +10,7 @@ import test from "node:test";
 import {
   G017_SOURCE_PATHS,
   computeG017SourceFingerprint,
+  hermesCompilerPath,
   validateExportArtifact,
   validateG017Evidence,
   validateProofText,
@@ -264,6 +265,19 @@ test("G017 source boundary remains exactly 34 unique existing spike-owned paths"
   for (const path of excludedRootAppPaths) assert(!sourcePaths.includes(path), path);
   assert(G017_SOURCE_PATHS.includes("tools/redaction.d.mts"));
   for (const path of G017_SOURCE_PATHS) await assert.doesNotReject(readFile(resolve(path)), path);
+});
+
+test("G017 Hermes compiler identity is owned by the spike lock while the root lock remains excluded", async () => {
+  const spikeLock = JSON.parse(await readFile("spikes/model-transport/package-lock.json", "utf8"));
+  const currentHermesVersion = "250829098.0.14";
+  assert.equal(spikeLock.packages["node_modules/hermes-compiler"].version, currentHermesVersion);
+  assert.equal(
+    hermesCompilerPath(),
+    resolve("spikes/model-transport/node_modules/hermes-compiler/hermesc", process.platform === "darwin" ? "osx-bin/hermesc" : process.platform === "linux" ? "linux64-bin/hermesc" : "win64-bin/hermesc.exe"),
+  );
+  assert.match(hermesCompilerPath(), /spikes\/model-transport\/node_modules\/hermes-compiler\/hermesc/);
+  assert(!G017_SOURCE_PATHS.includes("package-lock.json"));
+  assert(G017_SOURCE_PATHS.includes("spikes/model-transport/package-lock.json"));
 });
 
 test("G017 fingerprint ignores excluded root-app mutations but changes for spike-owned mutations", async (t) => {
