@@ -2,6 +2,7 @@ import { builtinModules } from "node:module";
 
 import expoConfig from "eslint-config-expo/flat.js";
 
+const typescriptParser = expoConfig.find((config) => config.languageOptions?.parser?.meta?.name === "typescript-eslint/parser").languageOptions.parser;
 const prefixOnlyNodeBuiltins = ["node:sea", "node:sqlite", "node:test", "node:test/reporters"];
 const nodeBuiltins = [...new Set([
   ...builtinModules,
@@ -18,6 +19,7 @@ const testingAliasPath = {
   name: faultControllerAlias,
   message: "Only a composition root may import the flavor-selected fault controller.",
 };
+const sourceExtensions = "{js,jsx,mjs,cjs,ts,tsx,mts,cts}";
 
 function categoryPatterns(...segments) {
   return segments.flatMap((segment) => [
@@ -57,8 +59,12 @@ const expoNativePatterns = [{
 const nonStaticImportSyntax = [
   "error",
   {
-    selector: "CallExpression[callee.name='require']",
-    message: "Production code must use statically analyzable imports instead of require().",
+    selector: "Identifier[name='require']",
+    message: "Production code must not reference require; use statically analyzable imports.",
+  },
+  {
+    selector: "MemberExpression[computed=true][property.value='require']",
+    message: "Production code must not access require through a computed property.",
   },
   {
     selector: "TSImportEqualsDeclaration",
@@ -67,6 +73,10 @@ const nonStaticImportSyntax = [
   {
     selector: "ImportExpression",
     message: "Production code must not use dynamic import().",
+  },
+  {
+    selector: "TSImportType",
+    message: "Production code must not load layer types through import() syntax.",
   },
 ];
 
@@ -91,11 +101,17 @@ export default [
     ],
   },
   {
-    files: ["App.tsx", "index.ts", "src/**/*.{ts,tsx}"],
+    files: ["**/*.{mts,cts}"],
+    languageOptions: { parser: typescriptParser },
+  },
+  {
+    files: [`App.${sourceExtensions}`, `index.${sourceExtensions}`, `src/**/*.${sourceExtensions}`],
     rules: {
       "import/no-unresolved": ["error", { ignore: ["^@for-mobile/fault-controller$"] }],
       "no-restricted-imports": restrictedImports(),
       "no-restricted-syntax": nonStaticImportSyntax,
+      "no-eval": "error",
+      "no-new-func": "error",
     },
   },
   {
@@ -103,7 +119,7 @@ export default [
     languageOptions: { globals: { __dirname: "readonly" } },
   },
   {
-    files: ["src/shared/**/*.{ts,tsx}"],
+    files: [`src/shared/**/*.${sourceExtensions}`],
     rules: {
       "no-restricted-imports": restrictedImports(
         [testingAliasPath],
@@ -118,7 +134,7 @@ export default [
     },
   },
   {
-    files: ["src/features/**/*.{ts,tsx}"],
+    files: [`src/features/**/*.${sourceExtensions}`],
     rules: {
       "no-restricted-imports": restrictedImports(
         [testingAliasPath],
@@ -130,7 +146,7 @@ export default [
     },
   },
   {
-    files: ["src/navigation/**/*.{ts,tsx}"],
+    files: [`src/navigation/**/*.${sourceExtensions}`],
     rules: {
       "no-restricted-imports": restrictedImports(
         [testingAliasPath],
@@ -142,7 +158,7 @@ export default [
     },
   },
   {
-    files: ["src/application/**/*.{ts,tsx}"],
+    files: [`src/application/**/*.${sourceExtensions}`],
     rules: {
       "no-restricted-imports": restrictedImports(
         [...platformPackagePaths, testingAliasPath],
@@ -157,7 +173,7 @@ export default [
     },
   },
   {
-    files: ["src/domain/**/*.{ts,tsx}"],
+    files: [`src/domain/**/*.${sourceExtensions}`],
     rules: {
       "no-restricted-imports": restrictedImports(
         [...platformPackagePaths, testingAliasPath],
@@ -172,7 +188,7 @@ export default [
     },
   },
   {
-    files: ["src/infrastructure/**/*.{ts,tsx}"],
+    files: [`src/infrastructure/**/*.${sourceExtensions}`],
     rules: {
       "no-restricted-imports": restrictedImports(
         [testingAliasPath],

@@ -19,6 +19,9 @@ const modeMarker = "crash_once";
 const platforms = FAULT_BUNDLE_PLATFORMS as readonly ("android" | "ios")[];
 const faultPoints = JSON.parse(await readFile("src/testing/faultPoints.json", "utf8")) as string[];
 const markers = [FAULT_CONTROLLER_SENTINEL, protocolMarker, modeMarker, ...faultPoints];
+const listenerModuleId = 101;
+const parserModuleId = 202;
+const registryModuleId = 303;
 const expectedMarkerCounts = {
   production: Object.fromEntries(markers.map((marker) => [marker, 0])),
   e2e: Object.fromEntries(markers.map((marker) => [
@@ -81,20 +84,97 @@ function sourceFor(flavor: "production" | "e2e", override?: { marker: string; co
   return tokens.length === 0 ? "production-no-op" : tokens.join("|");
 }
 
-async function fixture(production = sourceFor("production"), e2e = sourceFor("e2e")) {
+function metroModule(moduleId: number, dependencies: number[], body: string) {
+  return `__d(function (global, require, _importDefault, _importAll, module, exports, _dependencyMap) {\n${body}\n},${moduleId},${JSON.stringify(dependencies)});`;
+}
+
+const listenerBody = [
+  'var _reactNative = require(_dependencyMap[0]);',
+  'var _faultContract = require(_dependencyMap[1]);',
+  `var E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL = "${FAULT_CONTROLLER_SENTINEL}";`,
+  "async function installFaultController(onFault, signal) {",
+  "  if (signal?.aborted) return () => {};",
+  "  var handleUrl = ({ url }) => {",
+  "    if (signal?.aborted) return;",
+  "    var request = (0, _faultContract.parseFaultUrl)(url);",
+  "    if (request) onFault(request);",
+  "  };",
+  '  var subscription = _reactNative.Linking.addEventListener("url", handleUrl);',
+  "  var dispose = () => {",
+  '    signal?.removeEventListener("abort", dispose);',
+  "    subscription.remove();",
+  "  };",
+  '  signal?.addEventListener("abort", dispose, { once: true });',
+  "  try {",
+  "    var url = await _reactNative.Linking.getInitialURL();",
+  "    if (url) handleUrl({ url });",
+  "    return dispose;",
+  "  } catch (error) {",
+  "    dispose();",
+  "    throw error;",
+  "  }",
+  "}",
+].join("\n");
+
+const parserBody = [
+  'var _faultPointsJson = require(_dependencyMap[0]);',
+  "var faultPoints = _interopDefault(_faultPointsJson);",
+  "var FAULT_POINTS = Object.freeze([...faultPoints.default]);",
+  "var allowed = new Set(FAULT_POINTS);",
+  "function canonicalFaultUrl(point) {",
+  "  if (!allowed.has(point)) throw new Error(`Unknown fault point: ${point}`);",
+  "  return `formobile-test://fault?point=${point}&mode=crash_once`;",
+  "}",
+  "function parseFaultUrl(value) {",
+  String.raw`  var match = /^formobile-test:\/\/fault\?point=([a-z][a-z0-9_.]*)&mode=crash_once$/.exec(value);`,
+  "  if (!match || !allowed.has(match[1])) return null;",
+  '  var request = { point: match[1], mode: "crash_once" };',
+  "  return canonicalFaultUrl(request.point) === value ? request : null;",
+  "}",
+].join("\n");
+
+function e2eBundleSource() {
+  const registryBody = `module.exports = ${JSON.stringify(faultPoints, null, 2)};`;
+  return [
+    metroModule(listenerModuleId, [900, parserModuleId], listenerBody),
+    metroModule(parserModuleId, [registryModuleId], parserBody),
+    metroModule(registryModuleId, [], registryBody),
+    `__r(${listenerModuleId});`,
+  ].join("\n");
+}
+
+function productionBundleSource() {
+  return metroModule(1, [], "exports.installFaultController = async function () { return () => {}; };");
+}
+
+function sourceWithMarkerCount(flavor: "production" | "e2e", marker: string, count: number) {
+  let source = flavor === "production" ? productionBundleSource() : e2eBundleSource();
+  const expected = expectedMarkerCounts[flavor][marker];
+  for (let index = count; index < expected; index += 1) source = replaceOnce(source, marker, `removed-marker-${index}`);
+  for (let index = expected; index < count; index += 1) source += `\n/* ${marker} */`;
+  return source;
+}
+
+function replaceOnce(source: string, before: string, after: string) {
+  assert(source.includes(before), `fixture mutation target is absent: ${before}`);
+  return source.replace(before, after);
+}
+
+async function fixture(production = productionBundleSource(), e2e = e2eBundleSource()) {
   const root = await mkdtemp(join(tmpdir(), "g018-fault-bundles-"));
   const entries = {} as Proof["bundles"];
   for (const platform of platforms) {
     entries[platform] = {} as Record<"production" | "e2e", BundleEntry>;
     for (const [flavor, source] of [["production", production], ["e2e", e2e]] as const) {
-      const path = `.artifacts/fault-bundles/${platform}/${flavor}/_expo/static/js/${platform}/index.js`;
-      const bundlePath = `_expo/static/js/${platform}/index.js`;
+      const bundlePath = `_expo/static/js/${platform}/index-${flavor === "production" ? "a" : "b"}.js`;
+      const canonicalBundlePath = bundlePath.replace(/index-([ab])\.js$/, (_match, digit) => `index-${digit.repeat(32)}.js`);
+      const path = `.artifacts/fault-bundles/${platform}/${flavor}/${canonicalBundlePath}`;
       const bytes = Buffer.from(`${platform}:${source}`);
       const metadataPath = `.artifacts/fault-bundles/${platform}/${flavor}/metadata.json`;
       const metadataBytes = Buffer.from(JSON.stringify({
         version: 0,
         bundler: "metro",
-        fileMetadata: { [platform]: { bundle: bundlePath, assets: [] } },
+        fileMetadata: { [platform]: { bundle: canonicalBundlePath, assets: [] } },
       }));
       await mkdir(dirname(join(root, path)), { recursive: true });
       await Promise.all([writeFile(join(root, path), bytes), writeFile(join(root, metadataPath), metadataBytes)]);
@@ -137,6 +217,35 @@ async function replaceBundle(
   entry.observedMarkerCounts = markerCounts(bytes);
 }
 
+async function rewriteMetadataBundle(root: string, entry: BundleEntry, platform: "android" | "ios", bundle: string) {
+  const metadataPath = join(root, entry.metadata.path);
+  const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
+  metadata.fileMetadata[platform].bundle = bundle;
+  const bytes = Buffer.from(JSON.stringify(metadata));
+  await writeFile(metadataPath, bytes);
+  entry.metadata.bytes = bytes.length;
+  entry.metadata.sha256 = sha256(bytes);
+}
+
+async function relocateBundle(
+  root: string,
+  proof: Proof,
+  platform: "android" | "ios",
+  flavor: "production" | "e2e",
+  bundlePath: string,
+) {
+  const entry = proof.bundles[platform][flavor];
+  const oldPath = join(root, entry.path);
+  const bytes = await readFile(oldPath);
+  const newRelativePath = `.artifacts/fault-bundles/${platform}/${flavor}/${bundlePath}`;
+  const newPath = join(root, newRelativePath);
+  await mkdir(dirname(newPath), { recursive: true });
+  await writeFile(newPath, bytes);
+  await rm(oldPath);
+  entry.path = newRelativePath;
+  await rewriteMetadataBundle(root, entry, platform, bundlePath);
+}
+
 async function withFixture(
   run: (value: Awaited<ReturnType<typeof fixture>>) => Promise<void>,
   production?: string,
@@ -168,25 +277,163 @@ test("Metro rejects inherited-property and unknown build flavors instead of reso
   }
 });
 
-test("schema-v3 marker projection uses only the exact runtime strings and ordered fault registry", async () => {
+test("fault registry and marker projection stay exact, unique, nonempty, ordered, and grammar-safe", () => {
+  assert.equal(faultPoints.length, 13);
+  assert.equal(new Set(faultPoints).size, 13);
+  assert(faultPoints.every((point) => point.length > 0 && /^[a-z][a-z0-9_.]*$/.test(point)));
+  assert.deepEqual(markers, [FAULT_CONTROLLER_SENTINEL, "formobile-test:", "crash_once", ...faultPoints]);
+  assert.equal(new Set(markers).size, markers.length);
+  assert(markers.every((marker) => marker.length > 0));
+});
+
+test("schema-v3 validation returns the direct collector map with module relationships", async () => {
   await withFixture(async ({ root, proof }) => {
     const result = await validateFaultBundleProof(proof, { root, expectedSha: sha });
-    assert.deepEqual(result.markers, [FAULT_CONTROLLER_SENTINEL, "formobile-test:", "crash_once", ...faultPoints]);
-    assert.deepEqual(result.expectedMarkerCounts, expectedMarkerCounts);
+    assert.deepEqual(Object.keys(result), ["android", "ios"]);
+    assert.equal((result as any).bundles, undefined);
     for (const platform of platforms) {
-      assert.deepEqual(result.bundles[platform].production.observedMarkerCounts, expectedMarkerCounts.production);
-      assert.deepEqual(result.bundles[platform].e2e.observedMarkerCounts, expectedMarkerCounts.e2e);
+      assert.deepEqual(result[platform].production.observedMarkerCounts, expectedMarkerCounts.production);
+      assert.deepEqual(result[platform].e2e.observedMarkerCounts, expectedMarkerCounts.e2e);
+      assert.deepEqual(result[platform].production.moduleGraph, {
+        wrapperCount: 1,
+        listenerModuleId: null,
+        parserModuleId: null,
+        registryModuleId: null,
+        listenerToParser: null,
+        parserToRegistry: null,
+      });
+      assert.deepEqual(result[platform].e2e.moduleGraph, {
+        wrapperCount: 3,
+        listenerModuleId,
+        parserModuleId,
+        registryModuleId,
+        listenerToParser: { dependencyIndex: 1, moduleId: parserModuleId },
+        parserToRegistry: { dependencyIndex: 0, moduleId: registryModuleId },
+      });
     }
   });
+});
+
+test("marker-only token bags cannot impersonate Metro listener-parser-registry evidence", async () => {
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "android", "e2e", sourceFor("e2e"));
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /Metro|listener|module/i);
+  });
+});
+
+test("every __d occurrence must parse as one Metro wrapper", async () => {
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "android", "e2e", `${e2eBundleSource()}\n// hostile __d(`);
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /Metro|wrapper|__d/i);
+  });
+});
+
+test("production rejects marker-free listener behavior", async () => {
+  const markerFreeListener = listenerBody.replace(
+    `var E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL = "${FAULT_CONTROLLER_SENTINEL}";\n`,
+    "",
+  );
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "ios", "production", metroModule(listenerModuleId, [900, parserModuleId], markerFreeListener));
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /production.*listener|listener.*production/i);
+  });
+});
+
+test("E2E listener proof rejects hostile URL, initial-link, abort, disposal, and parser-call mutations", async (t) => {
+  const mutations = [
+    ["URL event", '.addEventListener("url", handleUrl)', '.addEventListener("change", handleUrl)'],
+    ["URL callback", '.addEventListener("url", handleUrl)', '.addEventListener("url", otherHandle)'],
+    ["initial URL", ".getInitialURL()", ".getInitialUri()"],
+    ["initial dispatch", "if (url) handleUrl({ url });", "if (url) onFault({ url });"],
+    ["abort guard", "if (signal?.aborted) return () => {};", "if (false) return () => {};"],
+    ["abort registration", '.addEventListener("abort", dispose', '.addEventListener("cancel", dispose'],
+    ["abort removal", '.removeEventListener("abort", dispose)', '.removeEventListener("cancel", dispose)'],
+    ["subscription disposal", "subscription.remove()", "void subscription"],
+    ["parser call argument", "_faultContract.parseFaultUrl)(url)", '_faultContract.parseFaultUrl)("ignored")'],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "android", "e2e", replaceOnce(e2eBundleSource(), before, after));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /listener|structure/i);
+      });
+    });
+  }
+});
+
+test("E2E sentinel must reside in the unique listener module", async () => {
+  const sentinelDeclaration = `var E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL = "${FAULT_CONTROLLER_SENTINEL}";`;
+  const relocated = `${replaceOnce(e2eBundleSource(), sentinelDeclaration, "var decoySentinel = true;")}\n/* ${FAULT_CONTROLLER_SENTINEL} */`;
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "android", "e2e", relocated);
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /sentinel.*listener|listener.*sentinel/i);
+  });
+});
+
+test("E2E parser proof rejects hostile serializer, grammar, allowlist, and canonical-equality mutations", async (t) => {
+  const mutations = [
+    [
+      "serializer",
+      "return `formobile-test://fault?point=${point}&mode=crash_once`;",
+      "return String.raw`formobile-test://fault?point=${point}&mode=crash_once`;",
+    ],
+    ["regex grammar", "[a-z0-9_.]*", "[a-z0-9._]*"],
+    ["allowlist construction", "new Set(FAULT_POINTS)", "new WeakSet(FAULT_POINTS)"],
+    ["parser allowlist", "!allowed.has(match[1])", "!FAULT_POINTS.includes(match[1])"],
+    ["canonical equality", "=== value ? request : null", "== value ? request : null"],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", replaceOnce(e2eBundleSource(), before, after));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /parser|structure/i);
+      });
+    });
+  }
+});
+
+test("E2E proof rejects listener-parser-registry dependency rewiring and duplicate module IDs", async (t) => {
+  const mutations = [
+    ["listener dependency index", "require(_dependencyMap[1])", "require(_dependencyMap[0])"],
+    ["listener dependency target", `[900,${parserModuleId}]`, `[${parserModuleId},900]`],
+    ["parser dependency index", "var _faultPointsJson = require(_dependencyMap[0]);", "var _faultPointsJson = require(_dependencyMap[1]);"],
+    ["parser dependency target", `},${parserModuleId},[${registryModuleId}]);`, `},${parserModuleId},[404]);`],
+    ["duplicate module ID", `__r(${listenerModuleId});`, `${metroModule(parserModuleId, [], "exports.decoy = true;")}\n__r(${listenerModuleId});`],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "android", "e2e", replaceOnce(e2eBundleSource(), before, after));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /dependency|module|parser|registry/i);
+      });
+    });
+  }
+});
+
+test("E2E registry proof rejects hostile order, shape, and contents", async (t) => {
+  const originalRegistry = `module.exports = ${JSON.stringify(faultPoints, null, 2)};`;
+  const mutations = [
+    ["order", `module.exports = ${JSON.stringify([...faultPoints].reverse(), null, 2)};`],
+    ["shape", `module.exports = { values: ${JSON.stringify(faultPoints, null, 2)} };`],
+    ["extra value", `module.exports = ${JSON.stringify([...faultPoints, "invalid-point!"], null, 2)};`],
+  ] as const;
+  for (const [name, replacement] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", replaceOnce(e2eBundleSource(), originalRegistry, replacement));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /registry|fault point|structure/i);
+      });
+    });
+  }
 });
 
 test("semantic proof independently rejects every marker missing or duplicated in E2E and leaking into production", async (t) => {
   for (const marker of markers) {
     const expected = expectedMarkerCounts.e2e[marker];
     for (const [scenario, production, e2e] of [
-      ["missing from E2E", sourceFor("production"), sourceFor("e2e", { marker, count: expected - 1 })],
-      ["duplicated in E2E", sourceFor("production"), sourceFor("e2e", { marker, count: expected + 1 })],
-      ["leaking into production", sourceFor("production", { marker, count: 1 }), sourceFor("e2e")],
+      ["missing from E2E", productionBundleSource(), sourceWithMarkerCount("e2e", marker, expected - 1)],
+      ["duplicated in E2E", productionBundleSource(), sourceWithMarkerCount("e2e", marker, expected + 1)],
+      ["leaking into production", sourceWithMarkerCount("production", marker, 1), e2eBundleSource()],
     ] as const) {
       await t.test(`${JSON.stringify(marker)} ${scenario}`, async () => {
         await withFixture(async ({ root, proof }) => {
@@ -278,6 +525,40 @@ test("proof binds byte counts and hashes to every retained canonical bundle", as
   }
 });
 
+test("proof requires one lowercase-hashed JavaScript bundle and rejects txt, unhashed, and uppercase names", async (t) => {
+  for (const [name, bundlePath] of [
+    ["txt", "_expo/static/js/android/index-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt"],
+    ["unhashed", "_expo/static/js/android/index.js"],
+    ["uppercase", "_expo/static/js/android/index-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.js"],
+  ] as const) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await relocateBundle(root, proof, "android", "e2e", bundlePath);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /canonical|index-|JavaScript bundle/i);
+      });
+    });
+  }
+});
+
+test("proof rejects every extra file in the canonical bundle directory", async (t) => {
+  for (const fileName of ["notes.txt", "index-cccccccccccccccccccccccccccccccc.js"]) {
+    await t.test(fileName, async () => {
+      await withFixture(async ({ root, proof }) => {
+        const directory = dirname(join(root, proof.bundles.ios.e2e.path));
+        await writeFile(join(directory, fileName), "hostile extra");
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /exactly one|extra|canonical/i);
+      });
+    });
+  }
+  await t.test("sibling of platform directory", async () => {
+    await withFixture(async ({ root, proof }) => {
+      const platformDirectory = dirname(join(root, proof.bundles.android.e2e.path));
+      await writeFile(join(dirname(platformDirectory), "rogue.txt"), "hostile extra");
+      await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /only its canonical platform bundle directory/i);
+    });
+  });
+});
+
 test("proof rejects missing platform evidence and cross-platform canonical paths", async () => {
   await withFixture(async ({ root, proof }) => {
     delete (proof.bundles as any).ios;
@@ -286,6 +567,13 @@ test("proof rejects missing platform evidence and cross-platform canonical paths
   await withFixture(async ({ root, proof }) => {
     proof.bundles.ios.e2e.path = proof.bundles.android.e2e.path;
     await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /ios e2e bundle path is outside/);
+  });
+  await withFixture(async ({ root, proof }) => {
+    proof.bundles.android.e2e.path = proof.bundles.android.e2e.path.replace(
+      "/android/e2e/_expo/",
+      "/android/e2e/../e2e/_expo/",
+    );
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /traversal|canonical/i);
   });
 });
 
