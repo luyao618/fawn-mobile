@@ -444,10 +444,14 @@ const exactPinnedSimulatorOpenLine = 'open "$DEVELOPER_DIR/Applications/Simulato
 
 const exactIosOpenConfirmationFlow = `appId: com.luyao618.formobile
 ---
-- tapOn:
-    text: "Open"
-    label: "Open For Mobile from the first-use system dialog"
-    optional: true
+- runFlow:
+    when:
+      visible: '^Open in .For Mobile.\\?$'
+    commands:
+      - tapOn:
+          point: '69%,54%'
+          label: 'Tap the right-side Open button in the iOS confirmation alert'
+      - assertNotVisible: '^Open in .For Mobile.\\?$'
 `;
 
 const exactReadinessFlow = `appId: com.luyao618.formobile
@@ -540,25 +544,27 @@ function assertExactIosUrlHandoff(script: string): void {
   const confirmationLines = lines.filter((line) => line.includes(iosOpenConfirmationFlow));
   assert.deepEqual(
     confirmationLines,
-    [exactIosConfirmationCommand],
-    "iOS confirmation must appear exactly once as the exact fail-closed command",
+    [exactIosConfirmationCommand, exactIosConfirmationCommand],
+    "iOS confirmation must appear exactly twice as the exact fail-closed command",
   );
   const smokeLines = lines.filter((line) => line.includes(smokeFlow));
   assert.deepEqual(smokeLines, [exactIosSmokeCommand], "iOS smoke must remain one exact fail-closed command");
 
   const assignmentIndex = lines.indexOf(exactDevClientUrlAssignment);
   const firstOpenIndex = lines.indexOf(exactIosOpenUrlCommand);
-  const confirmationIndex = lines.indexOf(exactIosConfirmationCommand);
+  const firstConfirmationIndex = lines.indexOf(exactIosConfirmationCommand);
   const secondOpenIndex = lines.lastIndexOf(exactIosOpenUrlCommand);
+  const secondConfirmationIndex = lines.lastIndexOf(exactIosConfirmationCommand);
   const readinessIndex = lines.indexOf(exactReadinessCommands.iOS);
   const smokeIndex = lines.indexOf(exactIosSmokeCommand);
   assert.ok(
     assignmentIndex < firstOpenIndex
-      && firstOpenIndex < confirmationIndex
-      && confirmationIndex < secondOpenIndex
-      && secondOpenIndex < readinessIndex
+      && firstOpenIndex < firstConfirmationIndex
+      && firstConfirmationIndex < secondOpenIndex
+      && secondOpenIndex < secondConfirmationIndex
+      && secondConfirmationIndex < readinessIndex
       && readinessIndex < smokeIndex,
-    "iOS handoff must preserve URL assignment, first open, confirmation, replay, readiness, and smoke order",
+    "iOS handoff must preserve assignment, open, confirmation, open, confirmation, readiness, and smoke order",
   );
 }
 
@@ -596,6 +602,7 @@ function assertIosFailureDiagnosticsPolicy(script: string, workflow: Workflow): 
   const upload = diagnosticUploads[0];
   assert.equal(upload.if, "always()", "iOS diagnostics upload must run after failure");
   assert.equal(upload.with?.path, ".artifacts/launch/**\n.artifacts/test-results/**\n");
+  assert.equal(upload.with?.["include-hidden-files"], true, "iOS diagnostics upload must retain hidden Maestro files");
 }
 
 function assertExactPinnedSimulatorOpen(script: string): void {
@@ -766,6 +773,7 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
     exactIosOpenUrlCommand,
     exactIosConfirmationCommand,
     exactIosOpenUrlCommand,
+    exactIosConfirmationCommand,
     exactReadinessCommands.iOS,
     exactIosSmokeCommand,
     "mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log",
@@ -785,7 +793,7 @@ test("iOS confirmation is exact while readiness and smoke retain their required 
     readFile(smokeFlow, "utf8"),
   ]);
   assertIosOpenConfirmationFlow(confirmation);
-  assert.doesNotMatch(confirmation, /extendedWaitUntil|assertVisible|launchApp|stopApp|openLink/);
+  assert.doesNotMatch(confirmation, /optional|extendedWaitUntil|assertVisible|launchApp|stopApp|openLink/);
   assert.equal(readiness, exactReadinessFlow);
   assert.doesNotMatch(readiness, /launchApp|stopApp|openLink/);
   assert.equal(smoke, exactSmokeFlow);
@@ -893,35 +901,66 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     /exactly one exact --no-streaming -r install command/,
   );
 
-  const withoutOptionalTap = confirmation.replace("    optional: true\n", "");
-  assert.notEqual(withoutOptionalTap, confirmation);
-  assert.throws(() => assertIosOpenConfirmationFlow(withoutOptionalTap), /flow bytes must remain exact/);
+  const confirmationFlowMutations = [
+    confirmation.replace("- runFlow:\n", ""),
+    confirmation.replace("- runFlow:\n", "- runFlow:\n- runFlow:\n"),
+    confirmation.replace(
+      "      - tapOn:\n          point: '69%,54%'\n          label: 'Tap the right-side Open button in the iOS confirmation alert'\n      - assertNotVisible: '^Open in .For Mobile.\\?$'",
+      "      - assertNotVisible: '^Open in .For Mobile.\\?$'\n      - tapOn:\n          point: '69%,54%'\n          label: 'Tap the right-side Open button in the iOS confirmation alert'",
+    ),
+    confirmation.replaceAll("^Open in .For Mobile.\\?$", "^Open in For Mobile\\?$"),
+    confirmation.replace("point: '69%,54%'", "point: '50%,50%'"),
+    confirmation.replace("      - assertNotVisible: '^Open in .For Mobile.\\?$'\n", ""),
+    confirmation.replace(
+      "          label: 'Tap the right-side Open button in the iOS confirmation alert'\n",
+      "          label: 'Tap the right-side Open button in the iOS confirmation alert'\n          optional: true\n",
+    ),
+  ];
+  for (const mutatedFlow of confirmationFlowMutations) {
+    assert.notEqual(mutatedFlow, confirmation);
+    assert.throws(() => assertIosOpenConfirmationFlow(mutatedFlow), /flow bytes must remain exact/);
+  }
 
   const withReadinessWait = `${confirmation}- extendedWaitUntil:\n    visible: "照护空间尚未设置"\n    timeout: 120000\n`;
   assert.throws(() => assertIosOpenConfirmationFlow(withReadinessWait), /flow bytes must remain exact/);
 
   const iosHandoffMutations = [
-    iosSmoke.run.replace(`${exactIosOpenUrlCommand}\n${exactReadinessCommands.iOS}`, exactReadinessCommands.iOS),
+    iosSmoke.run.replace(`${exactIosOpenUrlCommand}\n${exactIosConfirmationCommand}\n${exactReadinessCommands.iOS}`, `${exactIosOpenUrlCommand}\n${exactReadinessCommands.iOS}`),
     iosSmoke.run.replace(
-      `${exactIosOpenUrlCommand}\n${exactReadinessCommands.iOS}`,
-      `${exactIosOpenUrlCommand}\n${exactIosOpenUrlCommand}\n${exactReadinessCommands.iOS}`,
+      `${exactIosOpenUrlCommand}\n${exactIosConfirmationCommand}\n${exactReadinessCommands.iOS}`,
+      `${exactIosOpenUrlCommand}\n${exactIosConfirmationCommand}\n${exactIosConfirmationCommand}\n${exactReadinessCommands.iOS}`,
     ),
     iosSmoke.run.replace(
       `${exactIosConfirmationCommand}\n${exactIosOpenUrlCommand}`,
       `${exactIosOpenUrlCommand}\n${exactIosConfirmationCommand}`,
     ),
     iosSmoke.run.replace(
-      `${exactIosOpenUrlCommand}\n${exactReadinessCommands.iOS}`,
-      `xcrun simctl openurl "$simulator_udid" "${encodedDevClientUrl}" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log\n${exactReadinessCommands.iOS}`,
+      `${exactIosOpenUrlCommand}\n${exactIosConfirmationCommand}\n${exactReadinessCommands.iOS}`,
+      `xcrun simctl openurl "$simulator_udid" "${encodedDevClientUrl}" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log\n${exactIosConfirmationCommand}\n${exactReadinessCommands.iOS}`,
+    ),
+    iosSmoke.run.replace(exactIosConfirmationCommand, `${exactIosConfirmationCommand} || true`),
+    iosSmoke.run.replace(
+      `${exactIosConfirmationCommand}\n${exactReadinessCommands.iOS}`,
+      `${exactIosConfirmationCommand} || :\n${exactReadinessCommands.iOS}`,
     ),
   ];
   for (const mutatedScript of iosHandoffMutations) {
     assert.notEqual(mutatedScript, iosSmoke.run);
     assert.throws(
       () => assertExactIosUrlHandoff(mutatedScript),
-      /exactly two identical exact simctl openurl commands|must preserve URL assignment, first open, confirmation, replay, readiness, and smoke order/,
+      /exactly two identical exact simctl openurl commands|confirmation must appear exactly twice as the exact fail-closed command|must preserve assignment, open, confirmation, open, confirmation, readiness, and smoke order/,
     );
   }
+
+  const iosWithoutHiddenDiagnostics = structuredClone(iosWorkflow);
+  const diagnosticsUpload = requiredSteps(requiredJob(iosWithoutHiddenDiagnostics, "ios"), "ios")
+    .find((step) => step.with?.name === `ios-e2e-diagnostics-${expectedShaInput}`);
+  assert.ok(diagnosticsUpload?.with);
+  delete diagnosticsUpload.with["include-hidden-files"];
+  assert.throws(
+    () => assertIosFailureDiagnosticsPolicy(iosSmoke.run!, iosWithoutHiddenDiagnostics),
+    /must retain hidden Maestro files/,
+  );
 
   const commentedIosDiagnostic = iosSmoke.run.replace(
     exactIosFailureScreenshotCommand,

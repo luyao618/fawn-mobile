@@ -119,6 +119,7 @@ jobs:
           xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log
           maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-open-confirmation e2e/maestro/ios-open-confirmation.yaml 2>&1 | tee .artifacts/launch/ios-open-confirmation.log
           xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log
+          maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-open-confirmation e2e/maestro/ios-open-confirmation.yaml 2>&1 | tee .artifacts/launch/ios-open-confirmation.log
           maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-readiness e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/launch/ios-readiness.log
           maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-smoke e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log
           mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log
@@ -151,4 +152,5 @@ jobs:
           path: |
             .artifacts/launch/**
             .artifacts/test-results/**
+          include-hidden-files: true
           if-no-files-found: ignore

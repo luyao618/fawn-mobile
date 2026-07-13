@@ -1,6 +1,10 @@
 appId: com.luyao618.formobile
 ---
-- tapOn:
-    text: "Open"
-    label: "Open For Mobile from the first-use system dialog"
-    optional: true
+- runFlow:
+    when:
+      visible: '^Open in .For Mobile.\?$'
+    commands:
+      - tapOn:
+          point: '69%,54%'
+          label: 'Tap the right-side Open button in the iOS confirmation alert'
+      - assertNotVisible: '^Open in .For Mobile.\?$'
