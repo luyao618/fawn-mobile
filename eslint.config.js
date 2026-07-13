@@ -9,10 +9,15 @@ const nodeBuiltins = [...new Set([
   ...prefixOnlyNodeBuiltins,
 ])];
 const spikeAlias = "@fawn-mobile/slice0-device-proof";
+const faultControllerAlias = "@for-mobile/fault-controller";
 const basePaths = [
   ...nodeBuiltins.map((name) => ({ name, message: "Node built-ins are not available in mobile production code." })),
   { name: spikeAlias, message: "The workspace spike package is not available in mobile production code." },
 ];
+const testingAliasPath = {
+  name: faultControllerAlias,
+  message: "Only a composition root may import the flavor-selected fault controller.",
+};
 
 function categoryPatterns(...segments) {
   return segments.flatMap((segment) => [
@@ -45,9 +50,32 @@ const platformPackagePatterns = [{
   ],
   message: "Platform, React, and React Navigation package families are forbidden in this layer.",
 }];
+const expoNativePatterns = [{
+  group: ["expo", "expo-*", "expo-*/**", "expo/**", "@expo/**"],
+  message: "React components cannot bypass infrastructure through Expo native packages.",
+}];
+const nonStaticImportSyntax = [
+  "error",
+  {
+    selector: "CallExpression[callee.name='require']",
+    message: "Production code must use statically analyzable imports instead of require().",
+  },
+  {
+    selector: "TSImportEqualsDeclaration",
+    message: "Production code must use ECMAScript imports instead of TypeScript require imports.",
+  },
+  {
+    selector: "ImportExpression",
+    message: "Production code must not use dynamic import().",
+  },
+];
 
 function restrictedImports(paths = [], patterns = []) {
   return ["error", { paths: [...basePaths, ...paths], patterns: [...basePatterns, ...patterns] }];
+}
+
+function categoryRestriction(message, ...segments) {
+  return { group: categoryPatterns(...segments), message };
 }
 
 export default [
@@ -67,6 +95,7 @@ export default [
     rules: {
       "import/no-unresolved": ["error", { ignore: ["^@for-mobile/fault-controller$"] }],
       "no-restricted-imports": restrictedImports(),
+      "no-restricted-syntax": nonStaticImportSyntax,
     },
   },
   {
@@ -74,20 +103,56 @@ export default [
     languageOptions: { globals: { __dirname: "readonly" } },
   },
   {
-    files: ["src/features/**/*.{ts,tsx}", "src/navigation/**/*.{ts,tsx}"],
+    files: ["src/shared/**/*.{ts,tsx}"],
     rules: {
-      "no-restricted-imports": restrictedImports([], [
-        { group: categoryPatterns("infrastructure"), message: "Features and navigation cannot import infrastructure directly." },
-        { group: ["expo-*", "expo-*/**", "@expo/**"], message: "Features and navigation cannot bypass infrastructure through Expo native packages." },
-      ]),
+      "no-restricted-imports": restrictedImports(
+        [testingAliasPath],
+        [
+          categoryRestriction(
+            "Shared code cannot depend on runtime layers.",
+            "application", "domain", "features", "infrastructure", "navigation", "testing",
+          ),
+          ...expoNativePatterns,
+        ],
+      ),
+    },
+  },
+  {
+    files: ["src/features/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": restrictedImports(
+        [testingAliasPath],
+        [
+          categoryRestriction("Features cannot import infrastructure, navigation, or testing.", "infrastructure", "navigation", "testing"),
+          ...expoNativePatterns,
+        ],
+      ),
+    },
+  },
+  {
+    files: ["src/navigation/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": restrictedImports(
+        [testingAliasPath],
+        [
+          categoryRestriction("Navigation cannot import infrastructure or testing.", "infrastructure", "testing"),
+          ...expoNativePatterns,
+        ],
+      ),
     },
   },
   {
     files: ["src/application/**/*.{ts,tsx}"],
     rules: {
       "no-restricted-imports": restrictedImports(
-        platformPackagePaths,
-        [...platformPackagePatterns, { group: categoryPatterns("features", "infrastructure") }],
+        [...platformPackagePaths, testingAliasPath],
+        [
+          ...platformPackagePatterns,
+          categoryRestriction(
+            "Application can depend only on domain and shared production layers.",
+            "features", "infrastructure", "navigation", "testing",
+          ),
+        ],
       ),
     },
   },
@@ -95,11 +160,23 @@ export default [
     files: ["src/domain/**/*.{ts,tsx}"],
     rules: {
       "no-restricted-imports": restrictedImports(
-        platformPackagePaths,
+        [...platformPackagePaths, testingAliasPath],
         [
           ...platformPackagePatterns,
-          { group: categoryPatterns("application", "infrastructure", "features", "navigation", "shared", "testing") },
+          categoryRestriction(
+            "Domain cannot depend on outward runtime or testing layers.",
+            "application", "infrastructure", "features", "navigation", "shared", "testing",
+          ),
         ],
+      ),
+    },
+  },
+  {
+    files: ["src/infrastructure/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": restrictedImports(
+        [testingAliasPath],
+        [categoryRestriction("Infrastructure cannot depend on presentation or testing layers.", "features", "navigation", "testing")],
       ),
     },
   },

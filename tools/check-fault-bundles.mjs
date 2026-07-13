@@ -13,6 +13,37 @@ export const FAULT_BUNDLE_PLATFORMS = Object.freeze(["android", "ios"]);
 export const FAULT_BUNDLE_FLAVORS = Object.freeze(["production", "e2e"]);
 export const FAULT_BUNDLE_EXPORT_FLAGS = Object.freeze(["--no-bytecode", "--no-minify", "--clear"]);
 
+const faultPoints = JSON.parse(await readFile(resolve(repoRoot, "src/testing/faultPoints.json"), "utf8"));
+assert(Array.isArray(faultPoints) && faultPoints.every((point) => typeof point === "string"), "Fault point registry is invalid");
+const protocolMarker = "formobile-test:";
+const modeMarker = "crash_once";
+export const FAULT_BUNDLE_MARKERS = Object.freeze([
+  FAULT_CONTROLLER_SENTINEL,
+  protocolMarker,
+  modeMarker,
+  ...faultPoints,
+]);
+
+function expectedCounts(flavor) {
+  return Object.freeze(Object.fromEntries(FAULT_BUNDLE_MARKERS.map((marker) => [
+    marker,
+    flavor === "production"
+      ? 0
+      : marker === FAULT_CONTROLLER_SENTINEL
+        ? 1
+        : marker === protocolMarker
+          ? 2
+          : marker === modeMarker
+            ? 3
+            : 1,
+  ])));
+}
+
+export const FAULT_BUNDLE_EXPECTED_MARKER_COUNTS = Object.freeze({
+  production: expectedCounts("production"),
+  e2e: expectedCounts("e2e"),
+});
+
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -27,11 +58,29 @@ function occurrences(bytes, needle) {
   return count;
 }
 
+function markerCounts(bytes) {
+  return Object.fromEntries(FAULT_BUNDLE_MARKERS.map((marker) => [
+    marker,
+    occurrences(bytes, Buffer.from(marker)),
+  ]));
+}
+
+function copyMarkerCounts(counts) {
+  return Object.fromEntries(FAULT_BUNDLE_MARKERS.map((marker) => [marker, counts[marker]]));
+}
+
 function hasExactKeys(value, keys) {
   return value !== null
     && typeof value === "object"
     && !Array.isArray(value)
     && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
+}
+
+function assertMarkerCounts(value, label) {
+  assert(hasExactKeys(value, FAULT_BUNDLE_MARKERS), `${label} contains unknown or missing marker fields`);
+  for (const marker of FAULT_BUNDLE_MARKERS) {
+    assert(Number.isSafeInteger(value[marker]) && value[marker] >= 0, `${label} contains an invalid marker count`);
+  }
 }
 
 async function javascriptFiles(directory) {
@@ -54,26 +103,55 @@ function assertCanonicalBundlePath(path, platform, flavor) {
 /**
  * @param {any} proof
  * @param {{ root?: string, expectedSha?: string }} [options]
- * @returns {Promise<Record<"android" | "ios", Record<"production" | "e2e", { path: string, bytes: number, sha256: string, sentinelOccurrences: number }>>>}
+ * @returns {Promise<{
+ *   markers: string[],
+ *   expectedMarkerCounts: Record<"production" | "e2e", Record<string, number>>,
+ *   bundles: Record<"android" | "ios", Record<"production" | "e2e", {
+ *     path: string,
+ *     bytes: number,
+ *     sha256: string,
+ *     observedMarkerCounts: Record<string, number>
+ *   }>>
+ * }>}
  */
 export async function validateFaultBundleProof(proof, options = {}) {
   const { root = repoRoot, expectedSha } = options;
-  assert(hasExactKeys(proof, ["schemaVersion", "checkedOutSha", "platforms", "exportFlags", "sentinel", "bundles"]), "Fault bundle proof contains unknown or missing root fields");
-  assert.equal(proof?.schemaVersion, 2, "Fault bundle proof schema is invalid");
+  assert(
+    hasExactKeys(proof, ["schemaVersion", "checkedOutSha", "platforms", "exportFlags", "markers", "expectedMarkerCounts", "bundles"]),
+    "Fault bundle proof contains unknown or missing root fields",
+  );
+  assert.equal(proof?.schemaVersion, 3, "Fault bundle proof schema is invalid");
   assert.equal(proof?.checkedOutSha, expectedSha, "Fault bundle proof SHA disagrees with the exact checkout");
   assert.deepEqual(proof?.platforms, FAULT_BUNDLE_PLATFORMS, "Fault bundle proof platforms are invalid");
   assert.deepEqual(proof?.exportFlags, FAULT_BUNDLE_EXPORT_FLAGS, "Fault bundle proof must use text bundles without minification");
-  assert.equal(proof?.sentinel, FAULT_CONTROLLER_SENTINEL, "Fault bundle proof sentinel is invalid");
+  assert.deepEqual(proof?.markers, FAULT_BUNDLE_MARKERS, "Fault bundle proof markers are invalid");
+  assert(
+    hasExactKeys(proof?.expectedMarkerCounts, FAULT_BUNDLE_FLAVORS),
+    "Fault bundle proof expected counts contain unknown or missing flavor fields",
+  );
+  for (const flavor of FAULT_BUNDLE_FLAVORS) {
+    assertMarkerCounts(proof.expectedMarkerCounts[flavor], `${flavor} expected marker counts`);
+    assert.deepEqual(
+      proof.expectedMarkerCounts[flavor],
+      FAULT_BUNDLE_EXPECTED_MARKER_COUNTS[flavor],
+      "Fault bundle proof expected marker counts are invalid",
+    );
+  }
   assert(hasExactKeys(proof?.bundles, FAULT_BUNDLE_PLATFORMS), "Fault bundle proof contains unknown or missing platform fields");
-  const summary = {};
+
+  const bundles = {};
   for (const platform of FAULT_BUNDLE_PLATFORMS) {
     assert(hasExactKeys(proof.bundles[platform], FAULT_BUNDLE_FLAVORS), `${platform} fault bundle proof contains unknown or missing flavor fields`);
-    summary[platform] = {};
+    bundles[platform] = {};
     for (const flavor of FAULT_BUNDLE_FLAVORS) {
       const label = `${platform} ${flavor}`;
       const entry = proof?.bundles?.[platform]?.[flavor];
       assert(entry && typeof entry === "object", `${label} fault bundle evidence is absent`);
-      assert(hasExactKeys(entry, ["path", "bytes", "sha256", "sentinelOccurrences", "metadata"]), `${label} fault bundle entry contains unknown or missing fields`);
+      assert(
+        hasExactKeys(entry, ["path", "bytes", "sha256", "observedMarkerCounts", "metadata"]),
+        `${label} fault bundle entry contains unknown or missing fields`,
+      );
+      assertMarkerCounts(entry.observedMarkerCounts, `${label} observed marker counts`);
       assert(hasExactKeys(entry.metadata, ["path", "bytes", "sha256"]), `${label} metadata evidence contains unknown or missing fields`);
       assertCanonicalBundlePath(entry.path, platform, flavor);
       const absolute = resolve(root, entry.path);
@@ -84,10 +162,19 @@ export async function validateFaultBundleProof(proof, options = {}) {
       assert(bytes.length > 0, `${label} bundle is empty`);
       assert.equal(entry.bytes, bytes.length, `${label} bundle byte count disagrees`);
       assert.equal(entry.sha256, sha256(bytes), `${label} bundle hash disagrees`);
-      const count = occurrences(bytes, Buffer.from(FAULT_CONTROLLER_SENTINEL));
-      assert.equal(entry.sentinelOccurrences, count, `${label} sentinel count disagrees`);
-      if (flavor === "production") assert.equal(count, 0, `${platform} production bundle contains the real E2E fault controller sentinel`);
-      else assert(count > 0, `${platform} E2E bundle does not contain the real fault controller sentinel`);
+      const observedMarkerCounts = markerCounts(bytes);
+      for (const marker of FAULT_BUNDLE_MARKERS) {
+        assert.equal(
+          entry.observedMarkerCounts[marker],
+          observedMarkerCounts[marker],
+          `${label} observed marker count disagrees for ${JSON.stringify(marker)}`,
+        );
+        assert.equal(
+          observedMarkerCounts[marker],
+          FAULT_BUNDLE_EXPECTED_MARKER_COUNTS[flavor][marker],
+          `${label} marker count is invalid for ${JSON.stringify(marker)}`,
+        );
+      }
       const exportPrefix = `.artifacts/fault-bundles/${platform}/${flavor}/`;
       assert.equal(entry.metadata.path, `${exportPrefix}metadata.json`, `${label} metadata path is not canonical`);
       const metadataAbsolute = resolve(root, entry.metadata.path);
@@ -104,10 +191,22 @@ export async function validateFaultBundleProof(proof, options = {}) {
       assert(hasExactKeys(metadata.fileMetadata[platform], ["bundle", "assets"]), `${label} Expo metadata platform entry contains unknown or missing fields`);
       assert(Array.isArray(metadata.fileMetadata[platform].assets), `${label} Expo metadata assets must be an array`);
       assert.equal(`${exportPrefix}${metadata.fileMetadata[platform].bundle}`, entry.path, `${label} Expo metadata bundle does not match the validated canonical bundle`);
-      summary[platform][flavor] = { path: entry.path, bytes: bytes.length, sha256: entry.sha256, sentinelOccurrences: count };
+      bundles[platform][flavor] = {
+        path: entry.path,
+        bytes: bytes.length,
+        sha256: entry.sha256,
+        observedMarkerCounts,
+      };
     }
   }
-  return summary;
+  return {
+    markers: [...FAULT_BUNDLE_MARKERS],
+    expectedMarkerCounts: {
+      production: copyMarkerCounts(FAULT_BUNDLE_EXPECTED_MARKER_COUNTS.production),
+      e2e: copyMarkerCounts(FAULT_BUNDLE_EXPECTED_MARKER_COUNTS.e2e),
+    },
+    bundles,
+  };
 }
 
 function gitHead() {
@@ -121,11 +220,12 @@ export async function buildFaultBundleProof(root = repoRoot) {
   await rm(dirname(proofPath), { recursive: true, force: true });
   await mkdir(dirname(proofPath), { recursive: true });
   const proof = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     checkedOutSha: gitHead(),
     platforms: FAULT_BUNDLE_PLATFORMS,
     exportFlags: FAULT_BUNDLE_EXPORT_FLAGS,
-    sentinel: FAULT_CONTROLLER_SENTINEL,
+    markers: FAULT_BUNDLE_MARKERS,
+    expectedMarkerCounts: FAULT_BUNDLE_EXPECTED_MARKER_COUNTS,
     bundles: {},
   };
   for (const platform of FAULT_BUNDLE_PLATFORMS) {
@@ -150,7 +250,7 @@ export async function buildFaultBundleProof(root = repoRoot) {
         path,
         bytes: bytes.length,
         sha256: sha256(bytes),
-        sentinelOccurrences: occurrences(bytes, Buffer.from(FAULT_CONTROLLER_SENTINEL)),
+        observedMarkerCounts: markerCounts(bytes),
         metadata: { path: metadataPath, bytes: metadataBytes.length, sha256: sha256(metadataBytes) },
       };
     }
