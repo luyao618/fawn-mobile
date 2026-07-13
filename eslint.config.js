@@ -64,7 +64,14 @@ export default [
   },
   {
     files: ["App.tsx", "index.ts", "src/**/*.{ts,tsx}"],
-    rules: { "no-restricted-imports": restrictedImports() },
+    rules: {
+      "import/no-unresolved": ["error", { ignore: ["^@for-mobile/fault-controller$"] }],
+      "no-restricted-imports": restrictedImports(),
+    },
+  },
+  {
+    files: ["metro.config.cjs"],
+    languageOptions: { globals: { __dirname: "readonly" } },
   },
   {
     files: ["src/features/**/*.{ts,tsx}", "src/navigation/**/*.{ts,tsx}"],

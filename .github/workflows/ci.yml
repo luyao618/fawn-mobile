@@ -124,6 +124,7 @@ jobs:
       - run: npx --no-install expo install --check
       - run: npm run expo:doctor
       - run: npm run test:fault-scaffold
+      - run: npm run test:fault-bundles
       - run: npm run slice0
       - run: npm run test:g017
       - run: npm run expo:doctor:g017
@@ -134,13 +135,16 @@ jobs:
         run: |
           mkdir -p .artifacts/test-results
           printf 'static gates passed for %s\n' "$(git rev-parse HEAD)" > .artifacts/test-results/static-gates.log
-      - run: node tools/collect-ci-evidence.mjs --expected-sha "${{ github.event.pull_request.head.sha || github.sha }}" --platform host --flavor static --test-result pass --test-result-file .artifacts/test-results/static-gates.log --output .artifacts/static.json
+      - run: node tools/collect-ci-evidence.mjs --expected-sha "${{ github.event.pull_request.head.sha || github.sha }}" --platform host --flavor static --test-result pass --test-result-file .artifacts/test-results/static-gates.log --fault-bundle-proof .artifacts/fault-bundles/proof.json --output .artifacts/static.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: static-evidence-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             .artifacts/static.json
             .artifacts/test-results/static-gates.log
+            .artifacts/fault-bundles/proof.json
+            .artifacts/fault-bundles/production/**/*.js
+            .artifacts/fault-bundles/e2e/**/*.js
           if-no-files-found: error
 
   android-e2e:

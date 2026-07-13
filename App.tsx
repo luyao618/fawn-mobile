@@ -3,7 +3,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { RootNavigator } from "./src/navigation/RootNavigator";
 import { AppErrorBoundary } from "./src/shared/errors/AppErrorBoundary";
-import { installFaultController } from "./src/testing/FaultController";
+import { installFaultController } from "@for-mobile/fault-controller";
 import type { FaultRequest } from "./src/testing/faultContract";
 
 type InstallFaults = (

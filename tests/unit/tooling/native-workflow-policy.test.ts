@@ -74,12 +74,12 @@ if (major < 6 || (major === 6 && minor < 2)) {
 console.log("Apple Swift preflight passed: " + major + "." + minor);
 NODE
 `;
-const exactStaticCollector = `node tools/collect-ci-evidence.mjs --expected-sha "${exactHeadSha}" --platform host --flavor static --test-result pass --test-result-file .artifacts/test-results/static-gates.log --output .artifacts/static.json`;
+const exactStaticCollector = `node tools/collect-ci-evidence.mjs --expected-sha "${exactHeadSha}" --platform host --flavor static --test-result pass --test-result-file .artifacts/test-results/static-gates.log --fault-bundle-proof .artifacts/fault-bundles/proof.json --output .artifacts/static.json`;
 const whoProvisionStepName = "Populate hash-pinned WHO cache";
 const whoDownloadCommand = "PYTHONDONTWRITEBYTECODE=1 python3 tools/knowledge/download_who_sources.py";
 const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
-const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n";
+const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/production/**/*.js\n.artifacts/fault-bundles/e2e/**/*.js\n";
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
 const exactAndroidRunnerSha256 = "bf42ee697041e4a02e2d2eae21d50427ad1ea54fdc1956b4d769f960b760b871";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
@@ -181,6 +181,7 @@ const originalStaticGateRuns = [
   "npx --no-install expo install --check",
   "npm run expo:doctor",
   "npm run test:fault-scaffold",
+  "npm run test:fault-bundles",
   "npm run slice0",
   "npm run test:g017",
   "npm run expo:doctor:g017",
@@ -383,7 +384,7 @@ function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
   const staticUploadPath = staticUpload.with?.path;
   assert.ok(typeof staticUploadPath === "string", "Static evidence upload path must be a string");
   assert.doesNotMatch(staticUploadPath, forbiddenStaticUploadPath, "Static evidence upload must not include raw or generated WHO data");
-  assert.equal(staticUploadPath, exactStaticUploadPath, "Static evidence upload path must remain exactly the two approved files");
+  assert.equal(staticUploadPath, exactStaticUploadPath, "Static evidence upload path must retain only the approved evidence and text bundles");
 
   for (const [jobName, workflowPath] of [["android-e2e", "./.github/workflows/e2e-android.yml"], ["ios-e2e", "./.github/workflows/e2e-ios.yml"]] as const) {
     const reusableJob = requiredJob(workflows.ci, jobName);

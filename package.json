@@ -37,7 +37,7 @@
     "test:e2e:android:faults": "bash scripts/e2e/run-fault-matrix.sh android",
     "test:e2e:ios:faults": "bash scripts/e2e/run-fault-matrix.sh ios",
     "typecheck": "node tools/run-typecheck.mjs",
-    "lint": "eslint App.tsx app.config.ts index.ts src tests/app tests/setup.ts tools/check-licenses.mjs tools/check-app-dependencies.mjs tools/check-app-audit.mjs tools/check-app-config.mjs tools/check-native-schemes.mjs tools/collect-ci-evidence.mjs tools/clean-generated.mjs --max-warnings=0",
+    "lint": "eslint App.tsx app.config.ts index.ts metro.config.cjs src tests/app tests/setup.ts tools/check-licenses.mjs tools/check-fault-bundles.mjs tools/check-app-dependencies.mjs tools/check-app-audit.mjs tools/check-app-config.mjs tools/check-native-schemes.mjs tools/collect-ci-evidence.mjs tools/clean-generated.mjs --max-warnings=0",
     "expo:doctor": "expo-doctor --verbose",
     "expo:doctor:g017": "node tools/run-expo-doctor-isolated.mjs",
     "g017:install": "cd spikes/model-transport && npm ci --workspaces=false",
@@ -49,7 +49,8 @@
     "prebuild:android:e2e": "EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e expo prebuild --clean --platform android --no-install",
     "prebuild:ios:production": "EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=production expo prebuild --clean --platform ios --no-install",
     "prebuild:ios:e2e": "EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e expo prebuild --clean --platform ios --no-install",
-    "clean:generated": "node tools/clean-generated.mjs"
+    "clean:generated": "node tools/clean-generated.mjs",
+    "test:fault-bundles": "node tools/check-fault-bundles.mjs"
   },
   "dependencies": {
     "@react-native-vector-icons/lucide": "13.1.2",

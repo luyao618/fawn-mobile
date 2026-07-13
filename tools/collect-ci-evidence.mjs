@@ -6,6 +6,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { validateResolvedConfigs } from "./check-app-config.mjs";
+import { validateFaultBundleProof } from "./check-fault-bundles.mjs";
 import { inspectNativeScheme, NATIVE_EVIDENCE_PATHS } from "./check-native-schemes.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -121,6 +122,13 @@ async function main() {
   const flavor = option("--flavor", "static");
   let reports = null;
   let nativeFiles = null;
+  let faultBundles = null;
+  if (platform === "host") {
+    assert.equal(flavor, "static", "Host evidence must represent static gates");
+    const faultBundleProof = await loadReport(option("--fault-bundle-proof", null));
+    const bundles = await validateFaultBundleProof(faultBundleProof.report, { root: repoRoot, expectedSha });
+    faultBundles = { proof: { path: faultBundleProof.path, sha256: faultBundleProof.sha256 }, bundles };
+  }
   if (["android", "ios"].includes(platform)) {
     assert.equal(flavor, "e2e", "Native evidence must represent the final E2E flavor");
     const configProduction = await loadReport(option("--config-report-production", null));
@@ -141,7 +149,7 @@ async function main() {
     nativeFiles = validated.nativeFiles;
   }
   const evidence = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     checkedOutSha,
     expectedSha,
     platform,
@@ -155,6 +163,7 @@ async function main() {
     },
     nativeFiles,
     reports,
+    faultBundles,
     runner: {
       os: process.env.RUNNER_OS ?? process.platform,
       arch: process.env.RUNNER_ARCH ?? process.arch,

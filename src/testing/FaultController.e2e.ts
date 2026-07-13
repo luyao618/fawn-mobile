@@ -2,9 +2,11 @@ import { Linking } from "react-native";
 
 import { parseFaultUrl, type FaultRequest } from "./faultContract";
 
+export const E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL = "FOR_MOBILE_E2E_FAULT_CONTROLLER_REAL_V1";
+
 const noOp = () => {};
 
-export async function installE2EFaultController(
+export async function installFaultController(
   onFault: (request: FaultRequest) => void,
   signal?: AbortSignal,
 ): Promise<() => void> {

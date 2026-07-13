@@ -1,7 +1,7 @@
 import { Linking } from "react-native";
 
-import { installE2EFaultController } from "../../../src/testing/FaultController.e2e";
-import { createFaultController } from "../../../src/testing/FaultController";
+import { installFaultController as installE2EFaultController } from "../../../src/testing/FaultController.e2e";
+import { installFaultController as installProductionFaultController } from "../../../src/testing/FaultController.production";
 import { FAULT_POINTS, canonicalFaultUrl, parseFaultUrl } from "../../../src/testing/faultContract";
 
 const NORMATIVE_FAULT_POINTS = [
@@ -52,26 +52,11 @@ test.each([
   "formobile-test://fault?point=turn.after_user_commit&mode=crash_always",
 ])("rejects noncanonical fault URI %s", (value) => expect(parseFaultUrl(value)).toBeNull());
 
-test("production controller is a true no-op and never imports E2E code", async () => {
-  const importer = jest.fn();
+test("standalone production controller is a true no-op", async () => {
   const onFault = jest.fn();
-  const dispose = await createFaultController("production", onFault, importer);
+  const dispose = await installProductionFaultController(onFault, AbortSignal.abort());
   dispose();
-  expect(importer).not.toHaveBeenCalled();
   expect(onFault).not.toHaveBeenCalled();
-});
-
-test("dynamic import rejection fails E2E setup", async () => {
-  const importer = jest.fn(async () => { throw new Error("synthetic import failure"); });
-  await expect(createFaultController("e2e", jest.fn(), importer as never)).rejects.toThrow("synthetic import failure");
-});
-
-test.each(["throw", "reject"])("listener installation %s fails E2E setup", async (mode) => {
-  const install = mode === "throw"
-    ? jest.fn(() => { throw new Error("synthetic install failure"); })
-    : jest.fn(async () => { throw new Error("synthetic install failure"); });
-  const importer = jest.fn(async () => ({ installE2EFaultController: install }));
-  await expect(createFaultController("e2e", jest.fn(), importer as never)).rejects.toThrow("synthetic install failure");
 });
 
 test("native listener installation throws instead of being silently swallowed", async () => {

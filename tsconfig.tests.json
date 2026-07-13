@@ -3,6 +3,6 @@
   "compilerOptions": {
     "types": ["jest", "node", "react", "react-native"]
   },
-  "include": ["tests/app/**/*.ts", "tests/app/**/*.tsx", "tests/setup.ts"],
+  "include": ["tests/app/**/*.ts", "tests/app/**/*.tsx", "tests/setup.ts", "src/testing/fault-controller.d.ts"],
   "exclude": ["tests/unit", "tools", "spikes", "android", "ios"]
 }
