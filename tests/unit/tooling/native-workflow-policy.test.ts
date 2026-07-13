@@ -1908,6 +1908,11 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
       assert.ok(typeof step.run === "string");
       step.run = step.run.replace('MODE="0666"', 'MODE="0660"');
     }],
+    ["missing-read-probe", (candidate) => {
+      const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex];
+      assert.ok(typeof step.run === "string");
+      step.run = step.run.replace("test -r /dev/kvm\n", "");
+    }],
     ["missing-write-probe", (candidate) => {
       const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex];
       assert.ok(typeof step.run === "string");
