@@ -274,6 +274,7 @@ function pinnedAndroidActionScript(workflow: Workflow): string {
     "api-level": 35,
     arch: "x86_64",
     profile: "pixel_6",
+    "disable-linux-hw-accel": false,
     script: "bash scripts/e2e/run-android-emulator.sh",
   }, "Android emulator action inputs must remain exact");
   assertUnconditionalFailClosed(step, "Android emulator action");
@@ -350,7 +351,19 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
     assert.equal(Object.hasOwn(preflight, "if"), false, "iOS toolchain preflight must not be conditional");
     assert.equal(Object.hasOwn(preflight, "continue-on-error"), false, "iOS toolchain preflight must fail closed");
   } else {
+    assert.equal(job["runs-on"], exactAndroidRunner, "Android runner must remain ubuntu-latest");
+    assert.deepEqual(
+      job.env,
+      { MAESTRO_DRIVER_STARTUP_TIMEOUT: exactAndroidMaestroTimeout },
+      "Android Maestro driver startup timeout must remain exactly bounded at 60000ms",
+    );
     const e2ePrebuildIndex = stepIndex(steps, (step) => step.name === "Clean-prebuild, inspect, and build E2E", "Android E2E prebuild");
+    const kvmIndexes = steps.flatMap((step, index) => step.name === androidKvmStepName ? [index] : []);
+    assert.equal(kvmIndexes.length, 1, "Android must contain exactly one named KVM hardware acceleration step");
+    const kvmIndex = kvmIndexes[0];
+    const kvmStep = steps[kvmIndex];
+    assert.equal(kvmStep.run, exactAndroidKvmScript, "Android KVM hardware acceleration setup must remain exact and fail closed");
+    assertUnconditionalFailClosed(kvmStep, "Android KVM hardware acceleration setup");
     const emulatorIndex = stepIndex(steps, (step) => usesActionRepository(step, androidEmulatorRepository), "Android emulator");
     const e2ePrebuild = steps[e2ePrebuildIndex];
     assert.ok(typeof e2ePrebuild.run === "string", "Android E2E prebuild must have an enabled run script");
@@ -359,6 +372,8 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
       [exactAndroidBuildCommand],
       "Android E2E prebuild must contain only the exact x86_64 build command",
     );
+    assert.equal(kvmIndex, assertionIndex + 1, "Android KVM setup must immediately follow the exact SHA assertion");
+    assert.equal(installIndex, kvmIndex + 1, "Android npm install must immediately follow the exact KVM setup");
     assert.ok(e2ePrebuildIndex < emulatorIndex, "Android x86_64 E2E build must complete before the emulator action");
   }
 
@@ -532,6 +547,16 @@ const iosOpenConfirmationFlow = "e2e/maestro/ios-open-confirmation.yaml";
 const readinessFlow = "e2e/maestro/shell-readiness.yaml";
 const smokeFlow = "e2e/maestro/shell-smoke.yaml";
 const exactAndroidMaestroTimeout = "60000";
+const exactAndroidRunner = "ubuntu-latest";
+const androidKvmStepName = "Enable KVM hardware acceleration";
+const exactAndroidKvmScript = `set -euo pipefail
+test -c /dev/kvm
+echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --name-match=kvm
+test -r /dev/kvm
+test -w /dev/kvm
+`;
 const exactReadinessCommands: Record<NativePlatform, string> = {
   Android: `maestro --device "$emulator_serial" test --debug-output .artifacts/launch/maestro/android-readiness ${readinessFlow} 2>&1 | tee .artifacts/launch/android-readiness.log`,
   iOS: `maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-readiness ${readinessFlow} 2>&1 | tee .artifacts/launch/ios-readiness.log`,
@@ -1869,6 +1894,71 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
     () => pinnedAndroidActionScript(parseWorkflow(commentDecoy, "comment-decoy Android")),
     /must remain pinned to the reviewed SHA/,
   );
+
+  const androidSteps = requiredSteps(requiredJob(workflows.android, "android"), "android");
+  const androidKvmIndex = androidSteps.findIndex((step) => step.name === androidKvmStepName);
+  assert.notEqual(androidKvmIndex, -1);
+
+  const hostileKvmMutations: [string, (candidate: NativeWorkflows) => void][] = [
+    ["removed", (candidate) => {
+      requiredSteps(requiredJob(candidate.android, "android"), "android").splice(androidKvmIndex, 1);
+    }],
+    ["mode-0660", (candidate) => {
+      const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex];
+      assert.ok(typeof step.run === "string");
+      step.run = step.run.replace('MODE="0666"', 'MODE="0660"');
+    }],
+    ["missing-write-probe", (candidate) => {
+      const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex];
+      assert.ok(typeof step.run === "string");
+      step.run = step.run.replace("test -w /dev/kvm\n", "");
+    }],
+    ["conditional", (candidate) => {
+      requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex].if = "${{ false }}";
+    }],
+    ["continue-on-error", (candidate) => {
+      requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex]["continue-on-error"] = true;
+    }],
+    ["reordered", (candidate) => {
+      const steps = requiredSteps(requiredJob(candidate.android, "android"), "android");
+      const [step] = steps.splice(androidKvmIndex, 1);
+      steps.unshift(step);
+    }],
+  ];
+  for (const [label, mutate] of hostileKvmMutations) {
+    const candidate = structuredClone(workflows);
+    mutate(candidate);
+    assert.throws(
+      () => assertNativeWorkflowPolicy(candidate),
+      /KVM hardware acceleration|KVM setup must immediately follow/,
+      `hostile KVM ${label} mutation must be rejected`,
+    );
+  }
+
+  const wrongAndroidRunner = structuredClone(workflows);
+  requiredJob(wrongAndroidRunner.android, "android")["runs-on"] = "ubuntu-24.04";
+  assert.throws(() => assertNativeWorkflowPolicy(wrongAndroidRunner), /Android runner must remain ubuntu-latest/);
+
+  for (const fallback of [undefined, "auto", true] as const) {
+    const unsafeAccelerationFallback = structuredClone(workflows);
+    const emulator = requiredSteps(requiredJob(unsafeAccelerationFallback.android, "android"), "android")
+      .find((step) => step.uses === androidEmulatorAction);
+    assert.ok(emulator?.with);
+    if (fallback === undefined) delete emulator.with["disable-linux-hw-accel"];
+    else emulator.with["disable-linux-hw-accel"] = fallback;
+    assert.throws(
+      () => assertNativeWorkflowPolicy(unsafeAccelerationFallback),
+      /Android emulator action inputs must remain exact/,
+      `Android emulator must reject disable-linux-hw-accel fallback ${String(fallback)}`,
+    );
+  }
+
+  const overriddenCores = structuredClone(workflows);
+  const emulatorWithCores = requiredSteps(requiredJob(overriddenCores.android, "android"), "android")
+    .find((step) => step.uses === androidEmulatorAction);
+  assert.ok(emulatorWithCores?.with);
+  emulatorWithCores.with.cores = 4;
+  assert.throws(() => assertNativeWorkflowPolicy(overriddenCores), /Android emulator action inputs must remain exact/);
 
   const extraUnpinnedFamilyAction = structuredClone(workflows);
   requiredSteps(requiredJob(extraUnpinnedFamilyAction.android, "android"), "android").push({
