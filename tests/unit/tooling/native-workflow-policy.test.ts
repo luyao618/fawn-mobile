@@ -50,6 +50,8 @@ const checkoutAction = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af68
 const setupNodeAction = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
 const uploadArtifactAction = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
 const androidEmulatorAction = "ReactiveCircus/android-emulator-runner@1dcd0090116d15e7c562f8db72807de5e036a4ed";
+const uploadArtifactRepository = "actions/upload-artifact";
+const androidEmulatorRepository = "reactivecircus/android-emulator-runner";
 const exactHeadSha = "${{ github.event.pull_request.head.sha || github.sha }}";
 const expectedShaInput = "${{ inputs.expected_sha }}";
 const exactStaticShaAssertion = `test "$(git rev-parse HEAD)" = "${exactHeadSha}"`;
@@ -82,6 +84,10 @@ const whoDownloadCommand = "PYTHONDONTWRITEBYTECODE=1 python3 tools/knowledge/do
 const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
 const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/android/production/**/*.js\n.artifacts/fault-bundles/android/production/metadata.json\n.artifacts/fault-bundles/android/e2e/**/*.js\n.artifacts/fault-bundles/android/e2e/metadata.json\n.artifacts/fault-bundles/ios/production/**/*.js\n.artifacts/fault-bundles/ios/production/metadata.json\n.artifacts/fault-bundles/ios/e2e/**/*.js\n.artifacts/fault-bundles/ios/e2e/metadata.json\n";
+const exactChildPrimaryUploadPaths = {
+  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n",
+  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n",
+} as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
 const exactAndroidRunnerSha256 = "bf42ee697041e4a02e2d2eae21d50427ad1ea54fdc1956b4d769f960b760b871";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
@@ -243,9 +249,16 @@ function assertUnconditionalFailClosed(node: WorkflowStep | WorkflowJob, label: 
   assert.equal(Object.hasOwn(node, "continue-on-error"), false, `${label} must fail closed`);
 }
 
+function usesActionRepository(step: WorkflowStep, repository: string): boolean {
+  if (typeof step.uses !== "string") return false;
+  const separator = step.uses.indexOf("@");
+  const referencedRepository = separator === -1 ? step.uses : step.uses.slice(0, separator);
+  return referencedRepository.toLowerCase() === repository.toLowerCase();
+}
+
 function pinnedAndroidActionScript(workflow: Workflow): string {
   const steps = requiredSteps(requiredJob(workflow, "android"), "android");
-  const matches = steps.filter((step) => typeof step.uses === "string" && step.uses.startsWith("ReactiveCircus/android-emulator-runner@"));
+  const matches = steps.filter((step) => usesActionRepository(step, androidEmulatorRepository));
   assert.equal(matches.length, 1, "Android must contain exactly one emulator action family step");
   const step = matches[0];
   assert.equal(step.uses, androidEmulatorAction, "Android emulator action must remain pinned to the reviewed SHA");
@@ -257,15 +270,6 @@ function pinnedAndroidActionScript(workflow: Workflow): string {
   }, "Android emulator action inputs must remain exact");
   assertUnconditionalFailClosed(step, "Android emulator action");
   return step.with.script as string;
-}
-
-function assertArtifactName(steps: WorkflowStep[], name: string): void {
-  const index = stepIndex(
-    steps,
-    (step) => step.uses === uploadArtifactAction && step.with?.name === name,
-    `${name} artifact upload`,
-  );
-  assert.equal(steps[index].with?.name, name);
 }
 
 function withoutTerminalNewline(text: string): string {
@@ -349,7 +353,36 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
     ? stepIndex(steps, (step) => step.uses === androidEmulatorAction, "android device smoke")
     : stepIndex(steps, (step) => step.name === "Serial production and E2E builds, install, and smoke", "ios device smoke");
   assert.ok(collectorIndex > smokeIndex, `${jobName} evidence collector must follow the device smoke step`);
-  assertArtifactName(steps, `${jobName}-e2e-evidence-${expectedShaInput}`);
+  const uploadIndexes = steps.flatMap((step, index) => usesActionRepository(step, uploadArtifactRepository) ? [index] : []);
+  assert.equal(uploadIndexes.length, 2, `${jobName} must contain exactly the approved primary and diagnostics artifact uploads`);
+  for (const uploadIndex of uploadIndexes) {
+    assert.equal(steps[uploadIndex].uses, uploadArtifactAction, `${jobName} artifact upload actions must remain pinned`);
+  }
+  const primaryUploadName = `${jobName}-e2e-evidence-${expectedShaInput}`;
+  const primaryUploadIndexes = uploadIndexes.filter((index) => steps[index].with?.name === primaryUploadName);
+  assert.equal(primaryUploadIndexes.length, 1, `${jobName} must contain exactly one primary evidence upload`);
+  const primaryUploadIndex = primaryUploadIndexes[0];
+  const primaryUpload = steps[primaryUploadIndex];
+  assert.deepEqual(primaryUpload.with, {
+    name: primaryUploadName,
+    path: exactChildPrimaryUploadPaths[jobName],
+    "if-no-files-found": "error",
+  }, `${jobName} primary evidence upload inputs must remain exact`);
+  assertUnconditionalFailClosed(primaryUpload, `${jobName} primary evidence upload`);
+  assert.ok(primaryUploadIndex > collectorIndex, `${jobName} primary evidence upload must follow the same-SHA collector`);
+
+  const diagnosticsUploadName = `${jobName}-e2e-diagnostics-${expectedShaInput}`;
+  const diagnosticsUploadIndexes = uploadIndexes.filter((index) => steps[index].with?.name === diagnosticsUploadName);
+  assert.equal(diagnosticsUploadIndexes.length, 1, `${jobName} must retain exactly one diagnostics upload`);
+  const diagnosticsUpload = steps[diagnosticsUploadIndexes[0]];
+  assert.equal(diagnosticsUpload.if, "always()", `${jobName} diagnostics upload must always run`);
+  assert.equal(Object.hasOwn(diagnosticsUpload, "continue-on-error"), false, `${jobName} diagnostics upload must fail closed`);
+  assert.deepEqual(diagnosticsUpload.with, {
+    name: diagnosticsUploadName,
+    path: ".artifacts/launch/**\n.artifacts/test-results/**\n",
+    "include-hidden-files": true,
+    "if-no-files-found": "ignore",
+  }, `${jobName} diagnostics upload inputs must remain exact`);
   if (jobName === "android") pinnedAndroidActionScript(workflow);
 }
 
@@ -403,9 +436,8 @@ function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
   const collectorIndex = stepIndex(steps, (step) => step.run === exactStaticCollector, "Static evidence collector");
   assert.ok(collectorIndex > previousGateIndex, "Static evidence must be collected after all original gates");
   assertUnconditionalFailClosed(steps[collectorIndex], "Static evidence collector");
-  assertArtifactName(steps, `static-evidence-${exactHeadSha}`);
   const staticUploadIndexes = steps.flatMap((step, index) =>
-    typeof step.uses === "string" && step.uses.startsWith("actions/upload-artifact@") ? [index] : []
+    usesActionRepository(step, uploadArtifactRepository) ? [index] : []
   );
   assert.equal(staticUploadIndexes.length, 1, "Static job must contain exactly one artifact upload");
   const staticUpload = steps[staticUploadIndexes[0]];
@@ -1385,6 +1417,21 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
     /exactly one emulator action family step/,
   );
 
+  for (const hostileUses of [
+    "reactivecircus/android-emulator-runner@main",
+    "rEaCtIvEcIrCuS/AnDrOiD-EmUlAtOr-RuNnEr@main",
+  ]) {
+    const caseVariantFamilyAction = structuredClone(workflows);
+    requiredSteps(requiredJob(caseVariantFamilyAction.android, "android"), "android").push({
+      uses: hostileUses,
+      with: { script: "echo hostile" },
+    });
+    assert.throws(
+      () => assertNativeWorkflowPolicy(caseVariantFamilyAction),
+      /exactly one emulator action family step/,
+    );
+  }
+
   const heredocDecoyStep = `      - run: |\n          cat <<'YAML'\n          - uses: ${androidEmulatorAction}\n            with:\n              script: bash scripts/e2e/run-android-emulator.sh\n          YAML\n`;
   const heredocDecoy = androidSource
     .replace("          script: bash scripts/e2e/run-android-emulator.sh", "          script: echo hostile")
@@ -1436,6 +1483,24 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
   assert.ok(missingStaticJsonUpload?.with && typeof missingStaticJsonUpload.with.path === "string");
   missingStaticJsonUpload.with.path = missingStaticJsonUpload.with.path.replace(".artifacts/static.json\n", "");
   assert.throws(() => assertNativeWorkflowPolicy(missingStaticJson), /must retain static.json/);
+
+  for (const hostileUses of [
+    "actions/upload-artifact@main",
+    "AcTiOnS/UpLoAd-ArTiFaCt@main",
+  ]) {
+    const deniedStaticUpload = structuredClone(workflows);
+    requiredSteps(requiredJob(deniedStaticUpload.ci, "static"), "static").push({
+      uses: hostileUses,
+      with: {
+        name: "hostile-static-WHO-data",
+        path: "knowledge/sources/who-growth/**\n",
+      },
+    });
+    assert.throws(
+      () => assertNativeWorkflowPolicy(deniedStaticUpload),
+      /Static job must contain exactly one artifact upload/,
+    );
+  }
 
   for (const [label, select] of [
     ["Static job", (candidate: NativeWorkflows) => requiredJob(candidate.ci, "static")],
@@ -1510,6 +1575,40 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
     assert.ok(collector && typeof collector.run === "string");
     collector.run = collector.run.replace(expectedShaInput, "${{ github.sha }}");
     assert.throws(() => assertNativeWorkflowPolicy(wrongCollectorSha), new RegExp(`${jobName} evidence collector command`));
+
+    for (const [field, value] of [["if", "${{ false }}"], ["continue-on-error", true]] as const) {
+      const disabledPrimaryUpload = structuredClone(workflows);
+      const primaryUpload = requiredSteps(requiredJob(disabledPrimaryUpload[child], jobName), jobName)
+        .find((step) => step.with?.name === `${jobName}-e2e-evidence-${expectedShaInput}`);
+      assert.ok(primaryUpload);
+      primaryUpload[field] = value;
+      assert.throws(
+        () => assertNativeWorkflowPolicy(disabledPrimaryUpload),
+        new RegExp(`${jobName} primary evidence upload must`),
+      );
+    }
+
+    const missingPlatformJson = structuredClone(workflows);
+    const uploadWithoutPlatformJson = requiredSteps(requiredJob(missingPlatformJson[child], jobName), jobName)
+      .find((step) => step.with?.name === `${jobName}-e2e-evidence-${expectedShaInput}`);
+    assert.ok(uploadWithoutPlatformJson?.with && typeof uploadWithoutPlatformJson.with.path === "string");
+    uploadWithoutPlatformJson.with.path = uploadWithoutPlatformJson.with.path.replace(`.artifacts/${jobName}-e2e.json\n`, "");
+    assert.throws(
+      () => assertNativeWorkflowPolicy(missingPlatformJson),
+      new RegExp(`${jobName} primary evidence upload inputs must remain exact`),
+    );
+
+    for (const hostileUses of ["actions/upload-artifact@main", "AcTiOnS/UpLoAd-ArTiFaCt@main"]) {
+      const extraChildUpload = structuredClone(workflows);
+      requiredSteps(requiredJob(extraChildUpload[child], jobName), jobName).push({
+        uses: hostileUses,
+        with: { name: `hostile-${jobName}-upload`, path: ".artifacts/**\n" },
+      });
+      assert.throws(
+        () => assertNativeWorkflowPolicy(extraChildUpload),
+        new RegExp(`${jobName} must contain exactly the approved primary and diagnostics artifact uploads`),
+      );
+    }
   }
 });
 
