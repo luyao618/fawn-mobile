@@ -450,13 +450,6 @@ const exactAndroidFailureHierarchyCommand = '    adb -s "$emulator_serial" exec-
 const exactAndroidFailurePidCommand = String.raw`    app_pid=$(adb -s "$emulator_serial" shell pidof -s com.luyao618.formobile 2>/dev/null | tr -d "\r")`;
 const exactAndroidFailureLogCommand = '      adb -s "$emulator_serial" logcat -d --pid="$app_pid" > .artifacts/launch/device/android-app.log 2>&1';
 const exactAndroidFallbackLogCommand = "      adb -s \"$emulator_serial\" logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V '*:S' > .artifacts/launch/device/android-app.log 2>&1";
-const exactAndroidDiagnosticCommands = [
-  exactAndroidFailureScreenshotCommand,
-  exactAndroidFailureHierarchyCommand,
-  exactAndroidFailurePidCommand,
-  exactAndroidFailureLogCommand,
-  exactAndroidFallbackLogCommand,
-];
 const exactPinnedSimulatorOpenLine = 'open "$DEVELOPER_DIR/Applications/Simulator.app" --args -CurrentDeviceUDID "$simulator_udid"';
 
 const exactIosOpenConfirmationFlow = `appId: com.luyao618.formobile
@@ -567,27 +560,6 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
   const cleanupStart = lines.indexOf("cleanup() {");
   const cleanupEnd = lines.indexOf("trap cleanup EXIT", cleanupStart + 1);
   assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart, "Android cleanup function and EXIT trap must remain exact");
-  const logicalLines = script
-    .split(/\r\n|\n|\r/)
-    .filter((line) => !/^\s*#/.test(line))
-    .join("\n")
-    .replace(/\\\n/g, "")
-    .split("\n");
-  const logicalCleanupStart = logicalLines.indexOf("cleanup() {");
-  const logicalCleanupEnd = logicalLines.indexOf("trap cleanup EXIT", logicalCleanupStart + 1);
-  assert.ok(
-    logicalCleanupStart >= 0 && logicalCleanupEnd > logicalCleanupStart,
-    "Android logical cleanup function and EXIT trap must remain exact",
-  );
-  const diagnosticCommands = logicalLines.slice(logicalCleanupStart, logicalCleanupEnd + 1).filter(
-    (line) => /\badb\b/.test(line)
-      && /\b(?:screencap|uiautomator|pidof|logcat)\b/.test(line),
-  );
-  assert.deepEqual(
-    diagnosticCommands,
-    exactAndroidDiagnosticCommands,
-    "The executable Android diagnostic adb command inventory must exactly match in order",
-  );
   const cleanupLines = [
     "cleanup() {",
     "  status=$?",
@@ -610,9 +582,9 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
     "}",
     "trap cleanup EXIT",
   ];
-  const cleanupIndexes = cleanupLines.map((line) => lines.indexOf(line));
-  assert.ok(
-    cleanupIndexes.every((index, position) => index >= 0 && (position === 0 || index > cleanupIndexes[position - 1])),
+  assert.deepEqual(
+    lines.slice(cleanupStart, cleanupEnd + 1),
+    cleanupLines,
     "Android cleanup must preserve exact status, failure diagnostics, teardown, retained Metro log, and exit order",
   );
   const diagnosticUploads = requiredSteps(job, "android")
@@ -1131,7 +1103,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.notEqual(mutatedScript, androidRunner);
     assert.throws(
       () => assertAndroidDiagnosticsPolicy(mutatedScript, androidWorkflow),
-      /Android cleanup must preserve|distinct exact debug-output directories|executable Android diagnostic adb command inventory must exactly match/,
+      /Android cleanup must preserve|distinct exact debug-output directories/,
     );
   }
 
@@ -1140,6 +1112,8 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     '    adb -s "$emulator_serial" exec-out uiautomator dump /dev/tty > .artifacts/launch/device/extra-android-ui-hierarchy.xml 2>&1',
     String.raw`    extra_app_pid=$(adb -s "$emulator_serial" shell pidof -s com.luyao618.formobile 2>/dev/null | tr -d "\r")`,
     '    adb -s "$emulator_serial" logcat -d > .artifacts/launch/device/extra-android.log 2>&1',
+    "    a''db -s \"$emulator_serial\" logcat -d > .artifacts/launch/device/quote-joined-adb.log 2>&1",
+    "    adb -s \"$emulator_serial\" log''cat -d > .artifacts/launch/device/quote-joined-logcat.log 2>&1",
   ];
   for (const extraDiagnostic of extraAndroidDiagnostics) {
     const mutatedScript = androidRunner.replace(
@@ -1149,7 +1123,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.notEqual(mutatedScript, androidRunner);
     assert.throws(
       () => assertAndroidDiagnosticsPolicy(mutatedScript, androidWorkflow),
-      /executable Android diagnostic adb command inventory must exactly match/,
+      /Android cleanup must preserve/,
     );
   }
 
@@ -1166,7 +1140,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.notEqual(mutatedScript, androidRunner);
     assert.throws(
       () => assertAndroidDiagnosticsPolicy(mutatedScript, androidWorkflow),
-      /executable Android diagnostic adb command inventory must exactly match/,
+      /Android cleanup must preserve/,
     );
   }
 
@@ -1177,7 +1151,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
   assert.notEqual(duplicatedAndroidDiagnostic, androidRunner);
   assert.throws(
     () => assertAndroidDiagnosticsPolicy(duplicatedAndroidDiagnostic, androidWorkflow),
-    /executable Android diagnostic adb command inventory must exactly match/,
+    /Android cleanup must preserve/,
   );
 
   const reorderedAndroidDiagnostics = androidRunner.replace(
@@ -1187,7 +1161,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
   assert.notEqual(reorderedAndroidDiagnostics, androidRunner);
   assert.throws(
     () => assertAndroidDiagnosticsPolicy(reorderedAndroidDiagnostics, androidWorkflow),
-    /executable Android diagnostic adb command inventory must exactly match/,
+    /Android cleanup must preserve/,
   );
 
   const commentedExtraAndroidDiagnostic = androidRunner.replace(
@@ -1195,7 +1169,10 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     `${exactAndroidFailureScreenshotCommand}\n    # adb -s "$emulator_serial" logcat -d > .artifacts/launch/device/comment-only.log 2>&1`,
   );
   assert.notEqual(commentedExtraAndroidDiagnostic, androidRunner);
-  assert.doesNotThrow(() => assertAndroidDiagnosticsPolicy(commentedExtraAndroidDiagnostic, androidWorkflow));
+  assert.throws(
+    () => assertAndroidDiagnosticsPolicy(commentedExtraAndroidDiagnostic, androidWorkflow),
+    /Android cleanup must preserve/,
+  );
 
   const bashCommentBoundary = spawnSync("/bin/bash", ["-c", String.raw`# comment \
 printf 'next-line-ran'`], { encoding: "utf8" });
@@ -1209,7 +1186,7 @@ printf 'next-line-ran'`], { encoding: "utf8" });
   assert.notEqual(commentFollowedByExecutableAndroidDiagnostic, androidRunner);
   assert.throws(
     () => assertAndroidDiagnosticsPolicy(commentFollowedByExecutableAndroidDiagnostic, androidWorkflow),
-    /executable Android diagnostic adb command inventory must exactly match/,
+    /Android cleanup must preserve/,
   );
 
   const continuedCommentOnlyAndroidDiagnostic = androidRunner.replace(
@@ -1217,7 +1194,10 @@ printf 'next-line-ran'`], { encoding: "utf8" });
     `${exactAndroidFailureScreenshotCommand}\n    # adb -s "$emulator_serial" \\\n    # logcat -d > .artifacts/launch/device/comment-only-continued.log 2>&1`,
   );
   assert.notEqual(continuedCommentOnlyAndroidDiagnostic, androidRunner);
-  assert.doesNotThrow(() => assertAndroidDiagnosticsPolicy(continuedCommentOnlyAndroidDiagnostic, androidWorkflow));
+  assert.throws(
+    () => assertAndroidDiagnosticsPolicy(continuedCommentOnlyAndroidDiagnostic, androidWorkflow),
+    /Android cleanup must preserve/,
+  );
 
   const unboundedAndroidTimeout = structuredClone(androidWorkflow);
   requiredJob(unboundedAndroidTimeout, "android").env = { MAESTRO_DRIVER_STARTUP_TIMEOUT: "120000" };
