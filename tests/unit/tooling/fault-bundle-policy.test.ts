@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -16,7 +16,13 @@ import {
 const sha = "b".repeat(40);
 const platforms = FAULT_BUNDLE_PLATFORMS as readonly ("android" | "ios")[];
 
-type BundleEntry = { path: string; bytes: number; sha256: string; sentinelOccurrences: number };
+type BundleEntry = {
+  path: string;
+  bytes: number;
+  sha256: string;
+  sentinelOccurrences: number;
+  metadata: { path: string; bytes: number; sha256: string };
+};
 
 function resolverTarget(flavor: string) {
   const program = String.raw`
@@ -40,10 +46,12 @@ test("Metro resolves the stable fault-controller specifier to standalone flavor 
   assert.notEqual(JSON.parse(production.stdout).moduleName, JSON.parse(e2e.stdout).moduleName);
 });
 
-test("Metro rejects unknown build flavors instead of falling back to E2E or production", () => {
-  const result = resolverTarget("preview");
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Unsupported EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR: preview/);
+test("Metro rejects inherited-property and unknown build flavors instead of resolving them", () => {
+  for (const flavor of ["constructor", "toString", "__proto__", "preview"]) {
+    const result = resolverTarget(flavor);
+    assert.notEqual(result.status, 0, flavor);
+    assert.match(result.stderr, new RegExp(`Unsupported EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR: ${flavor}`));
+  }
 });
 
 async function fixture(production: string, e2e: string) {
@@ -53,14 +61,22 @@ async function fixture(production: string, e2e: string) {
     entries[platform] = {} as Record<"production" | "e2e", BundleEntry>;
     for (const [flavor, source] of [["production", production], ["e2e", e2e]] as const) {
       const path = `.artifacts/fault-bundles/${platform}/${flavor}/_expo/static/js/${platform}/index.js`;
+      const bundlePath = `_expo/static/js/${platform}/index.js`;
       const bytes = Buffer.from(`${platform}:${source}`);
+      const metadataPath = `.artifacts/fault-bundles/${platform}/${flavor}/metadata.json`;
+      const metadataBytes = Buffer.from(JSON.stringify({ version: 0, bundler: "metro", fileMetadata: { [platform]: { bundle: bundlePath, assets: [] } } }));
       await mkdir(dirname(join(root, path)), { recursive: true });
-      await writeFile(join(root, path), bytes);
+      await Promise.all([writeFile(join(root, path), bytes), writeFile(join(root, metadataPath), metadataBytes)]);
       entries[platform][flavor] = {
         path,
         bytes: bytes.length,
         sha256: createHash("sha256").update(bytes).digest("hex"),
         sentinelOccurrences: source.split(FAULT_CONTROLLER_SENTINEL).length - 1,
+        metadata: {
+          path: metadataPath,
+          bytes: metadataBytes.length,
+          sha256: createHash("sha256").update(metadataBytes).digest("hex"),
+        },
       };
     }
   }
@@ -117,7 +133,7 @@ test("text-bundle proof rejects missing platform evidence and cross-platform can
   const { root, proof } = await fixture("production-no-op", `e2e:${FAULT_CONTROLLER_SENTINEL}`);
   try {
     delete (proof.bundles as any).ios;
-    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /ios production fault bundle evidence is absent/);
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /unknown or missing platform fields/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -128,5 +144,56 @@ test("text-bundle proof rejects missing platform evidence and cross-platform can
     await assert.rejects(validateFaultBundleProof(hostile.proof, { root: hostile.root, expectedSha: sha }), /ios e2e bundle path is outside/);
   } finally {
     await rm(hostile.root, { recursive: true, force: true });
+  }
+});
+
+test("text-bundle proof rejects unknown or missing schema-v2 keys at every owned level", async () => {
+  const mutations = [
+    (proof: any) => { proof.extra = true; },
+    (proof: any) => { delete proof.sentinel; },
+    (proof: any) => { proof.bundles.web = {}; },
+    (proof: any) => { proof.bundles.android.preview = {}; },
+    (proof: any) => { delete proof.bundles.android.production; },
+    (proof: any) => { proof.bundles.android.production.extra = true; },
+    (proof: any) => { delete proof.bundles.android.production.path; },
+    (proof: any) => { delete proof.bundles.android.production.metadata.sha256; },
+  ];
+  for (const mutate of mutations) {
+    const { root, proof } = await fixture("production-no-op", `e2e:${FAULT_CONTROLLER_SENTINEL}`);
+    try {
+      mutate(proof);
+      await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /unknown or missing/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("text-bundle proof binds retained metadata to its claimed platform and canonical bundle", async () => {
+  for (const mutation of ["relabeled-platform", "extra-key", "wrong-bundle"] as const) {
+    const { root, proof } = await fixture("production-no-op", `e2e:${FAULT_CONTROLLER_SENTINEL}`);
+    try {
+      const entry = proof.bundles.android.e2e;
+      const metadataPath = join(root, entry.metadata.path);
+      const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
+      if (mutation === "relabeled-platform") {
+        metadata.fileMetadata.ios = metadata.fileMetadata.android;
+        delete metadata.fileMetadata.android;
+      } else if (mutation === "extra-key") {
+        metadata.fileMetadata.android.extra = true;
+      } else {
+        metadata.fileMetadata.android.bundle = "_expo/static/js/android/other.js";
+      }
+      const bytes = Buffer.from(JSON.stringify(metadata));
+      await writeFile(metadataPath, bytes);
+      entry.metadata.bytes = bytes.length;
+      entry.metadata.sha256 = createHash("sha256").update(bytes).digest("hex");
+      await assert.rejects(
+        validateFaultBundleProof(proof, { root, expectedSha: sha }),
+        /metadata contains unknown or missing platform fields|metadata platform entry contains unknown or missing fields|metadata bundle does not match/,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });

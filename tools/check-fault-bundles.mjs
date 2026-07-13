@@ -27,6 +27,13 @@ function occurrences(bytes, needle) {
   return count;
 }
 
+function hasExactKeys(value, keys) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
+}
+
 async function javascriptFiles(directory) {
   const files = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -51,18 +58,23 @@ function assertCanonicalBundlePath(path, platform, flavor) {
  */
 export async function validateFaultBundleProof(proof, options = {}) {
   const { root = repoRoot, expectedSha } = options;
+  assert(hasExactKeys(proof, ["schemaVersion", "checkedOutSha", "platforms", "exportFlags", "sentinel", "bundles"]), "Fault bundle proof contains unknown or missing root fields");
   assert.equal(proof?.schemaVersion, 2, "Fault bundle proof schema is invalid");
   assert.equal(proof?.checkedOutSha, expectedSha, "Fault bundle proof SHA disagrees with the exact checkout");
   assert.deepEqual(proof?.platforms, FAULT_BUNDLE_PLATFORMS, "Fault bundle proof platforms are invalid");
   assert.deepEqual(proof?.exportFlags, FAULT_BUNDLE_EXPORT_FLAGS, "Fault bundle proof must use text bundles without minification");
   assert.equal(proof?.sentinel, FAULT_CONTROLLER_SENTINEL, "Fault bundle proof sentinel is invalid");
+  assert(hasExactKeys(proof?.bundles, FAULT_BUNDLE_PLATFORMS), "Fault bundle proof contains unknown or missing platform fields");
   const summary = {};
   for (const platform of FAULT_BUNDLE_PLATFORMS) {
+    assert(hasExactKeys(proof.bundles[platform], FAULT_BUNDLE_FLAVORS), `${platform} fault bundle proof contains unknown or missing flavor fields`);
     summary[platform] = {};
     for (const flavor of FAULT_BUNDLE_FLAVORS) {
       const label = `${platform} ${flavor}`;
       const entry = proof?.bundles?.[platform]?.[flavor];
       assert(entry && typeof entry === "object", `${label} fault bundle evidence is absent`);
+      assert(hasExactKeys(entry, ["path", "bytes", "sha256", "sentinelOccurrences", "metadata"]), `${label} fault bundle entry contains unknown or missing fields`);
+      assert(hasExactKeys(entry.metadata, ["path", "bytes", "sha256"]), `${label} metadata evidence contains unknown or missing fields`);
       assertCanonicalBundlePath(entry.path, platform, flavor);
       const absolute = resolve(root, entry.path);
       assert.equal(relative(resolve(root), absolute).split(sep)[0], ".artifacts", `${label} bundle resolves outside retained artifacts`);
@@ -76,6 +88,20 @@ export async function validateFaultBundleProof(proof, options = {}) {
       assert.equal(entry.sentinelOccurrences, count, `${label} sentinel count disagrees`);
       if (flavor === "production") assert.equal(count, 0, `${platform} production bundle contains the real E2E fault controller sentinel`);
       else assert(count > 0, `${platform} E2E bundle does not contain the real fault controller sentinel`);
+      const exportPrefix = `.artifacts/fault-bundles/${platform}/${flavor}/`;
+      assert.equal(entry.metadata.path, `${exportPrefix}metadata.json`, `${label} metadata path is not canonical`);
+      const metadataAbsolute = resolve(root, entry.metadata.path);
+      const metadataStat = await lstat(metadataAbsolute);
+      assert(metadataStat.isFile() && !metadataStat.isSymbolicLink(), `${label} metadata must be a retained regular file`);
+      const metadataBytes = await readFile(metadataAbsolute);
+      assert.equal(entry.metadata.bytes, metadataBytes.length, `${label} metadata byte count disagrees`);
+      assert.equal(entry.metadata.sha256, sha256(metadataBytes), `${label} metadata hash disagrees`);
+      const metadata = JSON.parse(metadataBytes.toString("utf8"));
+      assert(hasExactKeys(metadata, ["version", "bundler", "fileMetadata"]), `${label} Expo metadata contains unknown or missing root fields`);
+      assert(hasExactKeys(metadata.fileMetadata, [platform]), `${label} Expo metadata contains unknown or missing platform fields`);
+      assert(hasExactKeys(metadata.fileMetadata[platform], ["bundle", "assets"]), `${label} Expo metadata platform entry contains unknown or missing fields`);
+      assert(Array.isArray(metadata.fileMetadata[platform].assets), `${label} Expo metadata assets must be an array`);
+      assert.equal(`${exportPrefix}${metadata.fileMetadata[platform].bundle}`, entry.path, `${label} Expo metadata bundle does not match the validated canonical bundle`);
       summary[platform][flavor] = { path: entry.path, bytes: bytes.length, sha256: entry.sha256, sentinelOccurrences: count };
     }
   }
@@ -116,11 +142,14 @@ export async function buildFaultBundleProof(root = repoRoot) {
       assert.equal(files.length, 1, `${platform} ${flavor} export must contain exactly one JavaScript bundle`);
       const path = relative(root, files[0]).split(sep).join("/");
       const bytes = await readFile(files[0]);
+      const metadataPath = relative(root, resolve(output, "metadata.json")).split(sep).join("/");
+      const metadataBytes = await readFile(resolve(output, "metadata.json"));
       proof.bundles[platform][flavor] = {
         path,
         bytes: bytes.length,
         sha256: sha256(bytes),
         sentinelOccurrences: occurrences(bytes, Buffer.from(FAULT_CONTROLLER_SENTINEL)),
+        metadata: { path: metadataPath, bytes: metadataBytes.length, sha256: sha256(metadataBytes) },
       };
     }
   }

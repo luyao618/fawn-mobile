@@ -8,10 +8,10 @@ const targets = {
   production: resolve(__dirname, "src/testing/FaultController.production.ts"),
   e2e: resolve(__dirname, "src/testing/FaultController.e2e.ts"),
 };
-const faultControllerTarget = targets[flavor];
-if (faultControllerTarget === undefined) {
+if (!Object.hasOwn(targets, flavor)) {
   throw new Error(`Unsupported ${BUILD_FLAVOR_VARIABLE}: ${flavor}`);
 }
+const faultControllerTarget = targets[flavor];
 
 const config = getDefaultConfig(__dirname);
 const defaultResolveRequest = config.resolver.resolveRequest;

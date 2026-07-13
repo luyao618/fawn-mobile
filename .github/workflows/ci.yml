@@ -144,9 +144,13 @@ jobs:
             .artifacts/test-results/static-gates.log
             .artifacts/fault-bundles/proof.json
             .artifacts/fault-bundles/android/production/**/*.js
+            .artifacts/fault-bundles/android/production/metadata.json
             .artifacts/fault-bundles/android/e2e/**/*.js
+            .artifacts/fault-bundles/android/e2e/metadata.json
             .artifacts/fault-bundles/ios/production/**/*.js
+            .artifacts/fault-bundles/ios/production/metadata.json
             .artifacts/fault-bundles/ios/e2e/**/*.js
+            .artifacts/fault-bundles/ios/e2e/metadata.json
           if-no-files-found: error
 
   android-e2e:

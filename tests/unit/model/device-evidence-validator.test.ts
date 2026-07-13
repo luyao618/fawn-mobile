@@ -15,6 +15,43 @@ import {
   validateProofText,
 } from "../../../spikes/model-transport/deviceEvidenceValidator.mjs";
 
+const EXACT_G017_SOURCE_PATHS = [
+  "spikes/model-transport/App.tsx",
+  "spikes/model-transport/app.json",
+  "spikes/model-transport/deviceEvidenceValidator.mjs",
+  "spikes/model-transport/index.ts",
+  "spikes/model-transport/metro.config.cjs",
+  "spikes/model-transport/package-lock.json",
+  "spikes/model-transport/package.json",
+  "spikes/model-transport/README.md",
+  "spikes/model-transport/plugins/withLocalMockNetwork.cjs",
+  "spikes/model-transport/src/adapter.ts",
+  "spikes/model-transport/src/contracts.ts",
+  "spikes/model-transport/src/deviceProof.ts",
+  "spikes/model-transport/src/sse.ts",
+  "spikes/model-transport/src/url.ts",
+  "spikes/model-transport/tsconfig.json",
+  "tests/fixtures/providers/chat-completions/malformed-json.sse",
+  "tests/fixtures/providers/chat-completions/premature-eof.sse",
+  "tests/fixtures/providers/chat-completions/profile-a.sse",
+  "tests/fixtures/providers/chat-completions/profile-b.sse",
+  "tests/fixtures/providers/mockCompatibleServer.ts",
+  "tests/unit/model/device-evidence-validator.test.ts",
+  "tests/unit/model/provider-contract.test.ts",
+  "tests/unit/model/sse-parser.test.ts",
+  "tests/unit/model/transport-lifecycle.test.ts",
+  "tests/unit/tooling/redaction.test.ts",
+  "tests/unit/tooling/typecheck-fixture-lifecycle.test.ts",
+  "tools/check-audit.mjs",
+  "tools/check-licenses.mjs",
+  "tools/export-g017.mjs",
+  "tools/redaction.d.mts",
+  "tools/redaction.mjs",
+  "tools/start-mock-provider.mts",
+  "dependencies.slice0.lock.json",
+  "licenses.slice0.json",
+] as const;
+
 function proofRecord(platform: "android" | "ios", fingerprint: string) {
   return `G017_TRANSPORT_PROOF ${JSON.stringify({
     schemaVersion: 1,
@@ -220,9 +257,11 @@ test("G017 source boundary remains exactly 34 unique existing spike-owned paths"
     "tools/run-typecheck.mjs",
     "tools/run-expo-doctor-isolated.mjs",
   ];
+  assert.deepEqual(G017_SOURCE_PATHS, EXACT_G017_SOURCE_PATHS);
   assert.equal(G017_SOURCE_PATHS.length, 34);
   assert.equal(new Set(G017_SOURCE_PATHS).size, 34);
-  for (const path of excludedRootAppPaths) assert(!G017_SOURCE_PATHS.includes(path), path);
+  const sourcePaths: readonly string[] = G017_SOURCE_PATHS;
+  for (const path of excludedRootAppPaths) assert(!sourcePaths.includes(path), path);
   assert(G017_SOURCE_PATHS.includes("tools/redaction.d.mts"));
   for (const path of G017_SOURCE_PATHS) await assert.doesNotReject(readFile(resolve(path)), path);
 });
@@ -250,7 +289,11 @@ test("G017 fingerprint ignores excluded root-app mutations but changes for spike
   }
   assert.equal(await computeG017SourceFingerprint(root), baseline);
 
-  const ownedPath = "spikes/model-transport/App.tsx";
-  await writeFile(resolve(root, ownedPath), Buffer.concat([await readFile(resolve(root, ownedPath)), Buffer.from("\n// spike-owned mutation\n")]));
-  assert.notEqual(await computeG017SourceFingerprint(root), baseline);
+  for (const path of EXACT_G017_SOURCE_PATHS) {
+    const original = await readFile(resolve(root, path));
+    await writeFile(resolve(root, path), Buffer.concat([original, Buffer.from(`\nG017 owned mutation: ${path}\n`)]));
+    assert.notEqual(await computeG017SourceFingerprint(root), baseline, path);
+    await writeFile(resolve(root, path), original);
+    assert.equal(await computeG017SourceFingerprint(root), baseline, `${path} restoration`);
+  }
 });

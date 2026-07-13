@@ -79,7 +79,7 @@ const whoProvisionStepName = "Populate hash-pinned WHO cache";
 const whoDownloadCommand = "PYTHONDONTWRITEBYTECODE=1 python3 tools/knowledge/download_who_sources.py";
 const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
-const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/android/production/**/*.js\n.artifacts/fault-bundles/android/e2e/**/*.js\n.artifacts/fault-bundles/ios/production/**/*.js\n.artifacts/fault-bundles/ios/e2e/**/*.js\n";
+const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/android/production/**/*.js\n.artifacts/fault-bundles/android/production/metadata.json\n.artifacts/fault-bundles/android/e2e/**/*.js\n.artifacts/fault-bundles/android/e2e/metadata.json\n.artifacts/fault-bundles/ios/production/**/*.js\n.artifacts/fault-bundles/ios/production/metadata.json\n.artifacts/fault-bundles/ios/e2e/**/*.js\n.artifacts/fault-bundles/ios/e2e/metadata.json\n";
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
 const exactAndroidRunnerSha256 = "bf42ee697041e4a02e2d2eae21d50427ad1ea54fdc1956b4d769f960b760b871";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
@@ -236,6 +236,26 @@ function stepIndex(steps: WorkflowStep[], predicate: (step: WorkflowStep) => boo
   return index;
 }
 
+function assertUnconditionalFailClosed(step: WorkflowStep, label: string): void {
+  assert.equal(Object.hasOwn(step, "if"), false, `${label} must not be conditional`);
+  assert.equal(Object.hasOwn(step, "continue-on-error"), false, `${label} must fail closed`);
+}
+
+function pinnedAndroidActionScript(workflow: Workflow): string {
+  const steps = requiredSteps(requiredJob(workflow, "android"), "android");
+  const matches = steps.filter((step) => step.uses === androidEmulatorAction);
+  assert.equal(matches.length, 1, "Android must contain exactly one pinned emulator action step");
+  const step = matches[0];
+  assert.deepEqual(step.with, {
+    "api-level": 35,
+    arch: "x86_64",
+    profile: "pixel_6",
+    script: "bash scripts/e2e/run-android-emulator.sh",
+  }, "Android emulator action inputs must remain exact");
+  assertUnconditionalFailClosed(step, "Android emulator action");
+  return step.with.script as string;
+}
+
 function assertArtifactName(steps: WorkflowStep[], name: string): void {
   const index = stepIndex(
     steps,
@@ -326,6 +346,7 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
     : stepIndex(steps, (step) => step.name === "Serial production and E2E builds, install, and smoke", "ios device smoke");
   assert.ok(collectorIndex > smokeIndex, `${jobName} evidence collector must follow the device smoke step`);
   assertArtifactName(steps, `${jobName}-e2e-evidence-${expectedShaInput}`);
+  if (jobName === "android") pinnedAndroidActionScript(workflow);
 }
 
 function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
@@ -365,7 +386,10 @@ function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
 
   let previousGateIndex = preflightIndex;
   for (const run of originalStaticGateRuns) {
-    const gateIndex = stepIndex(steps, (step) => step.run === run, run);
+    const matchingGates = steps.filter((step) => step.run === run);
+    assert.equal(matchingGates.length, 1, `${run} must occur as exactly one mandatory static gate`);
+    assertUnconditionalFailClosed(matchingGates[0], `Mandatory static gate ${run}`);
+    const gateIndex = stepIndex(steps, (step) => step === matchingGates[0], run);
     assert.ok(gateIndex > previousGateIndex, `${run} is out of its original static-gate order`);
     previousGateIndex = gateIndex;
   }
@@ -395,21 +419,6 @@ function assertNativeWorkflowPolicy(workflows: NativeWorkflows): void {
 
   assertChildWorkflowPolicy(workflows.android, "android");
   assertChildWorkflowPolicy(workflows.ios, "ios");
-}
-
-function pinnedActionScriptInput(workflow: string) {
-  const marker = "- uses: ReactiveCircus/android-emulator-runner@1dcd0090116d15e7c562f8db72807de5e036a4ed";
-  const start = workflow.indexOf(marker);
-  assert(start >= 0, "Pinned Android emulator action is absent");
-  const tail = workflow.slice(start);
-  const nextStep = tail.indexOf("\n      - ", marker.length);
-  const step = nextStep >= 0 ? tail.slice(0, nextStep) : tail;
-  const lines = step.split(/\r\n|\n|\r/);
-  const scriptIndex = lines.findIndex((line) => /^\s{10}script:/.test(line));
-  assert(scriptIndex >= 0, "Android emulator action script input is absent");
-  const scalar = lines[scriptIndex].replace(/^\s{10}script:\s*/, "");
-  if (!/^\|[-+]?$/.test(scalar)) return scalar;
-  return lines.slice(scriptIndex + 1).map((line) => line.replace(/^\s{12}/, "")).join("\n");
 }
 
 // Mirrors parseScript() in the pinned action commit exactly.
@@ -707,7 +716,8 @@ test("pinned Android action receives exactly one Bash command and the runner is 
     readFile(".github/workflows/e2e-android.yml", "utf8"),
     readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
   ]);
-  const commands = parsePinnedActionScript(pinnedActionScriptInput(workflow));
+  const parsedWorkflow = parseWorkflow(workflow, ".github/workflows/e2e-android.yml");
+  const commands = parsePinnedActionScript(pinnedAndroidActionScript(parsedWorkflow));
   assert.deepEqual(commands, ["bash scripts/e2e/run-android-emulator.sh"]);
   assert.equal(spawnSync("bash", ["-n", "scripts/e2e/run-android-emulator.sh"]).status, 0);
   assert.match(runner, /^#!\/usr\/bin\/env bash\nset -euo pipefail\n/);
@@ -715,7 +725,7 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assertExactMetroStartupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
   assertExactAndroidInstallPolicy(runner);
-  assertAndroidDiagnosticsPolicy(runner, parseWorkflow(workflow, ".github/workflows/e2e-android.yml"));
+  assertAndroidDiagnosticsPolicy(runner, parsedWorkflow);
   ordered(runner,
     "mapfile -t emulator_serials",
     'emulator_serial="${emulator_serials[0]}"',
@@ -1335,6 +1345,36 @@ test("native workflows enforce the parsed Intel runner, exact SHA boundaries, an
 
 test("parsed workflow policy rejects hostile structural counterexamples", async () => {
   const workflows = await loadNativeWorkflows();
+
+  for (const run of originalStaticGateRuns) {
+    for (const field of ["if", "continue-on-error"] as const) {
+      const hostileGate = structuredClone(workflows);
+      const gate = requiredSteps(requiredJob(hostileGate.ci, "static"), "static").find((step) => step.run === run);
+      assert.ok(gate);
+      gate[field] = field === "if" ? "${{ false }}" : true;
+      assert.throws(() => assertNativeWorkflowPolicy(hostileGate), /must not be conditional|must fail closed/);
+    }
+  }
+
+  const androidSource = await readFile(".github/workflows/e2e-android.yml", "utf8");
+  const exactAndroidActionLine = `      - uses: ${androidEmulatorAction}`;
+  const hostileAndroidActionLine = "      - uses: ReactiveCircus/android-emulator-runner@main";
+  const commentDecoy = `# ${exactAndroidActionLine.trim()}\n${androidSource.replace(exactAndroidActionLine, hostileAndroidActionLine)}`;
+  assert.doesNotThrow(() => parseWorkflow(commentDecoy, "comment-decoy Android"));
+  assert.throws(
+    () => pinnedAndroidActionScript(parseWorkflow(commentDecoy, "comment-decoy Android")),
+    /exactly one pinned emulator action step/,
+  );
+
+  const heredocDecoyStep = `      - run: |\n          cat <<'YAML'\n          - uses: ${androidEmulatorAction}\n            with:\n              script: bash scripts/e2e/run-android-emulator.sh\n          YAML\n`;
+  const heredocDecoy = androidSource
+    .replace("          script: bash scripts/e2e/run-android-emulator.sh", "          script: echo hostile")
+    .replace(exactAndroidActionLine, `${heredocDecoyStep}${exactAndroidActionLine}`);
+  assert.doesNotThrow(() => parseWorkflow(heredocDecoy, "heredoc-decoy Android"));
+  assert.throws(
+    () => pinnedAndroidActionScript(parseWorkflow(heredocDecoy, "heredoc-decoy Android")),
+    /inputs must remain exact/,
+  );
 
   const ciSource = await readFile(".github/workflows/ci.yml", "utf8");
   const commentedUbuntuSource = `# runs-on: macos-15-intel\n${ciSource.replace("runs-on: macos-15-intel", "runs-on: ubuntu-latest")}`;
