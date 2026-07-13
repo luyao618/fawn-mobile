@@ -154,6 +154,8 @@ test("npm lint enumerates every Metro-resolved App and index platform variant", 
   assert.match(packageJson.scripts.lint, /App\{,\.android,\.ios,\.native}/);
   assert.match(packageJson.scripts.lint, /index\{,\.android,\.ios,\.native}/);
   for (const extension of sourceExtensions) assert(packageJson.scripts.lint.includes(extension));
+  assert(packageJson.scripts.lint.includes("eslint.config.js"));
+  assert(packageJson.scripts.lint.includes("tests/unit/tooling"));
 });
 
 test("base and layer restrictions apply to every JavaScript and TypeScript source extension", async () => {

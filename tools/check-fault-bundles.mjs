@@ -271,15 +271,24 @@ function parseMetroBundle(bytes, label) {
   const byId = new Map(modules.map((module) => [module.moduleId, module]));
   for (const root of roots) assert(byId.has(root), `${label} Metro root ${root} does not resolve to a defined module`);
   for (const module of modules) {
-    module.usedDependencyIndexes = [...new Set(astNodes(module.factory.body, (node) => {
-      if (node.type !== "CallExpression" || !identifier(unwrapExpression(node.callee), module.requireName)) return false;
-      assert(node.arguments.length >= 1, `${label} module ${module.moduleId} require call is malformed`);
-      const index = dependencyMapIndex(node.arguments[0], module.dependencyMapName);
-      assert.notEqual(index, null, `${label} module ${module.moduleId} require does not use its Metro dependency map`);
-      return true;
-    }).map((call) => dependencyMapIndex(call.arguments[0], module.dependencyMapName)))]
-      // Metro uses null dependency slots for optional external resolution. They are not internal graph edges.
-      .filter((dependencyIndex) => module.dependencies[dependencyIndex] !== null);
+    const staticImports = [];
+    for (const statement of module.factory.body.body) {
+      if (statement.type === "ReturnStatement" || statement.type === "ThrowStatement") break;
+      const expressions = statement.type === "VariableDeclaration"
+        ? statement.declarations.map(({ init }) => init)
+        : statement.type === "ExpressionStatement" ? [unwrapExpression(statement.expression)] : [];
+      for (const expression of expressions) {
+        const call = expression?.type === "CallExpression" && identifier(unwrapExpression(expression.callee), module.requireName)
+          ? expression
+          : null;
+        if (!call) continue;
+        assert(call.arguments.length >= 1, `${label} module ${module.moduleId} require call is malformed`);
+        const dependencyIndex = dependencyMapIndex(call.arguments[0], module.dependencyMapName);
+        assert.notEqual(dependencyIndex, null, `${label} module ${module.moduleId} require does not use its Metro dependency map`);
+        staticImports.push(dependencyIndex);
+      }
+    }
+    module.usedDependencyIndexes = [...new Set(staticImports)];
   }
   return { modules, roots, byId };
 }
@@ -296,13 +305,6 @@ function dependencyBindings(module) {
     }
   }
   return bindings;
-}
-
-function topLevelAssignments(module) {
-  return module.factory.body.body.flatMap((statement) => {
-    const expression = statement.type === "ExpressionStatement" ? unwrapExpression(statement.expression) : null;
-    return expression?.type === "AssignmentExpression" && expression.operator === "=" ? [expression] : [];
-  });
 }
 
 function isModuleExports(node) {
@@ -345,6 +347,61 @@ function finalNamedExport(module, name) {
     else value = null;
   }
   return value;
+}
+
+function assertClosedExports(module, allowedNames, label) {
+  const allowed = new Set(["__esModule", ...allowedNames]);
+  const aliases = new Set(["exports"]);
+  const candidates = astNodes(module.factory.body, (node) => node.type === "VariableDeclarator" && node.id.type === "Identifier");
+  const aliasDeclarations = [];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const declaration of candidates) {
+      if (aliases.has(declaration.id.name)) continue;
+      const value = unwrapExpression(declaration.init);
+      if (!isModuleExports(value) && !(value?.type === "Identifier" && aliases.has(value.name))) continue;
+      aliases.add(declaration.id.name);
+      aliasDeclarations.push(declaration);
+      changed = true;
+    }
+  }
+  assert.equal(aliasDeclarations.length, 0, `${label} export object must not escape through an alias`);
+
+  const exportReference = (node) => {
+    const value = unwrapExpression(node);
+    return isModuleExports(value) || (value?.type === "Identifier" && aliases.has(value.name));
+  };
+  const definitions = new Map();
+  walkAst(module.factory.body, (node) => {
+    if (node.type === "AssignmentExpression") {
+      assert(!isModuleExports(node.left), `${label} must not replace module.exports`);
+      const target = unwrapExpression(node.left);
+      if (target?.type !== "MemberExpression" || !exportReference(target.object)) return;
+      const name = propertyName(target);
+      assert(node.operator === "=" && name && allowed.has(name), `${label} contains an unrecognized export assignment`);
+      definitions.set(name, (definitions.get(name) ?? 0) + 1);
+      return;
+    }
+    if (node.type === "UpdateExpression" || node.type === "UnaryExpression" && node.operator === "delete") {
+      const target = unwrapExpression(node.argument);
+      assert(!(target?.type === "MemberExpression" && exportReference(target.object)), `${label} contains an unrecognized export mutation`);
+      return;
+    }
+    if (node.type !== "CallExpression") return;
+    const call = unwrapExpression(node);
+    const defineProperty = member(call.callee, "Object", "defineProperty") && exportReference(call.arguments[0]);
+    if (defineProperty) {
+      const name = call.arguments[1]?.value;
+      assert(typeof name === "string" && allowed.has(name), `${label} defines an unrecognized export`);
+      definitions.set(name, (definitions.get(name) ?? 0) + 1);
+      return;
+    }
+    const receiver = unwrapExpression(call.callee)?.type === "MemberExpression" ? unwrapExpression(call.callee).object : null;
+    const exposesExports = exportReference(receiver) || call.arguments.some(exportReference);
+    assert(!exposesExports, `${label} contains an unrecognized export mutation path`);
+  });
+  for (const [name, count] of definitions) assert.equal(count, 1, `${label} export ${name} must have one final definition`);
 }
 
 function functionDeclaration(module, name) {
@@ -394,9 +451,20 @@ function reachableModules(graph, label) {
   return reachable;
 }
 
+function functionInvokes(fn, name) {
+  if (fn.body.body.length !== 1 || fn.body.body[0].type !== "ReturnStatement") return false;
+  const call = unwrapExpression(fn.body.body[0].argument);
+  if (call?.type !== "CallExpression") return false;
+  const callee = unwrapExpression(call.callee);
+  return identifier(callee, name) || identifier(call.arguments[0], name);
+}
+
 function appEvidence(module, graph, label) {
   const appComposition = exportedFunction(module, "AppComposition");
   if (!appComposition) return null;
+  assertClosedExports(module, ["AppComposition", "default"], `${label} App`);
+  const defaultApp = exportedFunction(module, "default");
+  if (!defaultApp || !functionInvokes(defaultApp, "AppComposition")) return null;
   const parameter = appComposition.params[0];
   if (parameter?.type !== "ObjectPattern") return null;
   const installProperty = parameter.properties.find((property) => property.type === "Property" && propertyName({
@@ -417,19 +485,67 @@ function appEvidence(module, graph, label) {
   return { module, controller: resolveDependency(graph, module, binding.dependencyIndex, `${label} App controller`) };
 }
 
-function parserCallBinding(module, handler, urlName) {
+function rootRegistersApp(graph, app, label) {
+  const registrations = [];
+  for (const rootId of graph.roots) {
+    const root = graph.byId.get(rootId);
+    const bindings = dependencyBindings(root);
+    for (const statement of root.factory.body.body) {
+      if (statement.type === "ReturnStatement" || statement.type === "ThrowStatement") break;
+      const call = statement.type === "ExpressionStatement" ? unwrapExpression(statement.expression) : null;
+      if (call?.type !== "CallExpression" || propertyName(unwrapExpression(call.callee)) !== "registerRootComponent") continue;
+      const runtimeName = unwrapExpression(call.callee).object?.name;
+      const runtimeBinding = bindings.find(({ name }) => name === runtimeName);
+      const argument = unwrapExpression(call.arguments[0]);
+      if (!runtimeBinding || argument?.type !== "MemberExpression" || propertyName(argument) !== "default" || argument.object.type !== "Identifier") continue;
+      const interop = variableDeclaration(root.factory.body, argument.object.name)?.init;
+      const importedName = interop?.type === "CallExpression" && interop.arguments.length === 1 && interop.arguments[0]?.type === "Identifier"
+        ? interop.arguments[0].name
+        : null;
+      const appBinding = bindings.find(({ name }) => name === importedName);
+      if (!appBinding) continue;
+      const importedApp = resolveDependency(graph, root, appBinding.dependencyIndex, `${label} root App`);
+      resolveDependency(graph, root, runtimeBinding.dependencyIndex, `${label} root runtime`);
+      if (importedApp.moduleId === app.moduleId) registrations.push({ root, call });
+    }
+  }
+  assert.equal(registrations.length, 1, `${label} one top-level Metro root must import and register the default App`);
+}
+
+function parserDelivery(module, handler, urlName, onFaultName) {
   const bindings = dependencyBindings(module);
   const matches = [];
-  for (const call of astNodes(handler.body, (node) => node.type === "CallExpression")) {
+  walkAst(handler.body, (node, parent) => {
+    if (node.type !== "CallExpression") return;
+    const call = node;
     const callee = unwrapExpression(call.callee);
-    if (callee?.type !== "MemberExpression" || propertyName(callee) !== "parseFaultUrl") continue;
+    if (callee?.type !== "MemberExpression" || propertyName(callee) !== "parseFaultUrl") return;
     const binding = bindings.find((candidate) => identifier(callee.object, candidate.name));
-    if (binding && call.arguments.length === 1 && identifier(call.arguments[0], urlName)) matches.push({ binding, call });
-  }
-  return matches.length === 1 ? matches[0].binding : null;
+    if (binding && call.arguments.length === 1 && identifier(call.arguments[0], urlName)
+      && parent?.type === "VariableDeclarator" && parent.id.type === "Identifier" && parent.init === call) {
+      matches.push({ binding, call, declaration: parent });
+    }
+  });
+  if (matches.length !== 1) return null;
+  const match = matches[0];
+  const requestName = match.declaration.id.name;
+  const declarations = astNodes(handler.body, (node) => node.type === "VariableDeclarator" && identifier(node.id, requestName));
+  const writes = astNodes(handler.body, (node) => (
+    node.type === "AssignmentExpression" && identifier(node.left, requestName)
+    || node.type === "UpdateExpression" && identifier(node.argument, requestName)
+  ));
+  if (declarations.length !== 1 || writes.length !== 0) return null;
+  const parseIndex = handler.body.body.findIndex((statement) => statement.type === "VariableDeclaration" && statement.declarations.includes(match.declaration));
+  const deliveryIndex = handler.body.body.findIndex((statement) => statement.type === "IfStatement" && identifier(statement.test, requestName)
+    && astNodes(statement.consequent, (node) => node.type === "CallExpression" && identifier(unwrapExpression(node.callee), onFaultName)
+      && node.arguments.length === 1 && identifier(node.arguments[0], requestName)).length === 1);
+  const allDeliveries = astNodes(handler.body, (node) => node.type === "CallExpression" && identifier(unwrapExpression(node.callee), onFaultName));
+  if (parseIndex < 0 || deliveryIndex <= parseIndex || allDeliveries.length !== 1) return null;
+  return match.binding;
 }
 
 function listenerEvidence(module, graph, label) {
+  assertClosedExports(module, ["E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL", "installFaultController"], `${label} listener`);
   const install = exportedFunction(module, "installFaultController");
   assert(install && install.params.length >= 2 && install.params.every((parameter) => parameter.type === "Identifier"),
     `${label} listener final installFaultController export is invalid`);
@@ -443,17 +559,8 @@ function listenerEvidence(module, graph, label) {
       if (!identifier(declaration.id, declaration.id?.name) || !["ArrowFunctionExpression", "FunctionExpression"].includes(handler?.type) || parameter?.type !== "ObjectPattern") continue;
       const urlProperty = parameter.properties.find((property) => property.type === "Property" && identifier(property.key, "url") && identifier(property.value, "url"));
       if (!urlProperty || handler.body.type !== "BlockStatement") continue;
-      const parserBinding = parserCallBinding(module, handler, "url");
-      const onFaultCalls = astNodes(handler.body, (node, parent) => (
-        node.type === "CallExpression" && identifier(unwrapExpression(node.callee), onFaultName)
-        && node.arguments.length === 1 && identifier(node.arguments[0], "request")
-        && parent?.type === "ExpressionStatement"
-      ));
-      const guardedDelivery = astNodes(handler.body, (node) => (
-        node.type === "IfStatement" && identifier(node.test, "request")
-        && astNodes(node.consequent, (candidate) => onFaultCalls.includes(candidate)).length === 1
-      ));
-      if (parserBinding && onFaultCalls.length === 1 && guardedDelivery.length === 1) handlerCandidates.push({ name: declaration.id.name, handler, parserBinding });
+      const parserBinding = parserDelivery(module, handler, "url", onFaultName);
+      if (parserBinding) handlerCandidates.push({ name: declaration.id.name, handler, parserBinding, declaration });
     }
   }
   assert.equal(handlerCandidates.length, 1, `${label} listener must parse URL and invoke onFault(request)`);
@@ -463,9 +570,34 @@ function listenerEvidence(module, graph, label) {
     .find((declaration) => declaration.init?.type === "CallExpression" && memberCall(declaration.init, "addEventListener")
       && literal(declaration.init.arguments[0], "url") && identifier(declaration.init.arguments[1], handler.name));
   assert(registration && registration.id.type === "Identifier", `${label} listener URL registration is invalid`);
+  const handlerIndex = install.body.body.findIndex((statement) => statement.type === "VariableDeclaration" && statement.declarations.includes(handler.declaration));
+  const registrationIndex = install.body.body.findIndex((statement) => statement.type === "VariableDeclaration" && statement.declarations.includes(registration));
+  assert(handlerIndex >= 0 && registrationIndex > handlerIndex, `${label} listener installation statement order is invalid`);
+  const preInstallation = install.body.body.slice(0, registrationIndex);
+  assert(preInstallation.every((statement) => {
+    if (statement.type === "VariableDeclaration") return true;
+    if (statement.type !== "IfStatement" || statement.alternate) return false;
+    const abortChecks = astNodes(statement.test, (node) => node.type === "MemberExpression"
+      && identifier(node.object, signalName) && propertyName(node) === "aborted");
+    const returns = astNodes(statement.consequent, (node) => node.type === "ReturnStatement");
+    return abortChecks.length === 1 && returns.length === 1;
+  }), `${label} listener has noncanonical control flow before installation`);
+  const registrationCallee = unwrapExpression(registration.init.callee);
+  const registrationLinking = registrationCallee?.type === "MemberExpression" ? unwrapExpression(registrationCallee.object) : null;
+  const runtimeName = registrationLinking?.type === "MemberExpression" && propertyName(registrationLinking) === "Linking"
+    && registrationLinking.object.type === "Identifier" ? registrationLinking.object.name : null;
+  const runtimeBinding = dependencyBindings(module).find(({ name }) => name === runtimeName);
+  assert(runtimeBinding, `${label} listener Linking registration is not bound to an imported runtime namespace`);
+  resolveDependency(graph, module, runtimeBinding.dependencyIndex, `${label} listener runtime`);
   const initialUrl = variableDeclaration(install.body, "url");
   assert(initialUrl?.init?.type === "AwaitExpression" && memberCall(initialUrl.init.argument, "getInitialURL"),
     `${label} listener initial URL lookup is invalid`);
+  const initialCallee = unwrapExpression(initialUrl.init.argument.callee);
+  const initialLinking = initialCallee?.type === "MemberExpression" ? unwrapExpression(initialCallee.object) : null;
+  assert(initialLinking?.type === "MemberExpression" && propertyName(initialLinking) === "Linking"
+    && identifier(initialLinking.object, runtimeName), `${label} listener Linking calls must share one imported runtime namespace`);
+  const initialStatementIndex = install.body.body.findIndex((statement) => astNodes(statement, (node) => node === initialUrl).length === 1);
+  assert(initialStatementIndex > registrationIndex, `${label} listener initial URL lookup must follow listener installation`);
   const initialDispatch = astNodes(install.body, (node) => node.type === "IfStatement" && identifier(node.test, "url")
     && astNodes(node.consequent, (candidate) => candidate.type === "CallExpression" && identifier(unwrapExpression(candidate.callee), handler.name)
       && candidate.arguments[0]?.type === "ObjectExpression"
@@ -509,6 +641,7 @@ function matchIndexOne(node) {
 }
 
 function parserEvidence(module, graph, label) {
+  assertClosedExports(module, ["FAULT_POINTS", "canonicalFaultUrl", "parseFaultUrl"], `${label} parser`);
   const canonical = exportedFunction(module, "canonicalFaultUrl");
   const parser = exportedFunction(module, "parseFaultUrl");
   if (!canonical || !parser || !identifier(canonical.params[0], "point") || !identifier(parser.params[0], "value")) return null;
@@ -558,13 +691,18 @@ function parserEvidence(module, graph, label) {
 }
 
 function registryValue(module) {
-  let value = null;
-  for (const assignment of topLevelAssignments(module)) if (isModuleExports(assignment.left)) value = assignment.right;
+  if (module.factory.body.body.length !== 1) return null;
+  const statement = module.factory.body.body[0];
+  const assignment = statement.type === "ExpressionStatement" ? unwrapExpression(statement.expression) : null;
+  const value = assignment?.type === "AssignmentExpression" && assignment.operator === "=" && isModuleExports(assignment.left)
+    ? assignment.right
+    : null;
   if (value?.type !== "ArrayExpression" || value.elements.some((element) => element?.type !== "Literal" || typeof element.value !== "string")) return null;
   return value.elements.map((element) => element.value);
 }
 
 function noOpController(module) {
+  assertClosedExports(module, ["installFaultController"], "production controller");
   const install = exportedFunction(module, "installFaultController");
   if (!install?.async || install.body.body.length !== 1 || install.body.body[0].type !== "ReturnStatement" || install.body.body[0].argument?.type !== "Identifier") return false;
   const noOpName = install.body.body[0].argument.name;
@@ -580,6 +718,7 @@ function moduleGraph(bytes, label, flavor) {
   const apps = [...reachable.values()].map((module) => appEvidence(module, graph, label)).filter(Boolean);
   assert.equal(apps.length, 1, `${label} bundle must contain one distinct reachable App module wired to the selected controller`);
   const app = apps[0];
+  rootRegistersApp(graph, app.module, label);
   assert.notEqual(app.module.moduleId, app.controller.moduleId, `${label} App and controller modules must be distinct`);
   if (flavor === "production") {
     assert(noOpController(app.controller), `${label} production App must reach the exact exported no-op controller`);

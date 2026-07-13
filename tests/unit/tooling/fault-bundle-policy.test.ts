@@ -25,6 +25,8 @@ const registryModuleId = 303;
 const appModuleId = 404;
 const entryModuleId = 505;
 const runtimeModuleId = 900;
+const rootRuntimeModuleId = 901;
+const alternateRuntimeModuleId = 902;
 const expectedMarkerCounts = {
   production: Object.fromEntries(markers.map((marker) => [marker, 0])),
   e2e: Object.fromEntries(markers.map((marker) => [
@@ -123,6 +125,7 @@ const listenerBody = [
 const parserBody = [
   "exports.canonicalFaultUrl = canonicalFaultUrl;",
   "exports.parseFaultUrl = parseFaultUrl;",
+  "function _interopDefault(value) { return value && value.__esModule ? value : { default: value }; }",
   'var _faultPointsJson = require(_dependencyMap[0]);',
   "var faultPoints = _interopDefault(_faultPointsJson);",
   "var FAULT_POINTS = Object.freeze([...faultPoints.default]);",
@@ -140,13 +143,15 @@ const parserBody = [
 ].join("\n");
 
 const appBody = [
+  'Object.defineProperty(exports, "__esModule", { value: true });',
   "var _forMobileFaultController = require(_dependencyMap[0]);",
   "function FaultControllerHost({ installFaults }) { return installFaults(() => {}, undefined); }",
   "function AppComposition({ installFaults = _forMobileFaultController.installFaultController }) {",
   "  return FaultControllerHost({ installFaults: installFaults });",
   "}",
+  "function App() { return AppComposition({}); }",
   "exports.AppComposition = AppComposition;",
-  "exports.default = function App() { return AppComposition({}); };",
+  "exports.default = App;",
 ].join("\n");
 
 const productionControllerBody = [
@@ -157,9 +162,21 @@ const productionControllerBody = [
 
 function rootedBundle(controllerId: number, modules: string[]) {
   return [
-    metroModule(entryModuleId, [appModuleId], "require(_dependencyMap[0]);"),
+    metroModule(entryModuleId, [rootRuntimeModuleId, appModuleId], [
+      "function _interopDefault(value) { return value && value.__esModule ? value : { default: value }; }",
+      "var _expo = require(_dependencyMap[0]);",
+      "var _App = require(_dependencyMap[1]);",
+      "var App = _interopDefault(_App);",
+      "_expo.registerRootComponent(App.default);",
+    ].join("\n")),
     metroModule(appModuleId, [controllerId], appBody),
     ...modules,
+    metroModule(rootRuntimeModuleId, [], [
+      "exports.registerRootComponent = function registerRootComponent(App) {",
+      "  global.__registeredDefaultApp = App;",
+      "  global.__appExecution = Promise.resolve(App());",
+      "};",
+    ].join("\n")),
     `__r(${entryModuleId});`,
   ].join("\n");
 }
@@ -170,7 +187,16 @@ function e2eBundleSource() {
     metroModule(listenerModuleId, [900, parserModuleId], listenerBody),
     metroModule(parserModuleId, [registryModuleId], parserBody),
     metroModule(registryModuleId, [], registryBody),
-    metroModule(runtimeModuleId, [], "exports.Linking = {};"),
+    metroModule(runtimeModuleId, [], [
+      "exports.Linking = {",
+      "  addEventListener: function addEventListener(type, handler) {",
+      "    if (type !== 'url' || typeof handler !== 'function') throw new Error('invalid listener');",
+      "    global.__listenerSetupReached = true;",
+      "    return { remove: function remove() {} };",
+      "  },",
+      "  getInitialURL: async function getInitialURL() { return null; },",
+      "};",
+    ].join("\n")),
   ]);
 }
 
@@ -189,6 +215,30 @@ function sourceWithMarkerCount(flavor: "production" | "e2e", marker: string, cou
 function replaceOnce(source: string, before: string, after: string) {
   assert(source.includes(before), `fixture mutation target is absent: ${before}`);
   return source.replace(before, after);
+}
+
+function executeSyntheticBundle(source: string) {
+  const harness = String.raw`
+    const factories = new Map();
+    const cache = new Map();
+    global.__d = (factory, id, dependencies) => factories.set(id, { factory, dependencies });
+    global.__r = (id) => {
+      if (cache.has(id)) return cache.get(id).exports;
+      const definition = factories.get(id);
+      if (!definition) throw new Error("undefined synthetic Metro module " + id);
+      const module = { exports: {} };
+      cache.set(id, module);
+      definition.factory(global, global.__r, undefined, undefined, module, module.exports, definition.dependencies);
+      return module.exports;
+    };
+    ${source}
+    Promise.resolve(global.__appExecution).then(() => {
+      if (typeof global.__registeredDefaultApp !== "function") throw new Error("default App was not registered");
+      if (!global.__listenerSetupReached) throw new Error("listener setup path was not reached");
+      process.stdout.write("listener-setup-reached");
+    }).catch((error) => { console.error(error); process.exitCode = 1; });
+  `;
+  return spawnSync("node", ["-e", harness], { encoding: "utf8" });
 }
 
 async function fixture(production = productionBundleSource(), e2e = e2eBundleSource()) {
@@ -331,12 +381,58 @@ test("schema-v4 collector leaves retain the established sentinelOccurrences shap
   });
 });
 
+test("synthetic Metro evidence executes the registered default App through listener setup", () => {
+  const result = executeSyntheticBundle(e2eBundleSource());
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "listener-setup-reached");
+});
+
+test("reachability ignores dependencies confined to dead branches or after unconditional termination", async (t) => {
+  const mutations = [
+    ["dead nested branch", "_expo.registerRootComponent(App.default);", "_expo.registerRootComponent(App.default);\nif (false) require(_dependencyMap[2]);"],
+    ["after early termination", "_expo.registerRootComponent(App.default);", "_expo.registerRootComponent(App.default);\nreturn;\nrequire(_dependencyMap[2]);"],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const source = replaceOnce(e2eBundleSource(), before, after)
+        .replace(`},${entryModuleId},[${rootRuntimeModuleId},${appModuleId}]);`, `},${entryModuleId},[${rootRuntimeModuleId},${appModuleId},9999]);`);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "android", "e2e", source);
+        await validateFaultBundleProof(proof, { root, expectedSha: sha });
+      });
+    });
+  }
+});
+
+test("unused optional null dependency slots remain outside the proven graph", async () => {
+  const source = e2eBundleSource().replace(
+    `},${entryModuleId},[${rootRuntimeModuleId},${appModuleId}]);`,
+    `},${entryModuleId},[${rootRuntimeModuleId},${appModuleId},null]);`,
+  );
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "ios", "e2e", source);
+    await validateFaultBundleProof(proof, { root, expectedSha: sha });
+  });
+});
+
 test("bundle proof requires executing Metro roots and a defined reachable App dependency graph", async (t) => {
   const mutations = [
     ["no roots", (source: string) => source.replaceAll(`__r(${entryModuleId});`, "")],
     ["undefined root", (source: string) => source.replace(`__r(${entryModuleId});`, "__r(9999);")],
-    ["undefined App edge", (source: string) => source.replace(`},${entryModuleId},[${appModuleId}]);`, `},${entryModuleId},[9999]);`)],
-    ["null App edge", (source: string) => source.replace(`},${entryModuleId},[${appModuleId}]);`, `},${entryModuleId},[null]);`)],
+    [
+      "undefined App edge",
+      (source: string) => source.replace(
+        `},${entryModuleId},[${rootRuntimeModuleId},${appModuleId}]);`,
+        `},${entryModuleId},[${rootRuntimeModuleId},9999]);`,
+      ),
+    ],
+    [
+      "null App edge",
+      (source: string) => source.replace(
+        `},${entryModuleId},[${rootRuntimeModuleId},${appModuleId}]);`,
+        `},${entryModuleId},[${rootRuntimeModuleId},null]);`,
+      ),
+    ],
     [
       "App ignores controller",
       (source: string) => source.replace(
@@ -376,6 +472,105 @@ test("listener evidence must execute in the final export and deliver parsed requ
       await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /onFault|listener/i);
     });
   });
+  for (const [name, before, after] of [
+    [
+      "unconditional return before listener installation",
+      "  var handleUrl = ({ url }) => {",
+      "  return () => {};\n  var handleUrl = ({ url }) => {",
+    ],
+    [
+      "disconnected parser result",
+      "    var request = (0, _faultContract.parseFaultUrl)(url);\n    if (request) onFault(request);",
+      "    var parsed = (0, _faultContract.parseFaultUrl)(url);\n    var request = { point: url };\n    if (request) onFault(request);",
+    ],
+    [
+      "parser result reassignment",
+      "    var request = (0, _faultContract.parseFaultUrl)(url);\n    if (request) onFault(request);",
+      "    var request = (0, _faultContract.parseFaultUrl)(url);\n    request = { point: url };\n    if (request) onFault(request);",
+    ],
+  ] as const) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "android", "e2e", replaceOnce(e2eBundleSource(), before, after));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /listener|parse|return|control|binding/i);
+      });
+    });
+  }
+});
+
+test("selected module exports reject every unrecognized mutation path", async (t) => {
+  const mutations = [
+    ["App Object.assign", appBody, `${appBody}\nObject.assign(exports, { default: function Other() {} });`],
+    ["App direct assignment", appBody, `${appBody}\nexports.default = function Other() {};`],
+    ["controller Reflect.set", listenerBody, `${listenerBody}\nReflect.set(exports, "installFaultController", function () {});`],
+    ["controller alias write", listenerBody, `${listenerBody}\nvar exportAlias = exports;\nexportAlias.installFaultController = function () {};`],
+    ["parser defineProperties", parserBody, `${parserBody}\nObject.defineProperties(exports, { parseFaultUrl: { value: function () {} } });`],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "android", "e2e", replaceOnce(e2eBundleSource(), before, after));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /export|mutation|App|listener|parser/i);
+      });
+    });
+  }
+});
+
+test("default App and root registration are bound to AppComposition", async (t) => {
+  const mutations = [
+    ["default App no-op", "function App() { return AppComposition({}); }", "function App() { return null; }"],
+    ["root registers another value", "_expo.registerRootComponent(App.default);", "_expo.registerRootComponent(function Other() {});"],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", replaceOnce(e2eBundleSource(), before, after));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /App|default|root|register/i);
+      });
+    });
+  }
+});
+
+test("Linking listener and initial URL calls share one defined imported runtime namespace", async (t) => {
+  const extraRuntime = metroModule(alternateRuntimeModuleId, [], "exports.Linking = exports.Linking;");
+  const mutations = [
+    [
+      "null runtime dependency",
+      (source: string) => source.replace(`[${runtimeModuleId},${parserModuleId}]`, `[null,${parserModuleId}]`),
+    ],
+    [
+      "undefined runtime dependency",
+      (source: string) => source.replace(`[${runtimeModuleId},${parserModuleId}]`, `[9999,${parserModuleId}]`),
+    ],
+    [
+      "mismatched receiver",
+      (source: string) => replaceOnce(
+        source.replace(listenerBody, `var _otherRuntime = require(_dependencyMap[2]);\n${listenerBody}`)
+          .replace(`[${runtimeModuleId},${parserModuleId}]`, `[${runtimeModuleId},${parserModuleId},${alternateRuntimeModuleId}]`)
+          .replace(metroModule(rootRuntimeModuleId, [], [
+            "exports.registerRootComponent = function registerRootComponent(App) {",
+            "  global.__registeredDefaultApp = App;",
+            "  global.__appExecution = Promise.resolve(App());",
+            "};",
+          ].join("\n")), `${extraRuntime}\n${metroModule(rootRuntimeModuleId, [], [
+            "exports.registerRootComponent = function registerRootComponent(App) {",
+            "  global.__registeredDefaultApp = App;",
+            "  global.__appExecution = Promise.resolve(App());",
+            "};",
+          ].join("\n"))}`),
+        "await _reactNative.Linking.getInitialURL()",
+        "await _otherRuntime.Linking.getInitialURL()",
+      ),
+    ],
+  ] as const;
+  for (const [name, mutate] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "android", "e2e", mutate(e2eBundleSource()));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /runtime|Linking|dependency|listener|undefined|null/i);
+      });
+    });
+  }
 });
 
 test("parser and registry evidence must be the final live exports", async (t) => {
@@ -545,6 +740,24 @@ test("E2E registry proof rejects hostile order, shape, and contents", async (t) 
       await withFixture(async ({ root, proof }) => {
         await replaceBundle(root, proof, "ios", "e2e", replaceOnce(e2eBundleSource(), originalRegistry, replacement));
         await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /registry|fault point|structure/i);
+      });
+    });
+  }
+});
+
+test("E2E registry factory rejects post-assignment mutation and aliases", async (t) => {
+  const originalRegistry = `module.exports = ${JSON.stringify(faultPoints, null, 2)};`;
+  const mutations = [
+    ["reverse", `${originalRegistry}\nmodule.exports.reverse();`],
+    ["push", `${originalRegistry}\nmodule.exports.push("hostile");`],
+    ["index", `${originalRegistry}\nmodule.exports[0] = "hostile";`],
+    ["alias", `${originalRegistry}\nvar registryAlias = module.exports;\nregistryAlias.pop();`],
+  ] as const;
+  for (const [name, replacement] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", replaceOnce(e2eBundleSource(), originalRegistry, replacement));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /registry|factory|statement|mutation/i);
       });
     });
   }

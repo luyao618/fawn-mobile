@@ -37,7 +37,7 @@
     "test:e2e:android:faults": "bash scripts/e2e/run-fault-matrix.sh android",
     "test:e2e:ios:faults": "bash scripts/e2e/run-fault-matrix.sh ios",
     "typecheck": "node tools/run-typecheck.mjs",
-    "lint": "eslint 'App{,.android,.ios,.native}.{js,jsx,mjs,cjs,ts,tsx,mts,cts}' app.config.ts 'index{,.android,.ios,.native}.{js,jsx,mjs,cjs,ts,tsx,mts,cts}' metro.config.cjs src tests/app tests/setup.ts tools/check-licenses.mjs tools/check-fault-bundles.mjs tools/check-app-dependencies.mjs tools/check-app-audit.mjs tools/check-app-config.mjs tools/check-native-schemes.mjs tools/collect-ci-evidence.mjs tools/clean-generated.mjs --max-warnings=0",
+    "lint": "eslint eslint.config.js 'App{,.android,.ios,.native}.{js,jsx,mjs,cjs,ts,tsx,mts,cts}' app.config.ts 'index{,.android,.ios,.native}.{js,jsx,mjs,cjs,ts,tsx,mts,cts}' metro.config.cjs src tests/app tests/unit/tooling tests/setup.ts tools/check-licenses.mjs tools/check-fault-bundles.mjs tools/check-app-dependencies.mjs tools/check-app-audit.mjs tools/check-app-config.mjs tools/check-native-schemes.mjs tools/collect-ci-evidence.mjs tools/clean-generated.mjs --max-warnings=0",
     "expo:doctor": "expo-doctor --verbose",
     "expo:doctor:g017": "node tools/run-expo-doctor-isolated.mjs",
     "g017:install": "cd spikes/model-transport && npm ci --workspaces=false",
