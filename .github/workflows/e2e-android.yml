@@ -44,12 +44,13 @@ jobs:
           cp android/app/src/main/AndroidManifest.xml .artifacts/native/android/production/AndroidManifest.xml
           node tools/check-native-schemes.mjs --platform android --flavor production --input .artifacts/native/android/production/AndroidManifest.xml --expected-sha "${{ inputs.expected_sha }}" --output .artifacts/schemes/android-production.json
           (cd android && ./gradlew :app:assembleDebug --no-daemon)
-      - name: Clean-prebuild and inspect E2E
+      - name: Clean-prebuild, inspect, and build E2E
         run: |
           npm run prebuild:android:e2e
           mkdir -p .artifacts/native/android/e2e
           cp android/app/src/main/AndroidManifest.xml .artifacts/native/android/e2e/AndroidManifest.xml
           node tools/check-native-schemes.mjs --platform android --flavor e2e --input .artifacts/native/android/e2e/AndroidManifest.xml --expected-sha "${{ inputs.expected_sha }}" --output .artifacts/schemes/android-e2e.json
+          (cd android && ./gradlew :app:assembleDebug -PreactNativeArchitectures=x86_64 --no-daemon)
       - uses: ReactiveCircus/android-emulator-runner@1dcd0090116d15e7c562f8db72807de5e036a4ed
         with:
           api-level: 35

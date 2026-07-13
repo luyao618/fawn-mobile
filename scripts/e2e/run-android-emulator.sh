@@ -5,7 +5,6 @@ mkdir -p .artifacts/launch/device .artifacts/launch/maestro .artifacts/launch/me
 mapfile -t emulator_serials < <(adb devices | awk '$1 ~ /^emulator-/ && $2 == "device" { print $1 }')
 test "${#emulator_serials[@]}" -eq 1
 emulator_serial="${emulator_serials[0]}"
-cd android && ./gradlew :app:assembleDebug -PreactNativeArchitectures=x86_64 --no-daemon && cd ..
 metro_log=.artifacts/launch/metro/android-metro.log
 metro_pid=
 cleanup() {
@@ -46,7 +45,7 @@ install_apk() {
 }
 wait_for_package_service
 if ! install_apk; then
-  if grep -Eq -e "^Can't find service: package$" -e '^Failure calling service package: Broken pipe( \([0-9]+\))?$' <<< "${install_output//$'\r'/}"; then
+  if grep -Eq -e "^(cmd: )?Can't find service: package$" -e '^(cmd: )?Failure calling service package: Broken pipe( \([0-9]+\))?$' <<< "${install_output//$'\r'/}"; then
     wait_for_package_service
     install_apk
   else
