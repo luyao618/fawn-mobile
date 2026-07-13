@@ -419,7 +419,12 @@ function parsePinnedActionScript(rawScript: string) {
 const encodedDevClientUrl = "formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081";
 type NativePlatform = "Android" | "iOS";
 
-const exactHeadlessMetroCommand = "CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &";
+const exactHeadlessMetroCommand = "CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &";
+const exactMetroStatusLines = [
+  "for attempt in $(seq 1 60); do curl --silent --fail http://127.0.0.1:8081/status >/dev/null && break; sleep 2; done",
+  "curl --silent --fail http://127.0.0.1:8081/status",
+] as const;
+const exactDevClientUrlAssignment = `dev_client_url='${encodedDevClientUrl}'`;
 const iosOpenConfirmationFlow = "e2e/maestro/ios-open-confirmation.yaml";
 const readinessFlow = "e2e/maestro/shell-readiness.yaml";
 const smokeFlow = "e2e/maestro/shell-smoke.yaml";
@@ -472,6 +477,35 @@ function assertExactHeadlessMetroLaunch(script: string, platform: NativePlatform
   );
 }
 
+function assertExactMetroStatusProbes(script: string, platform: NativePlatform): void {
+  const statusLines = script.split(/\r\n|\n|\r/).filter((line) => line.includes("/status"));
+  assert.deepEqual(
+    statusLines,
+    exactMetroStatusLines,
+    `${platform} Metro status probes must remain exactly the bounded retry loop and final IPv4 probe in order`,
+  );
+}
+
+function assertExactMetroStartupPolicy(script: string, platform: NativePlatform): void {
+  assertExactHeadlessMetroLaunch(script, platform);
+  assertExactMetroStatusProbes(script, platform);
+  const lines = script.split(/\r\n|\n|\r/);
+  const devClientUrlAssignments = lines.filter((line) => line.includes("dev_client_url="));
+  assert.deepEqual(
+    devClientUrlAssignments,
+    [exactDevClientUrlAssignment],
+    `${platform} dev-client URL assignment must appear exactly once as the exact full line`,
+  );
+  const launchIndex = lines.indexOf(exactHeadlessMetroCommand);
+  const retryIndex = lines.indexOf(exactMetroStatusLines[0]);
+  const finalProbeIndex = lines.indexOf(exactMetroStatusLines[1]);
+  const devClientUrlIndex = lines.indexOf(exactDevClientUrlAssignment);
+  assert.ok(
+    launchIndex < retryIndex && retryIndex < finalProbeIndex && finalProbeIndex < devClientUrlIndex,
+    `${platform} Metro startup must preserve exact launch, retry loop, final probe, and dev-client URL assignment order`,
+  );
+}
+
 function assertExactReadinessCommand(script: string, platform: NativePlatform): void {
   const readinessLines = script.split("\n").filter((line) => line.includes(readinessFlow));
   assert.deepEqual(
@@ -503,7 +537,7 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assert.deepEqual(commands, ["bash scripts/e2e/run-android-emulator.sh"]);
   assert.equal(spawnSync("bash", ["-n", "scripts/e2e/run-android-emulator.sh"]).status, 0);
   assert.match(runner, /^#!\/usr\/bin\/env bash\nset -euo pipefail\n/);
-  assertExactHeadlessMetroLaunch(runner, "Android");
+  assertExactMetroStartupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
   ordered(runner,
     "mapfile -t emulator_serials",
@@ -512,8 +546,7 @@ test("pinned Android action receives exactly one Bash command and the runner is 
     'adb -s "$emulator_serial" install -r',
     'adb -s "$emulator_serial" reverse tcp:8081 tcp:8081',
     exactHeadlessMetroCommand,
-    "curl --silent --fail http://127.0.0.1:8081/status",
-    encodedDevClientUrl,
+    exactDevClientUrlAssignment,
     'adb -s "$emulator_serial" shell am start -W -a android.intent.action.VIEW -d "$dev_client_url" -p com.luyao618.formobile',
     exactReadinessCommands.Android,
     `maestro --device "$emulator_serial" test ${smokeFlow}`,
@@ -555,7 +588,7 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
   const smokeIndex = stepIndex(iosSteps, (step) => step.name === "Serial production and E2E builds, install, and smoke", "iOS device smoke");
   const smokeRun = iosSteps[smokeIndex].run;
   assert.ok(typeof smokeRun === "string", "iOS device smoke must have an enabled run script");
-  assertExactHeadlessMetroLaunch(smokeRun, "iOS");
+  assertExactMetroStartupPolicy(smokeRun, "iOS");
   assertExactReadinessCommand(smokeRun, "iOS");
   assertExactPinnedSimulatorOpen(smokeRun);
   ordered(workflow,
@@ -572,7 +605,7 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
     "--flavor e2e --input .artifacts/native/ios/e2e/Info.plist",
     'simctl install "$simulator_udid"',
     exactHeadlessMetroCommand,
-    encodedDevClientUrl,
+    exactDevClientUrlAssignment,
     'simctl openurl "$simulator_udid" "$dev_client_url"',
     `maestro --device "$simulator_udid" test ${iosOpenConfirmationFlow} 2>&1 | tee .artifacts/launch/ios-open-confirmation.log`,
     exactReadinessCommands.iOS,
@@ -611,6 +644,23 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
   assert.ok(iosSmoke && typeof iosSmoke.run === "string");
 
   for (const [platform, script] of [["Android", androidRunner], ["iOS", iosSmoke.run]] as const) {
+    const withoutDnsOrder = script.replace("NODE_OPTIONS=--dns-result-order=ipv4first ", "");
+    assert.notEqual(withoutDnsOrder, script);
+    assert.throws(
+      () => assertExactHeadlessMetroLaunch(withoutDnsOrder, platform),
+      /exact loopback-only fail-closed headless command/,
+    );
+
+    const verbatimDnsOrder = script.replace(
+      "NODE_OPTIONS=--dns-result-order=ipv4first",
+      "NODE_OPTIONS=--dns-result-order=verbatim",
+    );
+    assert.notEqual(verbatimDnsOrder, script);
+    assert.throws(
+      () => assertExactHeadlessMetroLaunch(verbatimDnsOrder, platform),
+      /exact loopback-only fail-closed headless command/,
+    );
+
     const lanBound = script.replace("--localhost", "--lan");
     assert.notEqual(lanBound, script);
     assert.throws(
@@ -623,6 +673,40 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.throws(
       () => assertExactHeadlessMetroLaunch(withoutHeadless, platform),
       /exact loopback-only fail-closed headless command/,
+    );
+
+    const localhostStatusProbes = script.replaceAll(
+      "http://127.0.0.1:8081/status",
+      "http://localhost:8081/status",
+    );
+    assert.notEqual(localhostStatusProbes, script);
+    assert.throws(
+      () => assertExactMetroStatusProbes(localhostStatusProbes, platform),
+      /exactly the bounded retry loop and final IPv4 probe in order/,
+    );
+
+    const withoutFinalStatusProbe = script
+      .split(/\r\n|\n|\r/)
+      .filter((line) => line !== exactMetroStatusLines[1])
+      .join("\n");
+    assert.notEqual(withoutFinalStatusProbe, script);
+    assert.throws(
+      () => assertExactMetroStatusProbes(withoutFinalStatusProbe, platform),
+      /exactly the bounded retry loop and final IPv4 probe in order/,
+    );
+
+    const withoutApprovedStatusLines = script
+      .split(/\r\n|\n|\r/)
+      .filter((line) => !exactMetroStatusLines.some((statusLine) => line === statusLine))
+      .join("\n");
+    const statusProbesBeforeLaunch = withoutApprovedStatusLines.replace(
+      exactHeadlessMetroCommand,
+      `${exactMetroStatusLines.join("\n")}\n${exactHeadlessMetroCommand}`,
+    );
+    assert.notEqual(statusProbesBeforeLaunch, script);
+    assert.throws(
+      () => assertExactMetroStartupPolicy(statusProbesBeforeLaunch, platform),
+      /must preserve exact launch, retry loop, final probe, and dev-client URL assignment order/,
     );
 
     const exactReadinessCommand = exactReadinessCommands[platform];
