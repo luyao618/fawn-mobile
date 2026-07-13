@@ -89,7 +89,7 @@ const exactChildPrimaryUploadPaths = {
   ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "bf42ee697041e4a02e2d2eae21d50427ad1ea54fdc1956b4d769f960b760b871";
+const exactAndroidRunnerSha256 = "c2ee52204a421a9bd18bc6f91bbb449a0eabc9bb46feb7ed1c9b69c281084d0c";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -506,6 +506,10 @@ const exactMetroStatusLines = [
 ] as const;
 const exactDevClientUrlAssignment = `dev_client_url='${encodedDevClientUrl}'`;
 const exactAndroidInstallCommand = 'adb -s "$emulator_serial" install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk';
+const exactAndroidPackageServiceLines = [
+  "for attempt in $(seq 1 60); do adb -s \"$emulator_serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found' && break; sleep 2; done",
+  "adb -s \"$emulator_serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found'",
+] as const;
 const exactIosFailureScreenshotCommand = '    xcrun simctl io "$simulator_udid" screenshot .artifacts/launch/simulator/ios-failure.png';
 const exactIosFailureLogCommand = `    xcrun simctl spawn "$simulator_udid" log show --style compact --last 15m --predicate 'process == "ForMobile" OR process == "SpringBoard"' > .artifacts/launch/simulator/ios-simulator-app.log 2>&1`;
 const iosOpenConfirmationFlow = "e2e/maestro/ios-open-confirmation.yaml";
@@ -618,6 +622,24 @@ function assertExactAndroidInstallPolicy(script: string): void {
   );
 }
 
+function assertExactAndroidPackageServicePolicy(script: string): void {
+  const lines = script.split(/\r\n|\n|\r/);
+  const packageServiceLines = lines.filter((line) => line.includes("service check package"));
+  assert.deepEqual(
+    packageServiceLines,
+    exactAndroidPackageServiceLines,
+    "Android package service readiness must remain the exact bounded loop and final fail-closed probe",
+  );
+  const trapIndex = lines.indexOf("trap cleanup EXIT");
+  const loopIndex = lines.indexOf(exactAndroidPackageServiceLines[0]);
+  const finalProbeIndex = lines.indexOf(exactAndroidPackageServiceLines[1]);
+  const installIndex = lines.indexOf(exactAndroidInstallCommand);
+  assert.ok(
+    trapIndex < loopIndex && loopIndex < finalProbeIndex && finalProbeIndex < installIndex,
+    "Android must register cleanup before package readiness and install only after the final probe",
+  );
+}
+
 function assertExactAndroidRunnerSha256(script: string): void {
   assert.equal(
     createHash("sha256").update(script).digest("hex"),
@@ -668,9 +690,13 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
     exactAndroidFallbackLogCommand,
     "    fi",
     "  fi",
-    '  kill "$metro_pid" 2>/dev/null',
-    '  wait "$metro_pid" 2>/dev/null',
-    '  cat "$metro_log"',
+    '  if [ -n "$metro_pid" ]; then',
+    '    kill "$metro_pid" 2>/dev/null',
+    '    wait "$metro_pid" 2>/dev/null',
+    "  fi",
+    '  if [ -f "$metro_log" ]; then',
+    '    cat "$metro_log"',
+    "  fi",
     '  exit "$status"',
     "}",
     "trap cleanup EXIT",
@@ -787,15 +813,20 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assertExactAndroidRunnerSha256(runner);
   assertExactMetroStartupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
+  assertExactAndroidPackageServicePolicy(runner);
   assertExactAndroidInstallPolicy(runner);
   assertAndroidDiagnosticsPolicy(runner, parsedWorkflow);
   ordered(runner,
     "mapfile -t emulator_serials",
     'emulator_serial="${emulator_serials[0]}"',
     ":app:assembleDebug",
+    "metro_log=.artifacts/launch/metro/android-metro.log",
+    "metro_pid=",
+    "trap cleanup EXIT",
+    exactAndroidPackageServiceLines[0],
+    exactAndroidPackageServiceLines[1],
     exactAndroidInstallCommand,
     'adb -s "$emulator_serial" reverse tcp:8081 tcp:8081',
-    "metro_log=.artifacts/launch/metro/android-metro.log",
     exactHeadlessMetroCommands.Android,
     exactDevClientUrlAssignment,
     'adb -s "$emulator_serial" shell am start -W -a android.intent.action.VIEW -d "$dev_client_url" -p com.luyao618.formobile',
@@ -878,6 +909,16 @@ if [ "\${1:-}" = "devices" ]; then
 elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "install" ]; then
   printf '%s\\n' 'Failure [INSTALL_FAILED_INVALID_APK]' >&2
   exit 1
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "service" ]; then
+  printf '%s\\r\\n' 'Service package: found'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "screencap" ]; then
+  printf 'png-sentinel'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "uiautomator" ]; then
+  printf 'hierarchy-sentinel'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "pidof" ]; then
+  :
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "logcat" ]; then
+  printf 'logcat-sentinel'
 fi
 `);
     await writeFile(join(android, "gradlew"), "#!/usr/bin/env bash\nexit 0\n");
@@ -908,13 +949,99 @@ exit 97
     assert.notEqual(result.status, 0, "invalid APK install must fail closed");
     assert.match(result.stderr, /Failure \[INSTALL_FAILED_INVALID_APK\]/);
     const adbCalls = (await readFile(adbLog, "utf8")).trim().split("\n");
-    assert.deepEqual(adbCalls, [
-      "devices",
-      "-s emulator-5554 install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk",
-    ]);
+    assert.equal(adbCalls[0], "devices");
+    assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 shell service check package").length, 2);
     assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 1);
     assert.equal(adbCalls.some((call) => call.includes(" reverse ")), false);
     assert.equal(await readFile(downstreamLog, "utf8"), "", "Metro and Maestro must not be reached");
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-failure.png"), "utf8"), "png-sentinel");
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-ui-hierarchy.xml"), "utf8"), "hierarchy-sentinel");
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-app.log"), "utf8"), "logcat-sentinel");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Android unavailable package service exhausts the bounded wait before install", async () => {
+  const root = await mkdtemp(join(tmpdir(), "g018-android-package-service-"));
+  try {
+    const fakeBin = join(root, "bin");
+    const android = join(root, "android");
+    const adbLog = join(root, "adb.log");
+    const downstreamLog = join(root, "downstream.log");
+    const sleepLog = join(root, "sleep.log");
+    const bashEnv = join(root, "bash-env");
+    await mkdir(fakeBin);
+    await mkdir(android);
+    await writeFile(adbLog, "");
+    await writeFile(downstreamLog, "");
+    await writeFile(sleepLog, "");
+    await writeFile(bashEnv, `mapfile() {
+  test "$1" = "-t"
+  local array_name="$2"
+  local values=()
+  local line
+  while IFS= read -r line; do values[\${#values[@]}]="$line"; done
+  eval "$array_name=(\\"\${values[@]}\\")"
+}
+`);
+    await writeFile(join(fakeBin, "adb"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$ANDROID_ADB_LOG"
+if [ "\${1:-}" = "devices" ]; then
+  printf 'List of devices attached\\nemulator-5554\\tdevice\\n'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "service" ]; then
+  printf '%s\\n' 'Service package: not found'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "screencap" ]; then
+  printf 'png-sentinel'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "uiautomator" ]; then
+  printf 'hierarchy-sentinel'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "pidof" ]; then
+  :
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "logcat" ]; then
+  printf 'logcat-sentinel'
+fi
+`);
+    await writeFile(join(fakeBin, "sleep"), `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$ANDROID_SLEEP_LOG"
+`);
+    await writeFile(join(android, "gradlew"), "#!/usr/bin/env bash\nexit 0\n");
+    for (const command of ["npx", "maestro"]) {
+      await writeFile(join(fakeBin, command), `#!/usr/bin/env bash
+printf '%s %s\\n' ${JSON.stringify(command)} "$*" >> "$ANDROID_DOWNSTREAM_LOG"
+exit 97
+`);
+    }
+    await Promise.all([
+      chmod(join(fakeBin, "adb"), 0o755),
+      chmod(join(fakeBin, "sleep"), 0o755),
+      chmod(join(fakeBin, "npx"), 0o755),
+      chmod(join(fakeBin, "maestro"), 0o755),
+      chmod(join(android, "gradlew"), 0o755),
+    ]);
+
+    const result = spawnSync("bash", [resolve("scripts/e2e/run-android-emulator.sh")], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ANDROID_ADB_LOG: adbLog,
+        ANDROID_DOWNSTREAM_LOG: downstreamLog,
+        ANDROID_SLEEP_LOG: sleepLog,
+        BASH_ENV: bashEnv,
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+      },
+    });
+    assert.notEqual(result.status, 0, "missing package service must fail closed");
+    const adbCalls = (await readFile(adbLog, "utf8")).trim().split("\n");
+    assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 shell service check package").length, 61);
+    assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 0);
+    assert.equal(adbCalls.some((call) => call.includes(" reverse ")), false);
+    assert.equal((await readFile(sleepLog, "utf8")).trim().split("\n").filter((call) => call === "2").length, 60);
+    assert.equal(await readFile(downstreamLog, "utf8"), "", "Metro and Maestro must not be reached");
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-failure.png"), "utf8"), "png-sentinel");
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-ui-hierarchy.xml"), "utf8"), "hierarchy-sentinel");
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-app.log"), "utf8"), "logcat-sentinel");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -929,17 +1056,23 @@ test("Android EXIT cleanup preserves success and failure status with failure-onl
     assert.ok(start >= 0 && end > start, "Android cleanup function and EXIT trap must be extractable");
     const cleanup = runner.slice(start, end + "trap cleanup EXIT".length);
     const adbLog = join(root, "adb.log");
-    const runCleanup = async (status: number, appPid = "") => {
+    const runCleanup = async (
+      status: number,
+      appPid = "",
+      options: { metroPid?: string; metroLogPresent?: boolean } = {},
+    ) => {
+      const { metroPid = "424242", metroLogPresent = true } = options;
       const deviceDir = join(root, ".artifacts/launch/device");
-      const metroLog = join(root, `metro-${status}.log`);
+      const metroLog = join(root, `metro-${status}-${metroPid || "empty"}.log`);
       await rm(deviceDir, { recursive: true, force: true });
       await mkdir(deviceDir, { recursive: true });
       await writeFile(adbLog, "");
-      await writeFile(metroLog, "metro-sentinel\n");
+      if (metroLogPresent) await writeFile(metroLog, "metro-sentinel\n");
+      else await rm(metroLog, { force: true });
       const harness = `set -euo pipefail
 cd "$HARNESS_ROOT"
 emulator_serial=emulator-5554
-metro_pid=424242
+metro_pid="$HARNESS_METRO_PID"
 metro_log="$HARNESS_METRO_LOG"
 adb() {
   printf '%s\\n' "$*" >> "$HARNESS_ADB_LOG"
@@ -961,12 +1094,21 @@ exit ${status}
         HARNESS_ROOT: root,
         HARNESS_ADB_LOG: adbLog,
         HARNESS_APP_PID: appPid,
+        HARNESS_METRO_PID: metroPid,
         HARNESS_METRO_LOG: metroLog,
       } });
     };
 
+    const emptyCleanup = await runCleanup(0, "", { metroPid: "", metroLogPresent: false });
+    assert.equal(emptyCleanup.status, 0, emptyCleanup.stderr);
+    assert.equal(emptyCleanup.stdout, "");
+    assert.doesNotMatch(await readFile(adbLog, "utf8"), /^(?:kill|wait) /m);
+
     const success = await runCleanup(0);
     assert.equal(success.status, 0, success.stderr);
+    assert.equal(success.stdout, "metro-sentinel\n");
+    assert.match(await readFile(adbLog, "utf8"), /^kill 424242$/m);
+    assert.match(await readFile(adbLog, "utf8"), /^wait 424242$/m);
     await assert.rejects(readFile(join(root, ".artifacts/launch/device/android-failure.png")));
     await assert.rejects(readFile(join(root, ".artifacts/launch/device/android-ui-hierarchy.xml")));
     await assert.rejects(readFile(join(root, ".artifacts/launch/device/android-app.log")));
@@ -1176,6 +1318,22 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     /exactly one exact --no-streaming -r install command/,
   );
 
+  const packageServiceMutations = [
+    androidRunner.replace("seq 1 60", "seq 1 59"),
+    androidRunner.replace(exactAndroidPackageServiceLines[1], ""),
+    androidRunner.replace(
+      `trap cleanup EXIT\n${exactAndroidPackageServiceLines[0]}`,
+      `${exactAndroidPackageServiceLines[0]}\ntrap cleanup EXIT`,
+    ),
+  ];
+  for (const mutatedScript of packageServiceMutations) {
+    assert.notEqual(mutatedScript, androidRunner);
+    assert.throws(
+      () => assertExactAndroidPackageServicePolicy(mutatedScript),
+      /exact bounded loop and final fail-closed probe|register cleanup before package readiness/,
+    );
+  }
+
   const confirmationFlowMutations = [
     confirmation.replace("- runFlow:\n", ""),
     confirmation.replace("- runFlow:\n", "- runFlow:\n- runFlow:\n"),
@@ -1234,7 +1392,9 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
   const androidPolicyMutations = [
     androidRunner.replace(exactAndroidFailureScreenshotCommand, `    # ${exactAndroidFailureScreenshotCommand.trim()}`),
     androidRunner.replace("  status=$?", "  status=0"),
-    androidRunner.replace('  wait "$metro_pid" 2>/dev/null\n', ""),
+    androidRunner.replace('    wait "$metro_pid" 2>/dev/null\n', ""),
+    androidRunner.replace('  if [ -n "$metro_pid" ]; then\n', ""),
+    androidRunner.replace('  if [ -f "$metro_log" ]; then\n', ""),
     androidRunner.replace(`${exactAndroidFallbackLogCommand}\n`, ""),
     androidRunner.replace(".artifacts/launch/maestro/android-smoke", ".artifacts/launch/maestro/android-readiness"),
   ];
