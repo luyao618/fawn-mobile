@@ -567,7 +567,14 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
   const cleanupStart = lines.indexOf("cleanup() {");
   const cleanupEnd = lines.indexOf("trap cleanup EXIT", cleanupStart + 1);
   assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart, "Android cleanup function and EXIT trap must remain exact");
-  const diagnosticCommands = lines.slice(cleanupStart, cleanupEnd + 1).filter(
+  const logicalLines = script.replace(/\\(?:\r\n|\n|\r)/g, "").split(/\r\n|\n|\r/);
+  const logicalCleanupStart = logicalLines.indexOf("cleanup() {");
+  const logicalCleanupEnd = logicalLines.indexOf("trap cleanup EXIT", logicalCleanupStart + 1);
+  assert.ok(
+    logicalCleanupStart >= 0 && logicalCleanupEnd > logicalCleanupStart,
+    "Android logical cleanup function and EXIT trap must remain exact",
+  );
+  const diagnosticCommands = logicalLines.slice(logicalCleanupStart, logicalCleanupEnd + 1).filter(
     (line) => !/^\s*#/.test(line)
       && /\badb\b/.test(line)
       && /\b(?:screencap|uiautomator|pidof|logcat)\b/.test(line),
@@ -1142,6 +1149,23 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     );
   }
 
+  const continuedAndroidDiagnostics = [
+    '    adb -s "$emulator_serial" \\\n      logcat -d > .artifacts/launch/device/continued-before-logcat.log 2>&1',
+    '    adb -s "$emulator_serial" log\\\r\ncat -d > .artifacts/launch/device/continued-within-logcat.log 2>&1',
+    '    a\\\rdb -s "$emulator_serial" logcat -d > .artifacts/launch/device/continued-within-adb.log 2>&1',
+  ];
+  for (const continuedDiagnostic of continuedAndroidDiagnostics) {
+    const mutatedScript = androidRunner.replace(
+      exactAndroidFailureScreenshotCommand,
+      `${exactAndroidFailureScreenshotCommand}\n${continuedDiagnostic}`,
+    );
+    assert.notEqual(mutatedScript, androidRunner);
+    assert.throws(
+      () => assertAndroidDiagnosticsPolicy(mutatedScript, androidWorkflow),
+      /executable Android diagnostic adb command inventory must exactly match/,
+    );
+  }
+
   const duplicatedAndroidDiagnostic = androidRunner.replace(
     exactAndroidFailureScreenshotCommand,
     `${exactAndroidFailureScreenshotCommand}\n${exactAndroidFailureScreenshotCommand}`,
@@ -1168,6 +1192,13 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
   );
   assert.notEqual(commentedExtraAndroidDiagnostic, androidRunner);
   assert.doesNotThrow(() => assertAndroidDiagnosticsPolicy(commentedExtraAndroidDiagnostic, androidWorkflow));
+
+  const continuedCommentOnlyAndroidDiagnostic = androidRunner.replace(
+    exactAndroidFailureScreenshotCommand,
+    `${exactAndroidFailureScreenshotCommand}\n    # adb -s "$emulator_serial" \\\n+      logcat -d > .artifacts/launch/device/comment-only-continued.log 2>&1`,
+  );
+  assert.notEqual(continuedCommentOnlyAndroidDiagnostic, androidRunner);
+  assert.doesNotThrow(() => assertAndroidDiagnosticsPolicy(continuedCommentOnlyAndroidDiagnostic, androidWorkflow));
 
   const unboundedAndroidTimeout = structuredClone(androidWorkflow);
   requiredJob(unboundedAndroidTimeout, "android").env = { MAESTRO_DRIVER_STARTUP_TIMEOUT: "120000" };
