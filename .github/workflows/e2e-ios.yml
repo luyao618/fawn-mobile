@@ -56,7 +56,7 @@ jobs:
       - name: Serial production and E2E builds, install, and smoke
         run: |
           set -euo pipefail
-          mkdir -p .artifacts/launch .artifacts/test-results
+          mkdir -p .artifacts/launch/maestro .artifacts/launch/simulator .artifacts/test-results
           simulator_udid=$(xcrun simctl list devices available -j | node -e '
             let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
               const devices = JSON.parse(input).devices;
@@ -99,15 +99,28 @@ jobs:
           xcrun simctl install "$simulator_udid" "$app_path"
           CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &
           metro_pid=$!
-          trap 'kill "$metro_pid" 2>/dev/null || true; cat /tmp/metro.log' EXIT
+          cleanup() {
+            status=$?
+            trap - EXIT
+            set +e
+            if [ "$status" -ne 0 ]; then
+              xcrun simctl io "$simulator_udid" screenshot .artifacts/launch/simulator/ios-failure.png
+              xcrun simctl spawn "$simulator_udid" log show --style compact --last 15m --predicate 'process == "ForMobile" OR process == "SpringBoard"' > .artifacts/launch/simulator/ios-simulator-app.log 2>&1
+            fi
+            kill "$metro_pid" 2>/dev/null
+            cat /tmp/metro.log
+            exit "$status"
+          }
+          trap cleanup EXIT
           for attempt in $(seq 1 60); do curl --silent --fail http://127.0.0.1:8081/status >/dev/null && break; sleep 2; done
           curl --silent --fail http://127.0.0.1:8081/status
           dev_client_url='formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081'
           printf 'device=%s\nurl=%s\n' "$simulator_udid" "$dev_client_url" | tee .artifacts/launch/ios-dev-client.log
           xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log
-          maestro --device "$simulator_udid" test e2e/maestro/ios-open-confirmation.yaml 2>&1 | tee .artifacts/launch/ios-open-confirmation.log
-          maestro --device "$simulator_udid" test e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/launch/ios-readiness.log
-          maestro --device "$simulator_udid" test e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log
+          maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-open-confirmation e2e/maestro/ios-open-confirmation.yaml 2>&1 | tee .artifacts/launch/ios-open-confirmation.log
+          xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log
+          maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-readiness e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/launch/ios-readiness.log
+          maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-smoke e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log
           mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log
       - name: Collect same-SHA evidence
         run: |
@@ -136,6 +149,6 @@ jobs:
         with:
           name: ios-e2e-diagnostics-${{ inputs.expected_sha }}
           path: |
-            .artifacts/launch/*.log
-            .artifacts/test-results/*.log
+            .artifacts/launch/**
+            .artifacts/test-results/**
           if-no-files-found: ignore

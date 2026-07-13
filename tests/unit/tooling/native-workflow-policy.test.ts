@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
 
@@ -425,13 +427,19 @@ const exactMetroStatusLines = [
   "curl --silent --fail http://127.0.0.1:8081/status",
 ] as const;
 const exactDevClientUrlAssignment = `dev_client_url='${encodedDevClientUrl}'`;
+const exactAndroidInstallCommand = 'adb -s "$emulator_serial" install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk';
+const exactIosFailureScreenshotCommand = '    xcrun simctl io "$simulator_udid" screenshot .artifacts/launch/simulator/ios-failure.png';
+const exactIosFailureLogCommand = `    xcrun simctl spawn "$simulator_udid" log show --style compact --last 15m --predicate 'process == "ForMobile" OR process == "SpringBoard"' > .artifacts/launch/simulator/ios-simulator-app.log 2>&1`;
 const iosOpenConfirmationFlow = "e2e/maestro/ios-open-confirmation.yaml";
 const readinessFlow = "e2e/maestro/shell-readiness.yaml";
 const smokeFlow = "e2e/maestro/shell-smoke.yaml";
 const exactReadinessCommands: Record<NativePlatform, string> = {
   Android: `maestro --device "$emulator_serial" test ${readinessFlow} 2>&1 | tee .artifacts/launch/android-readiness.log`,
-  iOS: `maestro --device "$simulator_udid" test ${readinessFlow} 2>&1 | tee .artifacts/launch/ios-readiness.log`,
+  iOS: `maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-readiness ${readinessFlow} 2>&1 | tee .artifacts/launch/ios-readiness.log`,
 };
+const exactIosOpenUrlCommand = 'xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log';
+const exactIosConfirmationCommand = `maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-open-confirmation ${iosOpenConfirmationFlow} 2>&1 | tee .artifacts/launch/ios-open-confirmation.log`;
+const exactIosSmokeCommand = `maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-smoke ${smokeFlow} 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log`;
 const exactPinnedSimulatorOpenLine = 'open "$DEVELOPER_DIR/Applications/Simulator.app" --args -CurrentDeviceUDID "$simulator_udid"';
 
 const exactIosOpenConfirmationFlow = `appId: com.luyao618.formobile
@@ -440,9 +448,6 @@ const exactIosOpenConfirmationFlow = `appId: com.luyao618.formobile
     text: "Open"
     label: "Open For Mobile from the first-use system dialog"
     optional: true
-- extendedWaitUntil:
-    visible: "照护空间尚未设置"
-    timeout: 120000
 `;
 
 const exactReadinessFlow = `appId: com.luyao618.formobile
@@ -515,6 +520,84 @@ function assertExactReadinessCommand(script: string, platform: NativePlatform): 
   );
 }
 
+function assertExactAndroidInstallPolicy(script: string): void {
+  const installLines = script.split(/\r\n|\n|\r/).filter((line) => !/^\s*#/.test(line) && /\badb\b.*\binstall\b/.test(line));
+  assert.deepEqual(
+    installLines,
+    [exactAndroidInstallCommand],
+    "Android runner must contain exactly one exact --no-streaming -r install command",
+  );
+}
+
+function assertExactIosUrlHandoff(script: string): void {
+  const lines = script.split(/\r\n|\n|\r/);
+  const openUrlLines = lines.filter((line) => line.includes("simctl openurl"));
+  assert.deepEqual(
+    openUrlLines,
+    [exactIosOpenUrlCommand, exactIosOpenUrlCommand],
+    "iOS must contain exactly two identical exact simctl openurl commands",
+  );
+  const confirmationLines = lines.filter((line) => line.includes(iosOpenConfirmationFlow));
+  assert.deepEqual(
+    confirmationLines,
+    [exactIosConfirmationCommand],
+    "iOS confirmation must appear exactly once as the exact fail-closed command",
+  );
+  const smokeLines = lines.filter((line) => line.includes(smokeFlow));
+  assert.deepEqual(smokeLines, [exactIosSmokeCommand], "iOS smoke must remain one exact fail-closed command");
+
+  const assignmentIndex = lines.indexOf(exactDevClientUrlAssignment);
+  const firstOpenIndex = lines.indexOf(exactIosOpenUrlCommand);
+  const confirmationIndex = lines.indexOf(exactIosConfirmationCommand);
+  const secondOpenIndex = lines.lastIndexOf(exactIosOpenUrlCommand);
+  const readinessIndex = lines.indexOf(exactReadinessCommands.iOS);
+  const smokeIndex = lines.indexOf(exactIosSmokeCommand);
+  assert.ok(
+    assignmentIndex < firstOpenIndex
+      && firstOpenIndex < confirmationIndex
+      && confirmationIndex < secondOpenIndex
+      && secondOpenIndex < readinessIndex
+      && readinessIndex < smokeIndex,
+    "iOS handoff must preserve URL assignment, first open, confirmation, replay, readiness, and smoke order",
+  );
+}
+
+function assertIosFailureDiagnosticsPolicy(script: string, workflow: Workflow): void {
+  const lines = script.split(/\r\n|\n|\r/);
+  const diagnosticLines = lines.filter((line) => /^\s*xcrun\s+simctl\s+(?:io|spawn)(?:\s|$)/.test(line));
+  assert.deepEqual(
+    diagnosticLines,
+    [exactIosFailureScreenshotCommand, exactIosFailureLogCommand],
+    "iOS executable simctl io/spawn command inventory must exactly match the approved diagnostics in order",
+  );
+  const cleanupLines = [
+    "cleanup() {",
+    "  status=$?",
+    "  trap - EXIT",
+    "  set +e",
+    '  if [ "$status" -ne 0 ]; then',
+    exactIosFailureScreenshotCommand,
+    exactIosFailureLogCommand,
+    "  fi",
+    '  kill "$metro_pid" 2>/dev/null',
+    "  cat /tmp/metro.log",
+    '  exit "$status"',
+    "}",
+    "trap cleanup EXIT",
+  ];
+  const cleanupIndexes = cleanupLines.map((line) => lines.indexOf(line));
+  assert.ok(
+    cleanupIndexes.every((index, position) => index >= 0 && (position === 0 || index > cleanupIndexes[position - 1])),
+    "iOS cleanup must preserve exact status-preserving diagnostic and teardown order",
+  );
+  const steps = requiredSteps(requiredJob(workflow, "ios"), "ios");
+  const diagnosticUploads = steps.filter((step) => step.with?.name === `ios-e2e-diagnostics-${expectedShaInput}`);
+  assert.equal(diagnosticUploads.length, 1, "iOS must retain exactly one diagnostics upload");
+  const upload = diagnosticUploads[0];
+  assert.equal(upload.if, "always()", "iOS diagnostics upload must run after failure");
+  assert.equal(upload.with?.path, ".artifacts/launch/**\n.artifacts/test-results/**\n");
+}
+
 function assertExactPinnedSimulatorOpen(script: string): void {
   const simulatorOpenLines = script.split("\n").filter((line) => line.includes("-CurrentDeviceUDID"));
   assert.deepEqual(
@@ -539,11 +622,12 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assert.match(runner, /^#!\/usr\/bin\/env bash\nset -euo pipefail\n/);
   assertExactMetroStartupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
+  assertExactAndroidInstallPolicy(runner);
   ordered(runner,
     "mapfile -t emulator_serials",
     'emulator_serial="${emulator_serials[0]}"',
     ":app:assembleDebug",
-    'adb -s "$emulator_serial" install -r',
+    exactAndroidInstallCommand,
     'adb -s "$emulator_serial" reverse tcp:8081 tcp:8081',
     exactHeadlessMetroCommand,
     exactDevClientUrlAssignment,
@@ -552,6 +636,77 @@ test("pinned Android action receives exactly one Bash command and the runner is 
     `maestro --device "$emulator_serial" test ${smokeFlow}`,
     "mv .artifacts/test-results/android-maestro.attempt.log .artifacts/test-results/android-maestro.log",
   );
+});
+
+test("Android invalid APK install fails once before reverse, Metro, or Maestro", async () => {
+  const root = await mkdtemp(join(tmpdir(), "g018-android-install-"));
+  try {
+    const fakeBin = join(root, "bin");
+    const android = join(root, "android");
+    const adbLog = join(root, "adb.log");
+    const downstreamLog = join(root, "downstream.log");
+    const bashEnv = join(root, "bash-env");
+    await mkdir(fakeBin);
+    await mkdir(android);
+    await writeFile(adbLog, "");
+    await writeFile(downstreamLog, "");
+    await writeFile(bashEnv, `mapfile() {
+  test "$1" = "-t"
+  local array_name="$2"
+  local values=()
+  local line
+  while IFS= read -r line; do values[\${#values[@]}]="$line"; done
+  eval "$array_name=(\\"\${values[@]}\\")"
+}
+`);
+    await writeFile(join(fakeBin, "adb"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$ANDROID_ADB_LOG"
+if [ "\${1:-}" = "devices" ]; then
+  printf 'List of devices attached\\nemulator-5554\\tdevice\\n'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "install" ]; then
+  printf '%s\\n' 'Failure [INSTALL_FAILED_INVALID_APK]' >&2
+  exit 1
+fi
+`);
+    await writeFile(join(android, "gradlew"), "#!/usr/bin/env bash\nexit 0\n");
+    for (const command of ["npx", "maestro"]) {
+      await writeFile(join(fakeBin, command), `#!/usr/bin/env bash
+printf '%s %s\\n' ${JSON.stringify(command)} "$*" >> "$ANDROID_DOWNSTREAM_LOG"
+exit 97
+`);
+    }
+    await Promise.all([
+      chmod(join(fakeBin, "adb"), 0o755),
+      chmod(join(fakeBin, "npx"), 0o755),
+      chmod(join(fakeBin, "maestro"), 0o755),
+      chmod(join(android, "gradlew"), 0o755),
+    ]);
+
+    const result = spawnSync("bash", [resolve("scripts/e2e/run-android-emulator.sh")], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ANDROID_ADB_LOG: adbLog,
+        ANDROID_DOWNSTREAM_LOG: downstreamLog,
+        BASH_ENV: bashEnv,
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+      },
+    });
+    assert.notEqual(result.status, 0, "invalid APK install must fail closed");
+    assert.match(result.stderr, /Failure \[INSTALL_FAILED_INVALID_APK\]/);
+    const adbCalls = (await readFile(adbLog, "utf8")).trim().split("\n");
+    assert.deepEqual(adbCalls, [
+      "devices",
+      "-s emulator-5554 install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk",
+    ]);
+    assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 1);
+    assert.equal(adbCalls.some((call) => call.includes(" reverse ")), false);
+    assert.equal(await readFile(downstreamLog, "utf8"), "", "Metro and Maestro must not be reached");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Android retains both native flavors and records smoke provenance after exact-device readiness", async () => {
@@ -590,6 +745,8 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
   assert.ok(typeof smokeRun === "string", "iOS device smoke must have an enabled run script");
   assertExactMetroStartupPolicy(smokeRun, "iOS");
   assertExactReadinessCommand(smokeRun, "iOS");
+  assertExactIosUrlHandoff(smokeRun);
+  assertIosFailureDiagnosticsPolicy(smokeRun, parsedWorkflow);
   assertExactPinnedSimulatorOpen(smokeRun);
   ordered(workflow,
     "simulator_udid=$(xcrun simctl list devices available -j",
@@ -606,10 +763,11 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
     'simctl install "$simulator_udid"',
     exactHeadlessMetroCommand,
     exactDevClientUrlAssignment,
-    'simctl openurl "$simulator_udid" "$dev_client_url"',
-    `maestro --device "$simulator_udid" test ${iosOpenConfirmationFlow} 2>&1 | tee .artifacts/launch/ios-open-confirmation.log`,
+    exactIosOpenUrlCommand,
+    exactIosConfirmationCommand,
+    exactIosOpenUrlCommand,
     exactReadinessCommands.iOS,
-    `maestro --device "$simulator_udid" test ${smokeFlow} 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log`,
+    exactIosSmokeCommand,
     "mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log",
     "collect-ci-evidence.mjs",
     "--test-result pass --test-result-file .artifacts/test-results/ios-maestro.log",
@@ -617,7 +775,7 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
   assert.match(workflow, /set -euo pipefail/);
   assert.doesNotMatch(workflow, /simctl boot[^\n]*\|\| true/);
   assert.doesNotMatch(workflow, /simctl launch/);
-  assert.match(workflow, /\.artifacts\/launch\/\*\.log/);
+  assert.match(workflow, /\.artifacts\/launch\/\*\*/);
 });
 
 test("iOS confirmation is exact while readiness and smoke retain their required behavior", async () => {
@@ -627,6 +785,7 @@ test("iOS confirmation is exact while readiness and smoke retain their required 
     readFile(smokeFlow, "utf8"),
   ]);
   assertIosOpenConfirmationFlow(confirmation);
+  assert.doesNotMatch(confirmation, /extendedWaitUntil|assertVisible|launchApp|stopApp|openLink/);
   assert.equal(readiness, exactReadinessFlow);
   assert.doesNotMatch(readiness, /launchApp|stopApp|openLink/);
   assert.equal(smoke, exactSmokeFlow);
@@ -724,17 +883,78 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     }
   }
 
+  const duplicateAndroidInstall = androidRunner.replace(
+    exactAndroidInstallCommand,
+    `${exactAndroidInstallCommand}\n${exactAndroidInstallCommand}`,
+  );
+  assert.notEqual(duplicateAndroidInstall, androidRunner);
+  assert.throws(
+    () => assertExactAndroidInstallPolicy(duplicateAndroidInstall),
+    /exactly one exact --no-streaming -r install command/,
+  );
+
   const withoutOptionalTap = confirmation.replace("    optional: true\n", "");
   assert.notEqual(withoutOptionalTap, confirmation);
   assert.throws(() => assertIosOpenConfirmationFlow(withoutOptionalTap), /flow bytes must remain exact/);
 
-  const requiredWait = `- extendedWaitUntil:
-    visible: "照护空间尚未设置"
-    timeout: 120000
-`;
-  const withoutRequiredWait = confirmation.replace(requiredWait, "");
-  assert.notEqual(withoutRequiredWait, confirmation);
-  assert.throws(() => assertIosOpenConfirmationFlow(withoutRequiredWait), /flow bytes must remain exact/);
+  const withReadinessWait = `${confirmation}- extendedWaitUntil:\n    visible: "照护空间尚未设置"\n    timeout: 120000\n`;
+  assert.throws(() => assertIosOpenConfirmationFlow(withReadinessWait), /flow bytes must remain exact/);
+
+  const iosHandoffMutations = [
+    iosSmoke.run.replace(`${exactIosOpenUrlCommand}\n${exactReadinessCommands.iOS}`, exactReadinessCommands.iOS),
+    iosSmoke.run.replace(
+      `${exactIosOpenUrlCommand}\n${exactReadinessCommands.iOS}`,
+      `${exactIosOpenUrlCommand}\n${exactIosOpenUrlCommand}\n${exactReadinessCommands.iOS}`,
+    ),
+    iosSmoke.run.replace(
+      `${exactIosConfirmationCommand}\n${exactIosOpenUrlCommand}`,
+      `${exactIosOpenUrlCommand}\n${exactIosConfirmationCommand}`,
+    ),
+    iosSmoke.run.replace(
+      `${exactIosOpenUrlCommand}\n${exactReadinessCommands.iOS}`,
+      `xcrun simctl openurl "$simulator_udid" "${encodedDevClientUrl}" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log\n${exactReadinessCommands.iOS}`,
+    ),
+  ];
+  for (const mutatedScript of iosHandoffMutations) {
+    assert.notEqual(mutatedScript, iosSmoke.run);
+    assert.throws(
+      () => assertExactIosUrlHandoff(mutatedScript),
+      /exactly two identical exact simctl openurl commands|must preserve URL assignment, first open, confirmation, replay, readiness, and smoke order/,
+    );
+  }
+
+  const commentedIosDiagnostic = iosSmoke.run.replace(
+    exactIosFailureScreenshotCommand,
+    `    # ${exactIosFailureScreenshotCommand.trim()}`,
+  );
+  const removedIosDiagnostic = iosSmoke.run.replace(`${exactIosFailureLogCommand}\n`, "");
+  for (const mutatedScript of [commentedIosDiagnostic, removedIosDiagnostic]) {
+    assert.notEqual(mutatedScript, iosSmoke.run);
+    assert.throws(
+      () => assertIosFailureDiagnosticsPolicy(mutatedScript, iosWorkflow),
+      /executable simctl io\/spawn command inventory must exactly match/,
+    );
+  }
+
+  const reorderedIosDiagnostics = iosSmoke.run.replace(
+    `${exactIosFailureScreenshotCommand}\n${exactIosFailureLogCommand}`,
+    `${exactIosFailureLogCommand}\n${exactIosFailureScreenshotCommand}`,
+  );
+  assert.notEqual(reorderedIosDiagnostics, iosSmoke.run);
+  assert.throws(
+    () => assertIosFailureDiagnosticsPolicy(reorderedIosDiagnostics, iosWorkflow),
+    /executable simctl io\/spawn command inventory must exactly match/,
+  );
+
+  const extraIosDiagnostic = iosSmoke.run.replace(
+    exactIosFailureLogCommand,
+    `${exactIosFailureLogCommand}\n    xcrun simctl io "$simulator_udid" screenshot /tmp/extra-ios-diagnostic.png`,
+  );
+  assert.notEqual(extraIosDiagnostic, iosSmoke.run);
+  assert.throws(
+    () => assertIosFailureDiagnosticsPolicy(extraIosDiagnostic, iosWorkflow),
+    /executable simctl io\/spawn command inventory must exactly match/,
+  );
 });
 
 test("native workflows enforce the parsed Intel runner, exact SHA boundaries, and frozen tool preflight", async () => {
