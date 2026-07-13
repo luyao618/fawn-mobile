@@ -551,9 +551,7 @@ const exactAndroidRunner = "ubuntu-latest";
 const androidKvmStepName = "Enable KVM hardware acceleration";
 const exactAndroidKvmScript = `set -euo pipefail
 test -c /dev/kvm
-echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger --name-match=kvm
+sudo chmod 0666 /dev/kvm
 test -r /dev/kvm
 test -w /dev/kvm
 `;
@@ -1906,7 +1904,7 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
     ["mode-0660", (candidate) => {
       const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex];
       assert.ok(typeof step.run === "string");
-      step.run = step.run.replace('MODE="0666"', 'MODE="0660"');
+      step.run = step.run.replace("sudo chmod 0666 /dev/kvm", "sudo chmod 0660 /dev/kvm");
     }],
     ["missing-read-probe", (candidate) => {
       const step = requiredSteps(requiredJob(candidate.android, "android"), "android")[androidKvmIndex];
