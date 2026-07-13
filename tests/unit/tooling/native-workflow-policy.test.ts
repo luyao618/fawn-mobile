@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -80,6 +81,7 @@ const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
 const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n";
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
+const exactAndroidRunnerSha256 = "bf42ee697041e4a02e2d2eae21d50427ad1ea54fdc1956b4d769f960b760b871";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -543,6 +545,14 @@ function assertExactAndroidInstallPolicy(script: string): void {
   );
 }
 
+function assertExactAndroidRunnerSha256(script: string): void {
+  assert.equal(
+    createHash("sha256").update(script).digest("hex"),
+    exactAndroidRunnerSha256,
+    "Android runner bytes must match the reviewed SHA-256",
+  );
+}
+
 function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): void {
   const job = requiredJob(workflow, "android");
   assert.deepEqual(
@@ -551,6 +561,16 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
     "Android Maestro driver startup timeout must remain exactly bounded at 60000ms",
   );
   const lines = script.split(/\r\n|\n|\r/);
+  assert.equal(
+    lines.filter((line) => line === "cleanup() {").length,
+    1,
+    "Android runner must contain exactly one cleanup definition",
+  );
+  assert.equal(
+    lines.filter((line) => line === "trap cleanup EXIT").length,
+    1,
+    "Android runner must contain exactly one EXIT trap registration",
+  );
   const maestroLines = lines.filter((line) => /^maestro /.test(line));
   assert.deepEqual(
     maestroLines,
@@ -690,6 +710,7 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assert.deepEqual(commands, ["bash scripts/e2e/run-android-emulator.sh"]);
   assert.equal(spawnSync("bash", ["-n", "scripts/e2e/run-android-emulator.sh"]).status, 0);
   assert.match(runner, /^#!\/usr\/bin\/env bash\nset -euo pipefail\n/);
+  assertExactAndroidRunnerSha256(runner);
   assertExactMetroStartupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
   assertExactAndroidInstallPolicy(runner);
@@ -708,6 +729,50 @@ test("pinned Android action receives exactly one Bash command and the runner is 
     exactAndroidSmokeCommand,
     "mv .artifacts/test-results/android-maestro.attempt.log .artifacts/test-results/android-maestro.log",
   );
+});
+
+test("Android runner lock and cleanup cardinality reject hostile whole-file mutations", async () => {
+  const [runner, workflowSource] = await Promise.all([
+    readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
+    readFile(".github/workflows/e2e-android.yml", "utf8"),
+  ]);
+  const workflow = parseWorkflow(workflowSource, ".github/workflows/e2e-android.yml");
+
+  const duplicateCleanup = `${runner}cleanup() {
+  :
+}
+`;
+  assert.throws(
+    () => assertAndroidDiagnosticsPolicy(duplicateCleanup, workflow),
+    /exactly one cleanup definition/,
+  );
+
+  const duplicateExitTrap = `${runner}trap cleanup EXIT
+`;
+  assert.throws(
+    () => assertAndroidDiagnosticsPolicy(duplicateExitTrap, workflow),
+    /exactly one EXIT trap registration/,
+  );
+
+  const hostileMutations = [
+    ["later cleanup redefinition", `${runner}cleanup () { :; }
+`],
+    ["later EXIT trap override", `${runner}trap ':' EXIT
+`],
+    ["quote joining", runner.replace("mkdir -p", "m''kdir -p")],
+    ["line continuation", runner.replace("mkdir -p", "mkdir " + "\\\n" + "  -p")],
+    ["comment insertion", runner.replace("mkdir -p", "# hostile mutation\nmkdir -p")],
+    ["arbitrary line insertion", `${runner}printf '%s\n' hostile-mutation >/dev/null
+`],
+  ] as const;
+  for (const [label, mutatedRunner] of hostileMutations) {
+    assert.notEqual(mutatedRunner, runner, `${label} fixture must change the runner bytes`);
+    assert.throws(
+      () => assertExactAndroidRunnerSha256(mutatedRunner),
+      /must match the reviewed SHA-256/,
+      label,
+    );
+  }
 });
 
 test("Android invalid APK install fails once before reverse, Metro, or Maestro", async () => {
