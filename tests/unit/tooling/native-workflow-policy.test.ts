@@ -79,7 +79,7 @@ const whoProvisionStepName = "Populate hash-pinned WHO cache";
 const whoDownloadCommand = "PYTHONDONTWRITEBYTECODE=1 python3 tools/knowledge/download_who_sources.py";
 const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
-const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/production/**/*.js\n.artifacts/fault-bundles/e2e/**/*.js\n";
+const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/android/production/**/*.js\n.artifacts/fault-bundles/android/e2e/**/*.js\n.artifacts/fault-bundles/ios/production/**/*.js\n.artifacts/fault-bundles/ios/e2e/**/*.js\n";
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
 const exactAndroidRunnerSha256 = "bf42ee697041e4a02e2d2eae21d50427ad1ea54fdc1956b4d769f960b760b871";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';

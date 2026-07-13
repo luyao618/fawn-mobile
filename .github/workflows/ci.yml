@@ -143,8 +143,10 @@ jobs:
             .artifacts/static.json
             .artifacts/test-results/static-gates.log
             .artifacts/fault-bundles/proof.json
-            .artifacts/fault-bundles/production/**/*.js
-            .artifacts/fault-bundles/e2e/**/*.js
+            .artifacts/fault-bundles/android/production/**/*.js
+            .artifacts/fault-bundles/android/e2e/**/*.js
+            .artifacts/fault-bundles/ios/production/**/*.js
+            .artifacts/fault-bundles/ios/e2e/**/*.js
           if-no-files-found: error
 
   android-e2e:

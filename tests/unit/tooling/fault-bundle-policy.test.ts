@@ -8,11 +8,13 @@ import test from "node:test";
 
 import {
   FAULT_BUNDLE_EXPORT_FLAGS,
+  FAULT_BUNDLE_PLATFORMS,
   FAULT_CONTROLLER_SENTINEL,
   validateFaultBundleProof,
 } from "../../../tools/check-fault-bundles.mjs";
 
 const sha = "b".repeat(40);
+const platforms = FAULT_BUNDLE_PLATFORMS as readonly ("android" | "ios")[];
 
 type BundleEntry = { path: string; bytes: number; sha256: string; sentinelOccurrences: number };
 
@@ -46,54 +48,85 @@ test("Metro rejects unknown build flavors instead of falling back to E2E or prod
 
 async function fixture(production: string, e2e: string) {
   const root = await mkdtemp(join(tmpdir(), "g018-fault-bundles-"));
-  const entries = {} as Record<"production" | "e2e", BundleEntry>;
-  for (const [flavor, source] of [["production", production], ["e2e", e2e]] as const) {
-    const path = `.artifacts/fault-bundles/${flavor}/_expo/static/js/android/index.js`;
-    const bytes = Buffer.from(source);
-    await mkdir(dirname(join(root, path)), { recursive: true });
-    await writeFile(join(root, path), bytes);
-    entries[flavor] = {
-      path,
-      bytes: bytes.length,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      sentinelOccurrences: source.split(FAULT_CONTROLLER_SENTINEL).length - 1,
-    };
+  const entries = {} as Record<"android" | "ios", Record<"production" | "e2e", BundleEntry>>;
+  for (const platform of platforms) {
+    entries[platform] = {} as Record<"production" | "e2e", BundleEntry>;
+    for (const [flavor, source] of [["production", production], ["e2e", e2e]] as const) {
+      const path = `.artifacts/fault-bundles/${platform}/${flavor}/_expo/static/js/${platform}/index.js`;
+      const bytes = Buffer.from(`${platform}:${source}`);
+      await mkdir(dirname(join(root, path)), { recursive: true });
+      await writeFile(join(root, path), bytes);
+      entries[platform][flavor] = {
+        path,
+        bytes: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        sentinelOccurrences: source.split(FAULT_CONTROLLER_SENTINEL).length - 1,
+      };
+    }
   }
   return {
     root,
-    proof: { schemaVersion: 1, checkedOutSha: sha, exportFlags: FAULT_BUNDLE_EXPORT_FLAGS, sentinel: FAULT_CONTROLLER_SENTINEL, bundles: entries },
+    proof: { schemaVersion: 2, checkedOutSha: sha, platforms: FAULT_BUNDLE_PLATFORMS, exportFlags: FAULT_BUNDLE_EXPORT_FLAGS, sentinel: FAULT_CONTROLLER_SENTINEL, bundles: entries },
   };
 }
 
-test("text-bundle proof requires the sentinel absent from production and present in E2E", async () => {
+test("text-bundle proof requires the sentinel absent from production and present in E2E on both platforms", async () => {
   const { root, proof } = await fixture("production-no-op", `e2e:${FAULT_CONTROLLER_SENTINEL}`);
   try {
     const result = await validateFaultBundleProof(proof, { root, expectedSha: sha });
-    assert.equal(result.production.sentinelOccurrences, 0);
-    assert.equal(result.e2e.sentinelOccurrences, 1);
+    for (const platform of platforms) {
+      assert.equal(result[platform].production.sentinelOccurrences, 0);
+      assert.equal(result[platform].e2e.sentinelOccurrences, 1);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("text-bundle proof rejects production leakage, E2E omission, and retained-byte drift", async () => {
-  for (const [production, e2e, expected] of [
-    [FAULT_CONTROLLER_SENTINEL, FAULT_CONTROLLER_SENTINEL, /Production bundle contains/],
-    ["production-no-op", "e2e-without-controller", /E2E bundle does not contain/],
-  ] as const) {
-    const { root, proof } = await fixture(production, e2e);
-    try {
-      await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), expected);
-    } finally {
-      await rm(root, { recursive: true, force: true });
+test("text-bundle proof rejects hostile evidence independently for all four platform-flavor bundles", async () => {
+  for (const platform of platforms) {
+    for (const [flavor, source, expected] of [
+      ["production", FAULT_CONTROLLER_SENTINEL, /production bundle contains/],
+      ["e2e", "e2e-without-controller", /E2E bundle does not contain/],
+    ] as const) {
+      const { root, proof } = await fixture("production-no-op", `e2e:${FAULT_CONTROLLER_SENTINEL}`);
+      try {
+        const entry = proof.bundles[platform][flavor];
+        const bytes = Buffer.from(`${platform}:${source}`);
+        await writeFile(join(root, entry.path), bytes);
+        entry.bytes = bytes.length;
+        entry.sha256 = createHash("sha256").update(bytes).digest("hex");
+        entry.sentinelOccurrences = source.split(FAULT_CONTROLLER_SENTINEL).length - 1;
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), expected);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     }
   }
 
   const { root, proof } = await fixture("production-no-op", `e2e:${FAULT_CONTROLLER_SENTINEL}`);
   try {
-    await writeFile(join(root, proof.bundles.e2e.path), "forged");
+    await writeFile(join(root, proof.bundles.ios.e2e.path), "forged");
     await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /byte count disagrees|hash disagrees/);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("text-bundle proof rejects missing platform evidence and cross-platform canonical paths", async () => {
+  const { root, proof } = await fixture("production-no-op", `e2e:${FAULT_CONTROLLER_SENTINEL}`);
+  try {
+    delete (proof.bundles as any).ios;
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /ios production fault bundle evidence is absent/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+
+  const hostile = await fixture("production-no-op", `e2e:${FAULT_CONTROLLER_SENTINEL}`);
+  try {
+    hostile.proof.bundles.ios.e2e.path = hostile.proof.bundles.android.e2e.path;
+    await assert.rejects(validateFaultBundleProof(hostile.proof, { root: hostile.root, expectedSha: sha }), /ios e2e bundle path is outside/);
+  } finally {
+    await rm(hostile.root, { recursive: true, force: true });
   }
 });

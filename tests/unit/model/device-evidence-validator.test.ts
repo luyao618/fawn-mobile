@@ -210,10 +210,47 @@ test("fresh canonical Android and iOS exports pass Hermes validation and local-c
   assert.equal(result.status, "PASS", result.failures.join("; "));
 });
 
-test("G017 source boundary remains exactly 41 unique existing paths", async () => {
-  assert.equal(G017_SOURCE_PATHS.length, 41);
-  assert.equal(new Set(G017_SOURCE_PATHS).size, 41);
-  assert(G017_SOURCE_PATHS.includes(".gitignore"));
+test("G017 source boundary remains exactly 34 unique existing spike-owned paths", async () => {
+  const excludedRootAppPaths = [
+    ".gitignore",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "tools/run-slice0.mjs",
+    "tools/run-typecheck.mjs",
+    "tools/run-expo-doctor-isolated.mjs",
+  ];
+  assert.equal(G017_SOURCE_PATHS.length, 34);
+  assert.equal(new Set(G017_SOURCE_PATHS).size, 34);
+  for (const path of excludedRootAppPaths) assert(!G017_SOURCE_PATHS.includes(path), path);
   assert(G017_SOURCE_PATHS.includes("tools/redaction.d.mts"));
   for (const path of G017_SOURCE_PATHS) await assert.doesNotReject(readFile(resolve(path)), path);
+});
+
+test("G017 fingerprint ignores excluded root-app mutations but changes for spike-owned mutations", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "g017-source-boundary-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const path of G017_SOURCE_PATHS) {
+    await mkdir(resolve(root, path, ".."), { recursive: true });
+    await writeFile(resolve(root, path), await readFile(resolve(path)));
+  }
+
+  const baseline = await computeG017SourceFingerprint(root);
+  for (const path of [
+    ".gitignore",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "tools/run-slice0.mjs",
+    "tools/run-typecheck.mjs",
+    "tools/run-expo-doctor-isolated.mjs",
+  ]) {
+    await mkdir(resolve(root, path, ".."), { recursive: true });
+    await writeFile(resolve(root, path), `root-app mutation: ${path}\n`);
+  }
+  assert.equal(await computeG017SourceFingerprint(root), baseline);
+
+  const ownedPath = "spikes/model-transport/App.tsx";
+  await writeFile(resolve(root, ownedPath), Buffer.concat([await readFile(resolve(root, ownedPath)), Buffer.from("\n// spike-owned mutation\n")]));
+  assert.notEqual(await computeG017SourceFingerprint(root), baseline);
 });
