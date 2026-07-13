@@ -56,6 +56,10 @@ export function validateTestResultInput(status, path, bytes) {
   };
 }
 
+export function collectFaultBundleEvidence(proof, bundles) {
+  return { proof, bundles };
+}
+
 export async function validateNativeReports({ platform, expectedSha, configReports, schemeReports, root = repoRoot }) {
   assert(["android", "ios"].includes(platform), "Native evidence platform must be android or ios");
   const canonicalPaths = NATIVE_EVIDENCE_PATHS[platform];
@@ -127,7 +131,7 @@ async function main() {
     assert.equal(flavor, "static", "Host evidence must represent static gates");
     const faultBundleProof = await loadReport(option("--fault-bundle-proof", null));
     const bundles = await validateFaultBundleProof(faultBundleProof.report, { root: repoRoot, expectedSha });
-    faultBundles = { proof: { path: faultBundleProof.path, sha256: faultBundleProof.sha256 }, bundles };
+    faultBundles = collectFaultBundleEvidence({ path: faultBundleProof.path, sha256: faultBundleProof.sha256 }, bundles);
   }
   if (["android", "ios"].includes(platform)) {
     assert.equal(flavor, "e2e", "Native evidence must represent the final E2E flavor");

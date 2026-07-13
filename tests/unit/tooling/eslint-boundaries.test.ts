@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { ESLint } from "eslint";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const eslint = new ESLint({ overrideConfigFile: "eslint.config.js" });
@@ -113,6 +114,46 @@ test("eval and Function-constructor loading remain rejected", async () => {
       `${filePath} allowed new Function()`,
     );
   }
+});
+
+test("all Metro-resolved App and index variants reject bounded runtime loader surfaces", async () => {
+  const rootVariants = ["App", "App.android", "App.ios", "App.native", "index", "index.android", "index.ios", "index.native"];
+  const probes = [
+    ["direct __r", "void __r(1);"],
+    ["direct __d", "void __d;"],
+    ["direct __c", "const clear = __c; void clear;"],
+    ["nativeRequire alias", "const load = nativeRequire; void load(1);"],
+    ["global member", "const load = global.__r; void load(1);"],
+    ["globalThis computed", 'const load = globalThis["__r"]; void load(1);'],
+    ["computed nativeRequire", 'void global["nativeRequire"](1);'],
+    ["Reflect.get", 'const load = Reflect.get(globalThis, "__d"); void load(1);'],
+    ["Reflect.apply", "void Reflect.apply(nativeRequire, globalThis, [1]);"],
+  ] as const;
+  for (const rootVariant of rootVariants) {
+    for (const extension of sourceExtensions) {
+      const filePath = `${rootVariant}.${extension}`;
+      for (const [label, source] of probes) {
+        const messages = await ruleMessages(filePath, source, "no-restricted-syntax");
+        assert(messages.length >= 1, `${filePath} allowed ${label}`);
+      }
+    }
+  }
+});
+
+test("bounded loader policy ignores inert comments and strings", async () => {
+  const messages = await ruleMessages(
+    "App.native.tsx",
+    'const documentation = "globalThis[\\"__r\\"]";\n/* nativeRequire(1) */\nvoid documentation;',
+    "no-restricted-syntax",
+  );
+  assert.equal(messages.length, 0);
+});
+
+test("npm lint enumerates every Metro-resolved App and index platform variant", async () => {
+  const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+  assert.match(packageJson.scripts.lint, /App\{,\.android,\.ios,\.native}/);
+  assert.match(packageJson.scripts.lint, /index\{,\.android,\.ios,\.native}/);
+  for (const extension of sourceExtensions) assert(packageJson.scripts.lint.includes(extension));
 });
 
 test("base and layer restrictions apply to every JavaScript and TypeScript source extension", async () => {

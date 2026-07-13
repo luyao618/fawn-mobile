@@ -78,6 +78,18 @@ const nonStaticImportSyntax = [
     selector: "TSImportType",
     message: "Production code must not load layer types through import() syntax.",
   },
+  {
+    selector: "Identifier[name=/^(__r|__d|__c|nativeRequire)$/]",
+    message: "Production sources must not access bounded Metro or runtime loader surfaces.",
+  },
+  {
+    selector: "MemberExpression[object.name=/^(global|globalThis)$/][computed=true][property.value=/^(__r|__d|__c|nativeRequire)$/]",
+    message: "Production sources must not access Metro loaders through global computed properties.",
+  },
+  {
+    selector: "CallExpression[callee.object.name='Reflect'][callee.property.name='get'][arguments.0.name=/^(global|globalThis)$/][arguments.1.value=/^(__r|__d|__c|nativeRequire)$/]",
+    message: "Production sources must not retrieve Metro loaders through Reflect.get.",
+  },
 ];
 
 function restrictedImports(paths = [], patterns = []) {
@@ -105,7 +117,11 @@ export default [
     languageOptions: { parser: typescriptParser },
   },
   {
-    files: [`App.${sourceExtensions}`, `index.${sourceExtensions}`, `src/**/*.${sourceExtensions}`],
+    files: [
+      `App{,.android,.ios,.native}.${sourceExtensions}`,
+      `index{,.android,.ios,.native}.${sourceExtensions}`,
+      `src/**/*.${sourceExtensions}`,
+    ],
     rules: {
       "import/no-unresolved": ["error", { ignore: ["^@for-mobile/fault-controller$"] }],
       "no-restricted-imports": restrictedImports(),

@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   assertCleanTrackedStatus,
   CLEAN_REPOSITORY_STATUS_ARGS,
+  collectFaultBundleEvidence,
   validateNativeReports,
   validateTestResultInput,
 } from "../../../tools/collect-ci-evidence.mjs";
@@ -166,4 +167,21 @@ test("same-commit provenance rejects tracked, index, and nonignored untracked di
   assert.throws(() => validateTestResultInput(undefined, "result.log", Buffer.from("output")), /test-result pass/);
   assert.throws(() => validateTestResultInput("pass", null, Buffer.from("output")), /test-result-file/);
   assert.throws(() => validateTestResultInput("pass", "result.log", Buffer.alloc(0)), /nonempty/);
+});
+
+test("schema-v4 fault bundle collector preserves established sentinel leaves exactly", () => {
+  const leaf = { path: "bundle.js", bytes: 12, sha256: "f".repeat(64), sentinelOccurrences: 1 };
+  const bundles = {
+    android: { production: { ...leaf, sentinelOccurrences: 0 }, e2e: leaf },
+    ios: { production: { ...leaf, sentinelOccurrences: 0 }, e2e: leaf },
+  };
+  const evidence = collectFaultBundleEvidence({ path: "proof.json", sha256: "e".repeat(64) }, bundles);
+  assert.deepEqual(evidence.bundles, bundles);
+  for (const platform of ["android", "ios"] as const) {
+    for (const flavor of ["production", "e2e"] as const) {
+      assert.deepEqual(Object.keys(evidence.bundles[platform][flavor]), ["path", "bytes", "sha256", "sentinelOccurrences"]);
+      assert.equal((evidence.bundles[platform][flavor] as any).observedMarkerCounts, undefined);
+      assert.equal((evidence.bundles[platform][flavor] as any).moduleGraph, undefined);
+    }
+  }
 });
