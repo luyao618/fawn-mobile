@@ -181,6 +181,10 @@ function unwrapExpression(node) {
   return node;
 }
 
+function unwrapChain(node) {
+  return node?.type === "ChainExpression" ? node.expression : node;
+}
+
 function propertyName(member) {
   if (member?.type !== "MemberExpression") return null;
   if (!member.computed && member.property.type === "Identifier") return member.property.name;
@@ -188,12 +192,12 @@ function propertyName(member) {
 }
 
 function member(node, objectName, memberName) {
-  const value = unwrapExpression(node);
+  const value = unwrapChain(node);
   return value?.type === "MemberExpression" && identifier(value.object, objectName) && propertyName(value) === memberName;
 }
 
 function dependencyMapIndex(node, mapName) {
-  const value = unwrapExpression(node);
+  const value = unwrapChain(node);
   if (value?.type !== "MemberExpression" || !value.computed || !identifier(value.object, mapName)) return null;
   return Number.isSafeInteger(value.property?.value) && value.property.value >= 0 ? value.property.value : null;
 }
@@ -224,7 +228,7 @@ function parseMetroBundle(bytes, label) {
   const modules = [];
   const roots = [];
   for (const statement of program.body) {
-    const call = statement.type === "ExpressionStatement" ? unwrapExpression(statement.expression) : null;
+    const call = statement.type === "ExpressionStatement" ? directCall(statement.expression) : null;
     if (call?.type !== "CallExpression" || call.callee.type !== "Identifier") continue;
     if (call.callee.name === "__r") {
       assert.equal(call.arguments.length, 1, `${label} Metro __r root is malformed`);
@@ -235,7 +239,8 @@ function parseMetroBundle(bytes, label) {
     if (call.callee.name === "__d") {
       assert.equal(call.arguments.length, 3, `${label} Metro __d wrapper is malformed`);
       const [factory, idNode, dependencyNode] = call.arguments;
-      assert(factory?.type === "FunctionExpression" && factory.body.type === "BlockStatement", `${label} Metro __d factory is invalid`);
+      assert(factory?.type === "FunctionExpression" && !factory.async && !factory.generator
+        && factory.body.type === "BlockStatement", `${label} Metro __d factory is invalid`);
       assert(factory.params.length >= 7 && factory.params.every((parameter) => parameter.type === "Identifier"), `${label} Metro __d factory parameters are invalid`);
       const moduleId = idNode?.value;
       assert(Number.isSafeInteger(moduleId) && moduleId >= 0, `${label} Metro module ID is invalid`);
@@ -253,6 +258,8 @@ function parseMetroBundle(bytes, label) {
         dependencies,
         factory,
         requireName: factory.params[1].name,
+        moduleName: factory.params[4].name,
+        exportsName: factory.params[5].name,
         dependencyMapName: factory.params[6].name,
       });
     }
@@ -272,9 +279,9 @@ function parseMetroBundle(bytes, label) {
       if (statement.type === "ReturnStatement" || statement.type === "ThrowStatement") break;
       const expressions = statement.type === "VariableDeclaration"
         ? statement.declarations.map(({ init }) => init)
-        : statement.type === "ExpressionStatement" ? [unwrapExpression(statement.expression)] : [];
+        : statement.type === "ExpressionStatement" ? [directCall(statement.expression)] : [];
       for (const expression of expressions) {
-        const call = expression?.type === "CallExpression" && identifier(unwrapExpression(expression.callee), module.requireName)
+        const call = expression?.type === "CallExpression" && identifier(unwrapChain(expression.callee), module.requireName)
           ? expression
           : null;
         if (!call) continue;
@@ -365,6 +372,99 @@ function bindingIsImmutable(scope, name, definition, includeMembers = false) {
     && (!includeMembers || bindingMemberWrites(scope, name).length === 0);
 }
 
+function isIdentifierReference(node, parent) {
+  if (!parent) return true;
+  if (parent.type === "MemberExpression" && parent.property === node && !parent.computed) return false;
+  if (parent.type === "Property" && parent.key === node && !parent.computed && !parent.shorthand) return false;
+  if (["MethodDefinition", "PropertyDefinition"].includes(parent.type) && parent.key === node && !parent.computed) return false;
+  if (parent.type === "LabeledStatement" && parent.label === node) return false;
+  if (["BreakStatement", "ContinueStatement"].includes(parent.type) && parent.label === node) return false;
+  return true;
+}
+
+function bindingReferences(scope, name, definition) {
+  const definitionNodes = new Set();
+  walkAst(definition, (node) => definitionNodes.add(node));
+  return astNodes(scope, (node, parent) => identifier(node, name)
+    && !definitionNodes.has(node) && isIdentifierReference(node, parent));
+}
+
+function assertExactReferences(scope, name, definition, expectedReferences, label) {
+  const definitions = bindingDefinitions(scope, name);
+  assert(definitions.length === 1 && definitions[0] === definition, `${label} binding must be unique and unshadowed`);
+  const expected = new Set(expectedReferences);
+  assert([...expected].every((node) => identifier(node, name)), `${label} expected reference set is invalid`);
+  const actual = bindingReferences(scope, name, definition);
+  assert(actual.length === expected.size && actual.every((node) => expected.has(node)),
+    `${label} binding must be closed to its exact allowed references`);
+}
+
+function assertExactBindingReferences(scope, name, definition, expectedReferences, label) {
+  assert(bindingIsImmutable(scope, name, definition), `${label} binding must be immutable and unshadowed`);
+  assertExactReferences(scope, name, definition, expectedReferences, label);
+}
+
+function hasFunctionFlags(fn, isAsync, isGenerator = false) {
+  return Boolean(fn) && Boolean(fn.async) === isAsync && Boolean(fn.generator) === isGenerator;
+}
+
+function assertCanonicalMetroImports(module, label) {
+  const requireDefinition = module.factory.params[1];
+  const mapDefinition = module.factory.params[6];
+  assert(identifier(requireDefinition, module.requireName) && identifier(mapDefinition, module.dependencyMapName)
+    && new Set(module.factory.params.map((parameter) => parameter.name)).size === module.factory.params.length,
+  `${label} Metro factory parameters must be distinct canonical bindings`);
+  const requireReferences = [];
+  const mapReferences = [];
+  const addCanonicalCall = (call) => {
+    assert.equal(call.arguments.length, 1, `${label} Metro dependency import must have one argument`);
+    const dependencyIndex = dependencyMapIndex(call.arguments[0], module.dependencyMapName);
+    assert.notEqual(dependencyIndex, null, `${label} Metro dependency import must use a direct dependency-map member`);
+    requireReferences.push(call.callee);
+    mapReferences.push(unwrapChain(call.arguments[0]).object);
+  };
+  const addCanonicalCalls = (scope) => {
+    for (const call of astNodes(scope, (node) => node.type === "CallExpression" && identifier(node.callee, module.requireName))) {
+      addCanonicalCall(call);
+    }
+  };
+  let terminated = false;
+  for (const statement of module.factory.body.body) {
+    if (terminated) {
+      addCanonicalCalls(statement);
+      continue;
+    }
+    if (statement.type === "ReturnStatement" || statement.type === "ThrowStatement") {
+      terminated = true;
+      continue;
+    }
+    if (statement.type === "IfStatement" && literal(statement.test, false) && !statement.alternate) {
+      addCanonicalCalls(statement.consequent);
+      continue;
+    }
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations) {
+      const call = directCall(declaration.init);
+      if (!call || !identifier(call.callee, module.requireName)) continue;
+      addCanonicalCall(call);
+    }
+  }
+  assertExactBindingReferences(
+    module.factory,
+    module.requireName,
+    requireDefinition,
+    requireReferences,
+    `${label} Metro require parameter`,
+  );
+  assertExactBindingReferences(
+    module.factory,
+    module.dependencyMapName,
+    mapDefinition,
+    mapReferences,
+    `${label} Metro dependency-map parameter`,
+  );
+}
+
 function topLevelVariable(module, name, label, { before, includeMembers = false } = {}) {
   const matches = [];
   for (const [statementIndex, statement] of module.factory.body.body.entries()) {
@@ -384,7 +484,8 @@ function topLevelVariable(module, name, label, { before, includeMembers = false 
   return match;
 }
 
-function dependencyBinding(module, name, label, before) {
+function dependencyBinding(module, name, label, before, expectedReferences) {
+  assertCanonicalMetroImports(module, label);
   const binding = topLevelVariable(module, name, label, { before, includeMembers: true });
   const call = binding.declaration.init;
   assert(call?.type === "CallExpression" && identifier(call.callee, module.requireName) && call.arguments.length === 1,
@@ -392,12 +493,15 @@ function dependencyBinding(module, name, label, before) {
   const dependencyIndex = dependencyMapIndex(call.arguments[0], module.dependencyMapName);
   assert.notEqual(dependencyIndex, null, `${label} must use the Metro dependency map`);
   assert(module.usedDependencyIndexes.includes(dependencyIndex), `${label} import must be reachable before termination`);
+  if (expectedReferences) {
+    assertExactBindingReferences(module.factory.body, name, binding.declaration.id, expectedReferences, label);
+  }
   return { ...binding, name, dependencyIndex };
 }
 
-function canonicalInteropFunction(module, name, label, before) {
+function canonicalInteropFunction(module, name, label, before, callReference) {
   const fn = functionDeclaration(module, name);
-  assert(fn && fn.params.length === 1 && fn.params[0].type === "Identifier" && fn.body.body.length === 1,
+  assert(hasFunctionFlags(fn, false) && fn.params.length === 1 && fn.params[0].type === "Identifier" && fn.body.body.length === 1,
     `${label} interop helper must be one immutable top-level function`);
   const beforeIndex = module.factory.body.body.findIndex((statement) => statement === before || astNodes(statement, (node) => node === before).length === 1);
   const functionIndex = module.factory.body.body.indexOf(fn);
@@ -413,6 +517,7 @@ function canonicalInteropFunction(module, name, label, before) {
     && properties.length === 1 && properties[0].type === "Property" && properties[0].kind === "init"
     && !properties[0].computed && propertyName({ type: "MemberExpression", computed: false, property: properties[0].key }) === "default"
     && identifier(properties[0].value, parameterName), `${label} interop helper is noncanonical`);
+  assertExactBindingReferences(module.factory.body, name, fn.id, [callReference], `${label} interop helper`);
   return fn;
 }
 
@@ -420,6 +525,24 @@ function namedExportTarget(node, name) {
   const value = unwrapExpression(node);
   if (value?.type !== "MemberExpression" || propertyName(value) !== name) return false;
   return identifier(value.object, "exports") || isModuleExports(value.object);
+}
+
+function plainObjectProperty(property, name) {
+  return property?.type === "Property" && property.kind === "init" && !property.computed
+    && !property.method && !property.shorthand
+    && propertyName({ type: "MemberExpression", computed: false, property: property.key }) === name;
+}
+
+function namedExportGetterValue(descriptor) {
+  if (descriptor?.type !== "ObjectExpression" || descriptor.properties.length !== 2) return null;
+  const enumerable = descriptor.properties.find((property) => plainObjectProperty(property, "enumerable"));
+  const getterProperty = descriptor.properties.find((property) => plainObjectProperty(property, "get"));
+  const getter = getterProperty?.value;
+  if (!enumerable || !literal(enumerable.value, true) || !hasFunctionFlags(getter, false)
+    || getter.type !== "FunctionExpression" || getter.id !== null || getter.params.length !== 0
+    || getter.body.body.length !== 1 || getter.body.body[0].type !== "ReturnStatement"
+    || getter.body.body[0].argument?.type !== "Identifier") return null;
+  return getter.body.body[0].argument;
 }
 
 function finalNamedExport(module, name) {
@@ -441,15 +564,7 @@ function finalNamedExport(module, name) {
     const target = unwrapExpression(expression.arguments[0]);
     const targetsLiveExports = isModuleExports(target) || (identifier(target, "exports") && !exportsDetached);
     if (!targetsLiveExports) continue;
-    const descriptor = expression.arguments[2];
-    const valueProperty = descriptor.properties.find((property) => property.type === "Property" && identifier(property.key, "value"));
-    const getProperty = descriptor.properties.find((property) => property.type === "Property" && identifier(property.key, "get"));
-    const getterReturns = getProperty?.value?.body?.type === "BlockStatement"
-      ? getProperty.value.body.body.filter((bodyStatement) => bodyStatement.type === "ReturnStatement")
-      : [];
-    if (valueProperty?.type === "Property") value = valueProperty.value;
-    else if (getterReturns.length === 1) value = getterReturns[0].argument;
-    else value = null;
+    value = namedExportGetterValue(expression.arguments[2]);
   }
   return value;
 }
@@ -457,47 +572,62 @@ function finalNamedExport(module, name) {
 function assertClosedExports(module, allowedNames, label) {
   const allowed = new Set(["__esModule", ...allowedNames]);
   const definitions = new Map();
-  const parents = new Map();
-  walkAst(module.factory.body, (node, parent) => parents.set(node, parent));
-  const isExportObject = (node) => identifier(node, "exports") || isModuleExports(node);
-  const topLevelStatement = (node) => {
-    let current = node;
-    while (parents.get(current) && parents.get(current) !== module.factory.body) current = parents.get(current);
-    return parents.get(current) === module.factory.body ? current : null;
+  const moduleReferences = [];
+  const exportsReferences = [];
+  const exportObject = (node) => {
+    const value = unwrapChain(node);
+    if (identifier(value, module.exportsName)) return { moduleReference: null, exportsReference: value };
+    if (value?.type === "MemberExpression" && identifier(value.object, module.moduleName)
+      && propertyName(value) === "exports") return { moduleReference: value.object, exportsReference: null };
+    return null;
   };
-  walkAst(module.factory.body, (node, parent) => {
-    if (identifier(node, "exports") && parent?.type === "MemberExpression" && !parent.computed
-      && identifier(parent.object, "module") && parent.property === node) return;
-    if (!isExportObject(node)) return;
-    if (parent?.type === "MemberExpression" && parent.object === node) {
-      const assignment = parents.get(parent);
-      const statement = topLevelStatement(assignment);
-      const name = propertyName(parent);
-      assert(assignment?.type === "AssignmentExpression" && assignment.left === parent && assignment.operator === "="
-        && statement?.type === "ExpressionStatement" && statement.expression === assignment
-        && name && allowed.has(name), `${label} contains an unrecognized or non-top-level export assignment`);
+  for (const statement of module.factory.body.body) {
+    const assignment = statement.type === "ExpressionStatement" && statement.expression.type === "AssignmentExpression"
+      ? statement.expression : null;
+    if (assignment) {
+      const target = assignment.left?.type === "MemberExpression" ? exportObject(assignment.left.object) : null;
+      if (!target) continue;
+      const name = propertyName(assignment.left);
+      assert(assignment.operator === "=" && name && allowed.has(name),
+        `${label} contains an unrecognized top-level export assignment`);
+      if (name === "__esModule") assert(literal(assignment.right, true), `${label} __esModule export assignment is invalid`);
+      if (target.moduleReference) moduleReferences.push(target.moduleReference);
+      if (target.exportsReference) exportsReferences.push(target.exportsReference);
       definitions.set(name, (definitions.get(name) ?? 0) + 1);
-      return;
+      continue;
     }
-    if (parent?.type === "CallExpression" && parent.arguments[0] === node) {
-      const statement = topLevelStatement(parent);
-      const name = parent.arguments[1]?.value;
-      assert(member(canonicalCallee(parent.callee), "Object", "defineProperty") && parent.arguments.length === 3
-        && statement?.type === "ExpressionStatement" && directCall(statement.expression) === parent
-        && typeof name === "string" && allowed.has(name) && parent.arguments[2]?.type === "ObjectExpression",
-      `${label} contains an unrecognized or non-top-level export definition`);
-      if (name === "__esModule") {
-        const descriptor = parent.arguments[2];
-        assert(descriptor.properties.length === 1 && descriptor.properties[0].type === "Property"
-          && propertyName({ type: "MemberExpression", computed: descriptor.properties[0].computed, property: descriptor.properties[0].key }) === "value"
-          && literal(descriptor.properties[0].value, true), `${label} __esModule export descriptor is invalid`);
-      }
-      definitions.set(name, (definitions.get(name) ?? 0) + 1);
-      return;
+    const call = expressionCall(statement);
+    const target = call?.arguments.length === 3 ? exportObject(call.arguments[0]) : null;
+    if (!call || !target || !member(call.callee, "Object", "defineProperty")) continue;
+    const name = call.arguments[1]?.value;
+    assert(typeof name === "string" && allowed.has(name) && call.arguments[2]?.type === "ObjectExpression",
+      `${label} contains an unrecognized top-level export definition`);
+    if (name === "__esModule") {
+      const descriptor = call.arguments[2];
+      assert(descriptor.properties.length === 1 && plainObjectProperty(descriptor.properties[0], "value")
+        && literal(descriptor.properties[0].value, true), `${label} __esModule export descriptor is invalid`);
+    } else {
+      assert(namedExportGetterValue(call.arguments[2]), `${label} named export getter descriptor is invalid`);
     }
-    assert.fail(`${label} export object must not be rebound, read, aliased, wrapped, or escaped`);
-  });
+    if (target.moduleReference) moduleReferences.push(target.moduleReference);
+    if (target.exportsReference) exportsReferences.push(target.exportsReference);
+    definitions.set(name, (definitions.get(name) ?? 0) + 1);
+  }
   for (const name of allowed) assert.equal(definitions.get(name), 1, `${label} export ${name} must have one top-level definition`);
+  assertExactBindingReferences(
+    module.factory,
+    module.moduleName,
+    module.factory.params[4],
+    moduleReferences,
+    `${label} module object`,
+  );
+  assertExactBindingReferences(
+    module.factory,
+    module.exportsName,
+    module.factory.params[5],
+    exportsReferences,
+    `${label} exports object`,
+  );
 }
 
 function functionDeclaration(module, name) {
@@ -549,41 +679,234 @@ function jsxCall(node) {
   const method = propertyName(callee);
   if (!call || callee?.type !== "MemberExpression" || !["jsx", "jsxs"].includes(method)
     || callee.object.type !== "Identifier" || call.arguments.length !== 2 || call.arguments[1]?.type !== "ObjectExpression") return null;
-  return { call, runtimeName: callee.object.name, component: call.arguments[0], props: call.arguments[1] };
+  return {
+    call,
+    runtimeName: callee.object.name,
+    runtimeReference: callee.object,
+    component: call.arguments[0],
+    props: call.arguments[1],
+  };
 }
 
 function renderedComponent(expression, componentName) {
   const matches = [];
-  const runtimeNames = new Set();
-  const visit = (value, root = false) => {
+  const runtimeReferences = [];
+  const visit = (value) => {
     if (value?.type === "ArrayExpression") {
-      for (const element of value.elements) visit(element);
-      return true;
+      return value.elements.every((element) => element && visit(element));
     }
     const call = directCall(value);
     if (!call) return false;
     const callee = canonicalCallee(call.callee);
     if (identifier(callee, componentName)) {
-      if (call.arguments.length === 1 && call.arguments[0]?.type === "ObjectExpression") matches.push({ call, props: call.arguments[0] });
+      if (call.arguments.length !== 1 || call.arguments[0]?.type !== "ObjectExpression") return false;
+      matches.push({ call, props: call.arguments[0], componentReference: callee });
       return true;
     }
     const jsx = jsxCall(call);
     if (!jsx) return false;
-    runtimeNames.add(jsx.runtimeName);
-    if (identifier(jsx.component, componentName)) matches.push({ call, props: jsx.props });
-    for (const property of jsx.props.properties) {
-      if (property.type !== "Property" || property.kind !== "init") return false;
-      visit(property.value);
+    if (jsx.props.properties.some((property) => property.type !== "Property" || property.kind !== "init" || property.computed)) return false;
+    runtimeReferences.push(jsx.runtimeReference);
+    if (identifier(jsx.component, componentName)) {
+      matches.push({ call, props: jsx.props, componentReference: jsx.component });
     }
+    const children = objectProperties(jsx.props, "children");
+    if (children.length > 1) return false;
+    if (children.length === 1 && !visit(children[0].value)) return false;
     return true;
   };
-  const validRoot = visit(expression, true);
-  return { matches, runtimeNames: [...runtimeNames], validRoot };
+  const validRoot = visit(expression);
+  return { matches, runtimeReferences, validRoot };
 }
 
-function assertJsxRuntimeBindings(module, runtimeNames, before, label) {
-  assert(runtimeNames.length <= 1, `${label} must use one JSX runtime namespace`);
-  if (runtimeNames.length === 1) dependencyBinding(module, runtimeNames[0], `${label} JSX runtime`, before);
+function assertJsxRuntimeBinding(module, renders, before, label) {
+  const references = renders.flatMap((render) => render.runtimeReferences);
+  const names = new Set(references.map((reference) => reference.name));
+  assert(names.size <= 1, `${label} must use one JSX runtime namespace`);
+  if (names.size === 1) {
+    const [name] = names;
+    dependencyBinding(module, name, `${label} JSX runtime`, before, references);
+  }
+}
+
+function statementAssignment(statement) {
+  return statement?.type === "ExpressionStatement" && statement.expression.type === "AssignmentExpression"
+    ? statement.expression : null;
+}
+
+function hostInstallationEvidence(module, host, label) {
+  const hostParameter = host.params.length === 1 && host.params[0].type === "ObjectPattern" ? host.params[0] : null;
+  const parameterNames = hostParameter?.properties.map((property) => property.type === "Property"
+    && !property.computed && property.key.type === "Identifier" && identifier(property.value, property.key.name)
+    ? property.key.name : null);
+  if (!hostParameter || hostParameter.properties.length !== 2
+    || parameterNames[0] !== "installFaults" || parameterNames[1] !== "children"
+    || host.body.body.length !== 4) return null;
+
+  const useState = [];
+  const useEffects = [];
+  for (const [statementIndex, statement] of host.body.body.entries()) {
+    if (statement.type === "VariableDeclaration") {
+      for (const declaration of statement.declarations) {
+        const call = directCall(declaration.init);
+        const callee = call ? canonicalCallee(call.callee) : null;
+        if (callee?.type === "MemberExpression" && callee.object.type === "Identifier" && propertyName(callee) === "useState") {
+          useState.push({ call, runtimeReference: callee.object, declaration, statementIndex });
+        }
+      }
+    }
+    const call = expressionCall(statement);
+    const callee = call ? canonicalCallee(call.callee) : null;
+    if (callee?.type === "MemberExpression" && callee.object.type === "Identifier" && propertyName(callee) === "useEffect") {
+      useEffects.push({ call, runtimeReference: callee.object, statementIndex });
+    }
+  }
+  if (useState.length !== 1 || useEffects.length !== 1) return null;
+  const state = useState[0];
+  if (state.statementIndex !== 0 || useEffects[0].statementIndex !== 1
+    || state.declaration.id.type !== "ArrayPattern" || state.declaration.id.elements.length !== 2
+    || state.declaration.id.elements.some((element) => element?.type !== "Identifier")
+    || state.call.arguments.length !== 1 || !literal(state.call.arguments[0], null)) return null;
+  const [setupError, setSetupError] = state.declaration.id.elements;
+  const setupGuard = host.body.body[2];
+  const childrenReturn = host.body.body[3];
+  if (setupGuard.type !== "IfStatement" || setupGuard.alternate || !identifier(setupGuard.test, setupError.name)
+    || setupGuard.consequent.type !== "ThrowStatement" || !identifier(setupGuard.consequent.argument, setupError.name)
+    || childrenReturn.type !== "ReturnStatement" || !identifier(childrenReturn.argument, "children")) return null;
+  const effectCall = useEffects[0].call;
+  const effect = effectCall.arguments[0];
+  const dependencies = effectCall.arguments[1];
+  if (useEffects[0].runtimeReference.name !== state.runtimeReference.name || effectCall.arguments.length !== 2
+    || effect?.type !== "ArrowFunctionExpression" || !hasFunctionFlags(effect, false) || effect.params.length !== 0
+    || effect.body.type !== "BlockStatement" || dependencies?.type !== "ArrayExpression"
+    || dependencies.elements.length !== 1 || !identifier(dependencies.elements[0], "installFaults")) return null;
+
+  const body = effect.body.body;
+  if (body.length !== 5) return null;
+  const activeDeclaration = standaloneVariable(body[0], "active");
+  const disposeDeclaration = standaloneVariable(body[1], "dispose");
+  const abortDeclaration = standaloneVariable(body[2], "abortController");
+  const disposeInitializer = disposeDeclaration?.init;
+  const abortInitializer = abortDeclaration?.init;
+  if (!activeDeclaration || !literal(activeDeclaration.init, true)
+    || !disposeDeclaration || disposeInitializer?.type !== "ArrowFunctionExpression"
+    || !hasFunctionFlags(disposeInitializer, false) || disposeInitializer.params.length !== 0
+    || disposeInitializer.body.type !== "BlockStatement" || disposeInitializer.body.body.length !== 0
+    || !abortDeclaration || abortInitializer?.type !== "NewExpression" || !identifier(abortInitializer.callee, "AbortController")
+    || abortInitializer.arguments.length !== 0) return null;
+  const abortControllerReferences = astNodes(module.factory.body, (node, parent) => identifier(node, "AbortController")
+    && isIdentifierReference(node, parent));
+  if (abortControllerReferences.length !== 1 || abortControllerReferences[0] !== abortInitializer.callee
+    || bindingDefinitions(module.factory.body, "AbortController").length !== 0
+    || bindingWrites(module.factory.body, "AbortController").length !== 0) return null;
+
+  const installExpression = body[3]?.type === "ExpressionStatement" ? body[3].expression : null;
+  const catchCall = installExpression?.type === "UnaryExpression" && installExpression.operator === "void"
+    ? directCall(installExpression.argument) : null;
+  const catchCallee = catchCall ? canonicalCallee(catchCall.callee) : null;
+  const thenCall = catchCallee?.type === "MemberExpression" && propertyName(catchCallee) === "catch"
+    ? directCall(catchCallee.object) : null;
+  const thenCallee = thenCall ? canonicalCallee(thenCall.callee) : null;
+  const installCall = thenCallee?.type === "MemberExpression" && propertyName(thenCallee) === "then"
+    ? directCall(thenCallee.object) : null;
+  const onFault = installCall?.arguments[0];
+  const signal = installCall?.arguments[1];
+  const thenCallback = thenCall?.arguments[0];
+  const catchCallback = catchCall?.arguments[0];
+  if (!catchCall || catchCall.arguments.length !== 1 || catchCallback?.type !== "ArrowFunctionExpression"
+    || !hasFunctionFlags(catchCallback, false) || catchCallback.params.length !== 1 || catchCallback.body.type !== "BlockStatement"
+    || catchCallback.body.body.length !== 1 || catchCallback.body.body[0].type !== "IfStatement"
+    || !identifier(catchCallback.body.body[0].test, "active") || catchCallback.body.body[0].alternate
+    || !thenCall || thenCall.arguments.length !== 1 || thenCallback?.type !== "ArrowFunctionExpression"
+    || !hasFunctionFlags(thenCallback, false) || thenCallback.params.length !== 1 || thenCallback.params[0].type !== "Identifier"
+    || thenCallback.body.type !== "BlockStatement" || thenCallback.body.body.length !== 1
+    || !installCall || !identifier(installCall.callee, "installFaults") || installCall.arguments.length !== 2
+    || onFault?.type !== "ArrowFunctionExpression" || !hasFunctionFlags(onFault, false) || onFault.body.type !== "BlockStatement"
+    || signal?.type !== "MemberExpression" || signal.computed || !identifier(signal.object, "abortController")
+    || propertyName(signal) !== "signal") return null;
+
+  const installedDisposeName = thenCallback.params[0].name;
+  const installedFlow = thenCallback.body.body[0];
+  const assignDispose = installedFlow?.type === "IfStatement" ? statementAssignment(installedFlow.consequent) : null;
+  const disposeLate = installedFlow?.type === "IfStatement" ? expressionCall(installedFlow.alternate) : null;
+  const catchFlow = catchCallback.body.body[0];
+  const setErrorCall = expressionCall(catchFlow.consequent);
+  if (installedFlow?.type !== "IfStatement" || !identifier(installedFlow.test, "active") || !installedFlow.alternate
+    || !assignDispose || assignDispose.operator !== "=" || !identifier(assignDispose.left, "dispose")
+    || !identifier(assignDispose.right, installedDisposeName) || !disposeLate
+    || !identifier(canonicalCallee(disposeLate.callee), installedDisposeName) || disposeLate.arguments.length !== 0
+    || !setErrorCall || !identifier(canonicalCallee(setErrorCall.callee), setSetupError.name)
+    || setErrorCall.arguments.length !== 1) return null;
+
+  const cleanupReturn = body[4];
+  const cleanup = cleanupReturn?.type === "ReturnStatement" ? cleanupReturn.argument : null;
+  if (cleanup?.type !== "ArrowFunctionExpression" || !hasFunctionFlags(cleanup, false) || cleanup.params.length !== 0
+    || cleanup.body.type !== "BlockStatement" || cleanup.body.body.length !== 3) return null;
+  const deactivate = statementAssignment(cleanup.body.body[0]);
+  const abortCall = expressionCall(cleanup.body.body[1]);
+  const disposeCall = expressionCall(cleanup.body.body[2]);
+  if (!deactivate || deactivate.operator !== "=" || !identifier(deactivate.left, "active") || !literal(deactivate.right, false)
+    || !abortCall || !callOnIdentifier(abortCall, "abortController", "abort") || abortCall.arguments.length !== 0
+    || !disposeCall || !identifier(canonicalCallee(disposeCall.callee), "dispose") || disposeCall.arguments.length !== 0) return null;
+
+  assertExactReferences(
+    effect,
+    "active",
+    activeDeclaration.id,
+    [installedFlow.test, catchFlow.test, deactivate.left],
+    `${label} host active state`,
+  );
+  const activeWrites = bindingWrites(effect, "active");
+  assert(activeWrites.length === 1 && activeWrites[0] === deactivate, `${label} host active writes are invalid`);
+  assertExactReferences(effect, "dispose", disposeDeclaration.id, [assignDispose.left, disposeCall.callee], `${label} host disposer`);
+  const disposeWrites = bindingWrites(effect, "dispose");
+  assert(disposeWrites.length === 1 && disposeWrites[0] === assignDispose, `${label} host disposer writes are invalid`);
+  assertExactBindingReferences(
+    effect,
+    "abortController",
+    abortDeclaration.id,
+    [signal.object, canonicalCallee(abortCall.callee).object],
+    `${label} host AbortController`,
+  );
+  assertExactBindingReferences(
+    thenCallback,
+    installedDisposeName,
+    thenCallback.params[0],
+    [assignDispose.right, canonicalCallee(disposeLate.callee)],
+    `${label} installed disposer`,
+  );
+  assertExactBindingReferences(
+    host,
+    "installFaults",
+    hostParameter,
+    [dependencies.elements[0], installCall.callee],
+    `${label} host installFaults`,
+  );
+  assertExactBindingReferences(
+    host,
+    setupError.name,
+    state.declaration.id,
+    [setupGuard.test, setupGuard.consequent.argument],
+    `${label} host setup error`,
+  );
+  assertExactBindingReferences(
+    host,
+    setSetupError.name,
+    state.declaration.id,
+    [canonicalCallee(setErrorCall.callee)],
+    `${label} host setup error setter`,
+  );
+  assertExactBindingReferences(
+    host,
+    "children",
+    hostParameter,
+    [childrenReturn.argument],
+    `${label} host children`,
+  );
+  return {
+    runtimeName: state.runtimeReference.name,
+    runtimeReferences: [state.runtimeReference, useEffects[0].runtimeReference],
+  };
 }
 
 function appEvidence(module, graph, label) {
@@ -591,11 +914,11 @@ function appEvidence(module, graph, label) {
   if (!appComposition) return null;
   assertClosedExports(module, ["AppComposition", "default"], `${label} App`);
   const defaultApp = exportedFunction(module, "default");
-  if (!defaultApp || defaultApp.params.length !== 0 || defaultApp.body.body.length !== 1
+  if (!hasFunctionFlags(appComposition, false) || !hasFunctionFlags(defaultApp, false)
+    || defaultApp.params.length !== 0 || defaultApp.body.body.length !== 1
     || defaultApp.body.body[0].type !== "ReturnStatement") return null;
   const appRender = renderedComponent(defaultApp.body.body[0].argument, "AppComposition");
   if (!appRender.validRoot || appRender.matches.length !== 1 || appRender.matches[0].props.properties.length !== 0) return null;
-  assertJsxRuntimeBindings(module, appRender.runtimeNames, defaultApp, `${label} default App`);
 
   const parameter = appComposition.params.length === 1 ? appComposition.params[0] : null;
   if (parameter?.type !== "ObjectPattern" || parameter.properties.length !== 1) return null;
@@ -607,21 +930,57 @@ function appEvidence(module, graph, label) {
     ? installPattern.right : null;
   if (defaultValue?.type !== "MemberExpression" || defaultValue.computed || propertyName(defaultValue) !== "installFaultController"
     || defaultValue.object.type !== "Identifier" || !bindingIsImmutable(appComposition, "installFaults", parameter)) return null;
-  const controllerBinding = dependencyBinding(module, defaultValue.object.name, `${label} App controller`, appComposition);
+  const controllerBinding = dependencyBinding(
+    module,
+    defaultValue.object.name,
+    `${label} App controller`,
+    appComposition,
+    [defaultValue.object],
+  );
 
   if (appComposition.body.body.length !== 1 || appComposition.body.body[0].type !== "ReturnStatement") return null;
   const hostRender = renderedComponent(appComposition.body.body[0].argument, "FaultControllerHost");
   if (!hostRender.validRoot || hostRender.matches.length !== 1) return null;
-  assertJsxRuntimeBindings(module, hostRender.runtimeNames, appComposition, `${label} AppComposition`);
   const installProperties = objectProperties(hostRender.matches[0].props, "installFaults");
   if (installProperties.length !== 1 || !identifier(installProperties[0].value, "installFaults")) return null;
 
   const host = functionDeclaration(module, "FaultControllerHost");
-  if (!host) return null;
-  const hostParameter = host.params.find((candidate) => candidate.type === "ObjectPattern" && patternContains(candidate, "installFaults"));
-  if (!hostParameter || !bindingIsImmutable(host, "installFaults", hostParameter)) return null;
-  const installs = astNodes(host.body, (node) => node.type === "CallExpression" && identifier(canonicalCallee(node.callee), "installFaults"));
-  if (installs.length !== 1) return null;
+  if (!hasFunctionFlags(host, false)) return null;
+  const hostInstallation = hostInstallationEvidence(module, host, label);
+  if (!hostInstallation) return null;
+  dependencyBinding(
+    module,
+    hostInstallation.runtimeName,
+    `${label} App React runtime`,
+    host,
+    hostInstallation.runtimeReferences,
+  );
+  assertJsxRuntimeBinding(module, [appRender, hostRender], host, `${label} App render chain`);
+
+  const appCompositionExport = finalNamedExport(module, "AppComposition");
+  const defaultExport = finalNamedExport(module, "default");
+  assertExactBindingReferences(
+    module.factory.body,
+    "AppComposition",
+    appComposition.id,
+    [appCompositionExport, appRender.matches[0].componentReference],
+    `${label} AppComposition`,
+  );
+  assertExactBindingReferences(module.factory.body, "App", defaultApp.id, [defaultExport], `${label} default App`);
+  assertExactBindingReferences(
+    module.factory.body,
+    "FaultControllerHost",
+    host.id,
+    [hostRender.matches[0].componentReference],
+    `${label} FaultControllerHost`,
+  );
+  assertExactBindingReferences(
+    appComposition,
+    "installFaults",
+    parameter,
+    [installProperties[0].value],
+    `${label} AppComposition installFaults`,
+  );
   return { module, controller: resolveDependency(graph, module, controllerBinding.dependencyIndex, `${label} App controller`) };
 }
 
@@ -644,11 +1003,31 @@ function rootRegistersApp(graph, app, label) {
       assert(interopCall?.type === "CallExpression" && interopCall.arguments.length === 1
         && interopCall.arguments[0]?.type === "Identifier" && canonicalCallee(interopCall.callee)?.type === "Identifier",
       `${label} root App interop call is invalid`);
-      const helperName = canonicalCallee(interopCall.callee).name;
-      canonicalInteropFunction(root, helperName, `${label} root`, appInterop.statement);
+      const helperReference = canonicalCallee(interopCall.callee);
+      const helperName = helperReference.name;
+      canonicalInteropFunction(root, helperName, `${label} root`, appInterop.statement, helperReference);
       const importedName = interopCall.arguments[0].name;
-      const appBinding = dependencyBinding(root, importedName, `${label} root App import`, appInterop.statement);
-      const runtimeBinding = dependencyBinding(root, callee.object.name, `${label} root runtime import`, statement);
+      const appBinding = dependencyBinding(
+        root,
+        importedName,
+        `${label} root App import`,
+        appInterop.statement,
+        [interopCall.arguments[0]],
+      );
+      const runtimeBinding = dependencyBinding(
+        root,
+        callee.object.name,
+        `${label} root runtime import`,
+        statement,
+        [callee.object],
+      );
+      assertExactBindingReferences(
+        root.factory.body,
+        argument.object.name,
+        appInterop.declaration.id,
+        [argument.object],
+        `${label} root App interop result`,
+      );
       const importedApp = resolveDependency(graph, root, appBinding.dependencyIndex, `${label} root App`);
       resolveDependency(graph, root, runtimeBinding.dependencyIndex, `${label} root runtime`);
       if (importedApp.moduleId === app.moduleId) registrations.push({ root, call });
@@ -670,7 +1049,7 @@ function callOnIdentifier(call, objectName, methodName) {
 
 function linkingCall(call, runtimeName, methodName) {
   const callee = call ? canonicalCallee(call.callee) : null;
-  const linking = callee?.type === "MemberExpression" ? unwrapExpression(callee.object) : null;
+  const linking = callee?.type === "MemberExpression" ? unwrapChain(callee.object) : null;
   return propertyName(callee) === methodName && linking?.type === "MemberExpression" && !linking.computed
     && propertyName(linking) === "Linking" && identifier(linking.object, runtimeName);
 }
@@ -682,7 +1061,8 @@ function expressionCall(statement) {
 function listenerEvidence(module, graph, label) {
   assertClosedExports(module, ["E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL", "installFaultController"], `${label} listener`);
   const install = exportedFunction(module, "installFaultController");
-  assert(install?.async && install.params.length === 2 && install.params.every((parameter) => parameter.type === "Identifier"),
+  assert(hasFunctionFlags(install, true) && install.params.length === 2
+    && install.params.every((parameter) => parameter.type === "Identifier"),
     `${label} listener final installFaultController export is invalid`);
   const [onFaultName, signalName] = install.params.map((parameter) => parameter.name);
   assert(bindingIsImmutable(install, onFaultName, install.params[0]) && bindingIsImmutable(install, signalName, install.params[1]),
@@ -692,7 +1072,8 @@ function listenerEvidence(module, graph, label) {
 
   const noOpExport = topLevelVariable(module, "noOp", `${label} listener no-op`, { before: install });
   const noOp = noOpExport.declaration.init;
-  assert(noOp?.type === "ArrowFunctionExpression" && noOp.params.length === 0 && noOp.body.type === "BlockStatement"
+  assert(noOp?.type === "ArrowFunctionExpression" && hasFunctionFlags(noOp, false)
+    && noOp.params.length === 0 && noOp.body.type === "BlockStatement"
     && noOp.body.body.length === 0, `${label} listener no-op is invalid`);
   const initialGuard = body[0];
   assert(initialGuard.type === "IfStatement" && !initialGuard.alternate && member(initialGuard.test, signalName, "aborted")
@@ -707,7 +1088,7 @@ function listenerEvidence(module, graph, label) {
   const handlerDeclaration = standaloneVariable(body[3], "handleUrl");
   const handler = handlerDeclaration?.init;
   const handlerParameter = handler?.params?.length === 1 ? handler.params[0] : null;
-  assert(handler?.type === "ArrowFunctionExpression" && !handler.async && handlerParameter?.type === "ObjectPattern"
+  assert(handler?.type === "ArrowFunctionExpression" && hasFunctionFlags(handler, false) && handlerParameter?.type === "ObjectPattern"
     && handlerParameter.properties.length === 1 && handlerParameter.properties[0].type === "Property"
     && identifier(handlerParameter.properties[0].key, "url") && identifier(handlerParameter.properties[0].value, "url")
     && handler.body.type === "BlockStatement" && handler.body.body.length === 3,
@@ -728,7 +1109,13 @@ function listenerEvidence(module, graph, label) {
     && propertyName(parserCallee) === "parseFaultUrl" && parserCall.arguments.length === 1 && identifier(parserCall.arguments[0], "url"),
   `${label} listener parser delivery binding is invalid`);
   assert(bindingIsImmutable(handler, "request", requestDeclaration.id), `${label} listener parser result must be immutable and unshadowed`);
-  const parserBinding = dependencyBinding(module, parserCallee.object.name, `${label} listener parser`, install);
+  const parserBinding = dependencyBinding(
+    module,
+    parserCallee.object.name,
+    `${label} listener parser`,
+    install,
+    [parserCallee.object],
+  );
 
   const delivery = handler.body.body[2];
   const deliveryCall = delivery?.type === "IfStatement" && !delivery.alternate && identifier(delivery.test, "request")
@@ -739,25 +1126,23 @@ function listenerEvidence(module, graph, label) {
   const registration = standaloneVariable(body[4], "subscription");
   const registrationCall = registration?.init;
   const registrationCallee = registrationCall?.type === "CallExpression" ? canonicalCallee(registrationCall.callee) : null;
-  const registrationLinking = registrationCallee?.type === "MemberExpression" ? unwrapExpression(registrationCallee.object) : null;
+  const registrationLinking = registrationCallee?.type === "MemberExpression" ? unwrapChain(registrationCallee.object) : null;
   const runtimeName = registrationLinking?.type === "MemberExpression" && propertyName(registrationLinking) === "Linking"
     && registrationLinking.object.type === "Identifier" ? registrationLinking.object.name : null;
   assert(runtimeName && linkingCall(registrationCall, runtimeName, "addEventListener") && registrationCall.arguments.length === 2
     && literal(registrationCall.arguments[0], "url") && identifier(registrationCall.arguments[1], "handleUrl"),
   `${label} listener URL registration is invalid`);
-  const runtimeBinding = dependencyBinding(module, runtimeName, `${label} listener runtime`, install);
-  resolveDependency(graph, module, runtimeBinding.dependencyIndex, `${label} listener runtime`);
-
   const disposeDeclaration = standaloneVariable(body[5], "dispose");
   const dispose = disposeDeclaration?.init;
-  assert(dispose?.type === "ArrowFunctionExpression" && dispose.params.length === 0 && dispose.body.type === "BlockStatement"
+  assert(dispose?.type === "ArrowFunctionExpression" && hasFunctionFlags(dispose, false)
+    && dispose.params.length === 0 && dispose.body.type === "BlockStatement"
     && dispose.body.body.length === 5, `${label} listener disposer is invalid`);
   const [removedGuard, deactivate, markRemoved, abortRemoval, subscriptionRemoval] = dispose.body.body;
   assert(removedGuard.type === "IfStatement" && !removedGuard.alternate && identifier(removedGuard.test, "removed")
     && removedGuard.consequent.type === "ReturnStatement" && removedGuard.consequent.argument === null,
   `${label} listener disposer guard is invalid`);
-  const deactivateAssignment = deactivate.type === "ExpressionStatement" ? unwrapExpression(deactivate.expression) : null;
-  const removedAssignment = markRemoved.type === "ExpressionStatement" ? unwrapExpression(markRemoved.expression) : null;
+  const deactivateAssignment = statementAssignment(deactivate);
+  const removedAssignment = statementAssignment(markRemoved);
   assert(deactivateAssignment?.type === "AssignmentExpression" && deactivateAssignment.operator === "="
     && identifier(deactivateAssignment.left, "active") && literal(deactivateAssignment.right, false)
     && removedAssignment?.type === "AssignmentExpression" && removedAssignment.operator === "="
@@ -798,6 +1183,16 @@ function listenerEvidence(module, graph, label) {
   const initialCall = initialUrl?.init?.type === "AwaitExpression" ? directCall(initialUrl.init.argument) : null;
   assert(initialCall && linkingCall(initialCall, runtimeName, "getInitialURL") && initialCall.arguments.length === 0,
     `${label} listener initial URL lookup is invalid`);
+  const initialCallee = canonicalCallee(initialCall.callee);
+  const initialLinking = initialCallee?.type === "MemberExpression" ? unwrapChain(initialCallee.object) : null;
+  const runtimeBinding = dependencyBinding(
+    module,
+    runtimeName,
+    `${label} listener runtime`,
+    install,
+    [registrationLinking.object, initialLinking.object],
+  );
+  resolveDependency(graph, module, runtimeBinding.dependencyIndex, `${label} listener runtime`);
   const initialDispatch = initialFlow.block.body[1];
   const initialDispatchCall = initialDispatch.type === "IfStatement" && !initialDispatch.alternate && identifier(initialDispatch.test, "url")
     ? expressionCall(initialDispatch.consequent) : null;
@@ -819,6 +1214,27 @@ function listenerEvidence(module, graph, label) {
   assert(identifier(sentinelExport, "E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL"), `${label} listener sentinel export is invalid`);
   const sentinel = topLevelVariable(module, "E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL", `${label} listener sentinel`);
   assert(literal(sentinel.declaration.init, FAULT_CONTROLLER_SENTINEL), `${label} listener sentinel binding is invalid`);
+  assertExactBindingReferences(
+    module.factory.body,
+    "installFaultController",
+    install.id,
+    [finalNamedExport(module, "installFaultController")],
+    `${label} listener install export`,
+  );
+  assertExactBindingReferences(
+    module.factory.body,
+    "noOp",
+    noOpExport.declaration.id,
+    [initialGuard.consequent.argument],
+    `${label} listener no-op`,
+  );
+  assertExactBindingReferences(
+    module.factory.body,
+    "E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL",
+    sentinel.declaration.id,
+    [sentinelExport],
+    `${label} listener sentinel`,
+  );
   const sentinelLiterals = astNodes(module.factory.body, (node) => literal(node, FAULT_CONTROLLER_SENTINEL));
   assert.equal(sentinelLiterals.length, 1, `${label} listener sentinel must be one live literal`);
   return {
@@ -841,7 +1257,8 @@ function parserEvidence(module, graph, label) {
   assertClosedExports(module, ["FAULT_POINTS", "canonicalFaultUrl", "parseFaultUrl"], `${label} parser`);
   const canonical = exportedFunction(module, "canonicalFaultUrl");
   const parser = exportedFunction(module, "parseFaultUrl");
-  if (!canonical || !parser || canonical.params.length !== 1 || parser.params.length !== 1
+  if (!hasFunctionFlags(canonical, false) || !hasFunctionFlags(parser, false)
+    || canonical.params.length !== 1 || parser.params.length !== 1
     || !identifier(canonical.params[0], "point") || !identifier(parser.params[0], "value")
     || !bindingIsImmutable(canonical, "point", canonical.params[0]) || !bindingIsImmutable(parser, "value", parser.params[0])) return null;
   if (canonical.body.body.length !== 2 || parser.body.body.length !== 4) return null;
@@ -882,13 +1299,20 @@ function parserEvidence(module, graph, label) {
   if (!bindingIsImmutable(parser, "match", matchDeclaration.id) || !bindingIsImmutable(parser, "request", requestDeclaration.id)) return null;
 
   const faultPointsBinding = topLevelVariable(module, "faultPoints", `${label} parser interop result`, { includeMembers: true });
-  const registryBinding = dependencyBinding(module, "_faultPointsJson", `${label} parser registry import`, faultPointsBinding.statement);
   const faultPointsImport = faultPointsBinding.declaration.init;
+  const interopReference = faultPointsImport?.type === "CallExpression" ? canonicalCallee(faultPointsImport.callee) : null;
   const interopName = faultPointsImport?.type === "CallExpression" && faultPointsImport.arguments.length === 1
-    && identifier(faultPointsImport.arguments[0], "_faultPointsJson") && canonicalCallee(faultPointsImport.callee)?.type === "Identifier"
-    ? canonicalCallee(faultPointsImport.callee).name : null;
+    && identifier(faultPointsImport.arguments[0], "_faultPointsJson") && interopReference?.type === "Identifier"
+    ? interopReference.name : null;
   if (!interopName) return null;
-  canonicalInteropFunction(module, interopName, `${label} parser`, faultPointsBinding.statement);
+  const registryBinding = dependencyBinding(
+    module,
+    "_faultPointsJson",
+    `${label} parser registry import`,
+    faultPointsBinding.statement,
+    [faultPointsImport.arguments[0]],
+  );
+  canonicalInteropFunction(module, interopName, `${label} parser`, faultPointsBinding.statement, interopReference);
 
   const frozenBinding = topLevelVariable(module, "FAULT_POINTS", `${label} parser frozen registry`, { includeMembers: true });
   const allowedBinding = topLevelVariable(module, "allowed", `${label} parser allowlist`, { before: canonical, includeMembers: true });
@@ -904,13 +1328,52 @@ function parserEvidence(module, graph, label) {
     || !member(frozenPoints.arguments[0].elements[0].argument, "faultPoints", "default")
     || allowed?.type !== "NewExpression" || !identifier(allowed.callee, "Set") || allowed.arguments.length !== 1
     || !identifier(allowed.arguments[0], "FAULT_POINTS") || !identifier(finalNamedExport(module, "FAULT_POINTS"), "FAULT_POINTS")) return null;
+  const faultPointsReference = unwrapChain(frozenPoints.arguments[0].elements[0].argument).object;
+  const canonicalAllowed = directCall(canonicalGuard.test.argument);
+  const parserAllowed = directCall(guardTest.right.argument);
+  assertExactBindingReferences(
+    module.factory.body,
+    "canonicalFaultUrl",
+    canonical.id,
+    [finalNamedExport(module, "canonicalFaultUrl"), canonicalCallee(canonicalCall.callee)],
+    `${label} canonical fault URL`,
+  );
+  assertExactBindingReferences(
+    module.factory.body,
+    "parseFaultUrl",
+    parser.id,
+    [finalNamedExport(module, "parseFaultUrl")],
+    `${label} parser export`,
+  );
+  assertExactBindingReferences(
+    module.factory.body,
+    "faultPoints",
+    faultPointsBinding.declaration.id,
+    [faultPointsReference],
+    `${label} parser interop result`,
+  );
+  assertExactBindingReferences(
+    module.factory.body,
+    "FAULT_POINTS",
+    frozenBinding.declaration.id,
+    [finalNamedExport(module, "FAULT_POINTS"), allowed.arguments[0]],
+    `${label} frozen fault points`,
+  );
+  assertExactBindingReferences(
+    module.factory.body,
+    "allowed",
+    allowedBinding.declaration.id,
+    [canonicalCallee(canonicalAllowed.callee).object, canonicalCallee(parserAllowed.callee).object],
+    `${label} parser allowlist`,
+  );
   return { module, registry: resolveDependency(graph, module, registryBinding.dependencyIndex, `${label} parser registry`) };
 }
 
 function registryValue(module) {
   if (module.factory.body.body.length !== 1) return null;
   const statement = module.factory.body.body[0];
-  const assignment = statement.type === "ExpressionStatement" ? unwrapExpression(statement.expression) : null;
+  const assignment = statement.type === "ExpressionStatement" && statement.expression.type === "AssignmentExpression"
+    ? statement.expression : null;
   const value = assignment?.type === "AssignmentExpression" && assignment.operator === "=" && isModuleExports(assignment.left)
     ? assignment.right
     : null;
@@ -920,13 +1383,32 @@ function registryValue(module) {
 
 function noOpController(module) {
   assertClosedExports(module, ["installFaultController"], "production controller");
+  assertCanonicalMetroImports(module, "production controller");
   const install = exportedFunction(module, "installFaultController");
-  if (!install?.async || install.body.body.length !== 1 || install.body.body[0].type !== "ReturnStatement" || install.body.body[0].argument?.type !== "Identifier") return false;
+  if (!hasFunctionFlags(install, true) || install.body.body.length !== 1
+    || install.body.body[0].type !== "ReturnStatement" || install.body.body[0].argument?.type !== "Identifier") return false;
   const noOpName = install.body.body[0].argument.name;
   const binding = topLevelVariable(module, noOpName, "production controller no-op", { before: install });
   const initializer = binding.declaration.init;
-  return ["ArrowFunctionExpression", "FunctionExpression"].includes(initializer?.type) && initializer.params.length === 0
+  const valid = ["ArrowFunctionExpression", "FunctionExpression"].includes(initializer?.type)
+    && hasFunctionFlags(initializer, false) && initializer.params.length === 0
     && initializer.body.type === "BlockStatement" && initializer.body.body.length === 0;
+  if (!valid) return false;
+  assertExactBindingReferences(
+    module.factory.body,
+    "installFaultController",
+    install.id,
+    [finalNamedExport(module, "installFaultController")],
+    "production controller install export",
+  );
+  assertExactBindingReferences(
+    module.factory.body,
+    noOpName,
+    binding.declaration.id,
+    [install.body.body[0].argument],
+    "production controller no-op",
+  );
+  return true;
 }
 
 function moduleGraph(bytes, label, flavor) {

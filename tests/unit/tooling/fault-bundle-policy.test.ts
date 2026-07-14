@@ -27,6 +27,7 @@ const entryModuleId = 505;
 const runtimeModuleId = 900;
 const rootRuntimeModuleId = 901;
 const alternateRuntimeModuleId = 902;
+const appRuntimeModuleId = 903;
 const expectedMarkerCounts = {
   production: Object.fromEntries(markers.map((marker) => [marker, 0])),
   e2e: Object.fromEntries(markers.map((marker) => [
@@ -158,18 +159,48 @@ const parserBody = [
   "}",
 ].join("\n");
 
-const appBody = [
-  'Object.defineProperty(exports, "__esModule", { value: true });',
-  "var _forMobileFaultController = require(_dependencyMap[0]);",
-  "function FaultControllerHost({ installFaults }) {",
-  "  return installFaults((request) => { global.__deliveredFault = request; }, undefined);",
+const hostBody = [
+  "function FaultControllerHost({ installFaults, children }) {",
+  "  var [setupError, setSetupError] = (0, _react.useState)(null);",
+  "  (0, _react.useEffect)(() => {",
+  "    var active = true;",
+  "    var dispose = () => {};",
+  "    var abortController = new AbortController();",
+  "    void installFaults((request) => { global.__deliveredFault = request; }, abortController.signal).then(installedDispose => {",
+  "      if (active) dispose = installedDispose; else installedDispose();",
+  "    }).catch(error => {",
+  "      if (active) setSetupError(asError(error));",
+  "    });",
+  "    return () => {",
+  "      active = false;",
+  "      abortController.abort();",
+  "      dispose();",
+  "    };",
+  "  }, [installFaults]);",
+  "  if (setupError) throw setupError;",
+  "  return children;",
   "}",
+].join("\n");
+
+const compositionBody = [
   "function AppComposition({ installFaults = _forMobileFaultController.installFaultController }) {",
   "  return FaultControllerHost({ installFaults: installFaults });",
   "}",
-  "function App() { return AppComposition({}); }",
+].join("\n");
+
+const appBody = [
+  'Object.defineProperty(exports, "__esModule", { value: true });',
+  'Object.defineProperty(exports, "default", {',
+  "  enumerable: true,",
+  "  get: function () { return App; },",
+  "});",
   "exports.AppComposition = AppComposition;",
-  "exports.default = App;",
+  "var _forMobileFaultController = require(_dependencyMap[0]);",
+  "var _react = require(_dependencyMap[1]);",
+  'function asError(reason) { return reason instanceof Error ? reason : new Error("synthetic setup failure", { cause: reason }); }',
+  hostBody,
+  compositionBody,
+  "function App() { return AppComposition({}); }",
 ].join("\n");
 
 const productionControllerBody = [
@@ -177,6 +208,13 @@ const productionControllerBody = [
   "exports.installFaultController = installFaultController;",
   "var noOp = () => {};",
   "async function installFaultController() { return noOp; }",
+].join("\n");
+
+const appRuntimeBody = [
+  "exports.useState = function useState(value) { return [value, function setValue(next) { global.__hostState = next; }]; };",
+  "exports.useEffect = function useEffect(effect) { global.__hostCleanup = effect(); };",
+  "exports.jsx = function jsx(Component, props) { return typeof Component === 'function' ? Component(props) : null; };",
+  "exports.jsxs = exports.jsx;",
 ].join("\n");
 
 function rootedBundle(controllerId: number, modules: string[]) {
@@ -188,8 +226,9 @@ function rootedBundle(controllerId: number, modules: string[]) {
       "var App = _interopDefault(_App);",
       "_expo.registerRootComponent(App.default);",
     ].join("\n")),
-    metroModule(appModuleId, [controllerId], appBody),
+    metroModule(appModuleId, [controllerId, appRuntimeModuleId], appBody),
     ...modules,
+    metroModule(appRuntimeModuleId, [], appRuntimeBody),
     metroModule(rootRuntimeModuleId, [], [
       "exports.registerRootComponent = function registerRootComponent(App) {",
       "  global.__registeredDefaultApp = App;",
@@ -211,7 +250,7 @@ function e2eBundleSource() {
       "  addEventListener: function addEventListener(type, handler) {",
       "    if (type !== 'url' || typeof handler !== 'function') throw new Error('invalid listener');",
       "    global.__listenerSetupReached = true;",
-      "    return { remove: function remove() {} };",
+      "    return { remove: function remove() { global.__listenerRemoveCount = (global.__listenerRemoveCount ?? 0) + 1; } };",
       "  },",
       "  getInitialURL: async function getInitialURL() { return global.__syntheticInitialUrl ?? null; },",
       "};",
@@ -226,18 +265,32 @@ function productionBundleSource() {
 function jsxAppBundleSource() {
   const jsxAppBody = appBody
     .replace(
-      "var _forMobileFaultController = require(_dependencyMap[0]);",
-      "var _forMobileFaultController = require(_dependencyMap[0]);\nvar _reactJsxRuntime = require(_dependencyMap[1]);",
+      "var _react = require(_dependencyMap[1]);",
+      "var _react = require(_dependencyMap[1]);\nvar _reactJsxRuntime = require(_dependencyMap[1]);",
     )
     .replace(
       "function App() { return AppComposition({}); }",
       "function App() { return (0, _reactJsxRuntime.jsx)(AppComposition, {}); }",
     );
-  return replaceOnce(
-    replaceOnce(e2eBundleSource(), appBody, jsxAppBody),
-    `},${appModuleId},[${listenerModuleId}]);`,
-    `},${appModuleId},[${listenerModuleId},${runtimeModuleId}]);`,
-  );
+  return replaceOnce(e2eBundleSource(), appBody, jsxAppBody);
+}
+
+function jsxCompositionBundleSource(hostProp = "children") {
+  const jsxComposition = [
+    "function Shell({ children }) { return children; }",
+    "function AppComposition({ installFaults = _forMobileFaultController.installFaultController }) {",
+    "  return (0, _reactJsxRuntime.jsx)(Shell, {",
+    `    ${hostProp}: (0, _reactJsxRuntime.jsx)(FaultControllerHost, { installFaults: installFaults }),`,
+    "  });",
+    "}",
+  ].join("\n");
+  const jsxAppBody = appBody
+    .replace(
+      "var _react = require(_dependencyMap[1]);",
+      "var _react = require(_dependencyMap[1]);\nvar _reactJsxRuntime = require(_dependencyMap[1]);",
+    )
+    .replace(compositionBody, jsxComposition);
+  return replaceOnce(e2eBundleSource(), appBody, jsxAppBody);
 }
 
 function sourceWithMarkerCount(flavor: "production" | "e2e", marker: string, count: number) {
@@ -257,6 +310,13 @@ function executeSyntheticBundle(source: string, initialUrl: string | null = null
   const harness = String.raw`
     const factories = new Map();
     const cache = new Map();
+    const NativeAbortController = AbortController;
+    global.AbortController = class SyntheticAbortController extends NativeAbortController {
+      constructor() {
+        super();
+        global.__hostAbortSignal = this.signal;
+      }
+    };
     global.__syntheticInitialUrl = ${JSON.stringify(initialUrl)};
     global.__d = (factory, id, dependencies) => factories.set(id, { factory, dependencies });
     global.__r = (id) => {
@@ -269,16 +329,20 @@ function executeSyntheticBundle(source: string, initialUrl: string | null = null
       return module.exports;
     };
     ${source}
-    Promise.resolve(global.__appExecution).then(() => {
+    Promise.resolve(global.__appExecution).then(() => new Promise((resolve) => setImmediate(resolve))).then(() => {
       if (typeof global.__registeredDefaultApp !== "function") throw new Error("default App was not registered");
       if (!global.__listenerSetupReached) throw new Error("listener setup path was not reached");
+      if (!(global.__hostAbortSignal instanceof AbortSignal)) throw new Error("host did not install with a real AbortSignal");
+      if (global.__hostAbortSignal.aborted) throw new Error("host AbortSignal was not active during installation");
+      if (typeof global.__hostCleanup !== "function") throw new Error("host cleanup was not installed");
       if (global.__syntheticInitialUrl !== null) {
         const expected = { point: ${JSON.stringify(faultPoints[0])}, mode: "crash_once" };
         if (JSON.stringify(global.__deliveredFault) !== JSON.stringify(expected)) throw new Error("active initial URL was not delivered exactly");
-        process.stdout.write("active-url-delivered");
-      } else {
-        process.stdout.write("listener-setup-reached");
       }
+      global.__hostCleanup();
+      if (!global.__hostAbortSignal.aborted) throw new Error("host cleanup did not abort its signal");
+      if (global.__listenerRemoveCount !== 1) throw new Error("host cleanup did not dispose the listener exactly once");
+      process.stdout.write(global.__syntheticInitialUrl === null ? "listener-setup-reached" : "active-url-delivered");
     }).catch((error) => { console.error(error); process.exitCode = 1; });
   `;
   return spawnSync("node", ["-e", harness], { encoding: "utf8" });
@@ -442,6 +506,12 @@ test("bundle proof accepts the immutable imported JSX-runtime App call emitted b
   }, undefined, jsxAppBundleSource());
 });
 
+test("bundle proof follows FaultControllerHost through rendered JSX children", async () => {
+  await withFixture(async ({ root, proof }) => {
+    await validateFaultBundleProof(proof, { root, expectedSha: sha });
+  }, undefined, jsxCompositionBundleSource());
+});
+
 test("reachability ignores dependencies confined to dead branches or after unconditional termination", async (t) => {
   const mutations = [
     ["dead nested branch", "_expo.registerRootComponent(App.default);", "_expo.registerRootComponent(App.default);\nif (false) require(_dependencyMap[2]);"],
@@ -587,8 +657,8 @@ test("listener parser delivery, abort flow, disposal, and Linking receiver rejec
     ],
     [
       "side-effecting pre-install declaration",
-      "  var active = true;",
-      "  var hostile = onFault(null);\n  var active = true;",
+      "  if (signal?.aborted) return noOp;\n  var active = true;",
+      "  if (signal?.aborted) return noOp;\n  var hostile = onFault(null);\n  var active = true;",
     ],
     [
       "runtime Linking object mutation",
@@ -697,6 +767,51 @@ test("selected export objects reject rebinding and wrapped escape paths", async 
   }
 });
 
+test("selected export objects reject computed module aliases", async () => {
+  const source = replaceOnce(
+    e2eBundleSource(),
+    appBody,
+    `${appBody}\nvar moduleAlias = module;\nmoduleAlias["exports"]["default"] = function Other() {};`,
+  );
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "android", "e2e", source);
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /export|module|alias|escape/i);
+  });
+});
+
+test("selected named-export getters require the exact Babel descriptor shape", async (t) => {
+  const mutations = [
+    [
+      "false enumerable default getter",
+      'Object.defineProperty(exports, "default", {\n  enumerable: true,',
+      'Object.defineProperty(exports, "default", {\n  enumerable: false,',
+    ],
+    [
+      "extra default descriptor field",
+      "  get: function () { return App; },\n});",
+      "  get: function () { return App; },\n  configurable: true,\n});",
+    ],
+    [
+      "side effect before sentinel getter return",
+      "  get: function () { return E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL; },",
+      "  get: function () { global.__getterSideEffect = true; return E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL; },",
+    ],
+    [
+      "async FAULT_POINTS getter",
+      "  get: function () { return FAULT_POINTS; },",
+      "  get: async function () { return FAULT_POINTS; },",
+    ],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", replaceOnce(e2eBundleSource(), before, after));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /export|descriptor|getter/i);
+      });
+    });
+  }
+});
+
 test("default App and root registration are bound to AppComposition", async (t) => {
   const mutations = [
     ["default App no-op", "function App() { return AppComposition({}); }", "function App() { return null; }"],
@@ -713,11 +828,6 @@ test("default App and root registration are bound to AppComposition", async (t) 
 });
 
 test("default App, AppComposition, host, and root registration reject inert or mutable chains", async (t) => {
-  const composition = [
-    "function AppComposition({ installFaults = _forMobileFaultController.installFaultController }) {",
-    "  return FaultControllerHost({ installFaults: installFaults });",
-    "}",
-  ].join("\n");
   const mutations: readonly [string, (source: string) => string][] = [
     [
       "inert wrapper receives AppComposition",
@@ -755,7 +865,7 @@ test("default App, AppComposition, host, and root registration reject inert or m
       "AppComposition rewrites installFaults",
       (source) => replaceOnce(
         source,
-        composition,
+        compositionBody,
         [
           "function AppComposition({ installFaults = _forMobileFaultController.installFaultController }) {",
           "  installFaults = async function hostileInstall() { return function hostileDispose() {}; };",
@@ -768,7 +878,7 @@ test("default App, AppComposition, host, and root registration reject inert or m
       "AppComposition never invokes FaultControllerHost",
       (source) => replaceOnce(
         source,
-        composition,
+        compositionBody,
         [
           "function AppComposition({ installFaults = _forMobileFaultController.installFaultController }) {",
           "  return ignore({ installFaults: installFaults });",
@@ -806,6 +916,54 @@ test("default App, AppComposition, host, and root registration reject inert or m
       await withFixture(async ({ root, proof }) => {
         await replaceBundle(root, proof, "ios", "e2e", mutate(e2eBundleSource()));
         await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /App|composition|host|root|interop|JSX|binding/i);
+      });
+    });
+  }
+});
+
+test("App host evidence rejects inert JSX props and dead installation or cleanup paths", async (t) => {
+  const deadHost = [
+    "function FaultControllerHost({ installFaults, children }) {",
+    "  function neverMounted() {",
+    "    var abortController = new AbortController();",
+    "    return installFaults((request) => { global.__deliveredFault = request; }, abortController.signal);",
+    "  }",
+    "  return children;",
+    "}",
+  ].join("\n");
+  const mutations: readonly [string, (source: string) => string][] = [
+    ["FaultControllerHost hidden in an inert JSX prop", () => jsxCompositionBundleSource("inert")],
+    ["installFaults hidden in dead nested code", (source) => replaceOnce(source, hostBody, deadHost)],
+    [
+      "host effect appears after an early return",
+      (source) => replaceOnce(
+        replaceOnce(
+          source,
+          "  (0, _react.useEffect)(() => {",
+          "  return children;\n  (0, _react.useEffect)(() => {",
+        ),
+        "  if (setupError) throw setupError;\n  return children;",
+        "  if (setupError) throw setupError;",
+      ),
+    ],
+    [
+      "installFaults receives no AbortSignal",
+      (source) => replaceOnce(source, "abortController.signal).then", "undefined).then"),
+    ],
+    [
+      "host cleanup neither aborts nor disposes",
+      (source) => replaceOnce(
+        source,
+        "      abortController.abort();\n      dispose();",
+        "      void abortController;\n      void dispose;",
+      ),
+    ],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "android", "e2e", mutate(e2eBundleSource()));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /App|host|render|install|AbortSignal|cleanup/i);
       });
     });
   }
@@ -926,6 +1084,193 @@ test("selected dependency and interop namespaces are unique immutable top-level 
       await withFixture(async ({ root, proof }) => {
         await replaceBundle(root, proof, "android", "e2e", replaceOnce(e2eBundleSource(), before, after));
         await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /binding|namespace|dependency|interop|runtime|parser|App/i);
+      });
+    });
+  }
+});
+
+test("selected imported namespaces reject aliases and call-based mutators", async (t) => {
+  const mutations: readonly [string, (source: string) => string][] = [
+    [
+      "App controller alias through Object.assign",
+      (source) => replaceOnce(
+        source,
+        "var _forMobileFaultController = require(_dependencyMap[0]);",
+        [
+          "var _forMobileFaultController = require(_dependencyMap[0]);",
+          "var controllerAlias = _forMobileFaultController;",
+          "Object.assign(controllerAlias, { installFaultController: async function hostileInstall() { return () => {}; } });",
+        ].join("\n"),
+      ),
+    ],
+    [
+      "listener parser namespace through Reflect.set",
+      (source) => replaceOnce(
+        source,
+        "var _faultContract = require(_dependencyMap[1]);",
+        [
+          "var _faultContract = require(_dependencyMap[1]);",
+          'Reflect.set(_faultContract, "parseFaultUrl", function hostileParser() { return null; });',
+        ].join("\n"),
+      ),
+    ],
+    [
+      "listener runtime alias member mutation",
+      (source) => replaceOnce(
+        source,
+        "var _reactNative = require(_dependencyMap[0]);",
+        [
+          "var _reactNative = require(_dependencyMap[0]);",
+          "var runtimeAlias = _reactNative;",
+          "runtimeAlias.Linking.addEventListener = function hostileAdd() { return { remove() {} }; };",
+        ].join("\n"),
+      ),
+    ],
+    [
+      "root runtime alias through Object.assign",
+      (source) => replaceOnce(
+        source,
+        "var _expo = require(_dependencyMap[0]);",
+        [
+          "var _expo = require(_dependencyMap[0]);",
+          "var expoAlias = _expo;",
+          "Object.assign(expoAlias, { registerRootComponent: function hostileRegister() {} });",
+        ].join("\n"),
+      ),
+    ],
+    [
+      "JSX runtime alias member mutation",
+      () => replaceOnce(
+        jsxAppBundleSource(),
+        "var _reactJsxRuntime = require(_dependencyMap[1]);",
+        [
+          "var _reactJsxRuntime = require(_dependencyMap[1]);",
+          "var jsxAlias = _reactJsxRuntime;",
+          "jsxAlias.jsx = function hostileJsx() { return null; };",
+        ].join("\n"),
+      ),
+    ],
+    [
+      "parser registry namespace alias through Object.assign",
+      (source) => replaceOnce(
+        source,
+        "var _faultPointsJson = require(_dependencyMap[0]);",
+        [
+          "var _faultPointsJson = require(_dependencyMap[0]);",
+          "var registryAlias = _faultPointsJson;",
+          'Object.assign(registryAlias, { 0: "hostile.point" });',
+        ].join("\n"),
+      ),
+    ],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", mutate(e2eBundleSource()));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /binding|namespace|alias|mutation|runtime|parser|App/i);
+      });
+    });
+  }
+});
+
+test("selected Metro factories preserve the canonical require parameter binding", async (t) => {
+  const mutations = [
+    [
+      "require declaration alias",
+      "var _forMobileFaultController = require(_dependencyMap[0]);",
+      "var _forMobileFaultController = require(_dependencyMap[0]);\nvar requireAlias = require;",
+    ],
+    [
+      "require parameter reassignment",
+      "var _forMobileFaultController = require(_dependencyMap[0]);",
+      "var _forMobileFaultController = require(_dependencyMap[0]);\nrequire = function hostileRequire() { return {}; };",
+    ],
+    [
+      "require parameter call-based mutation",
+      "var _forMobileFaultController = require(_dependencyMap[0]);",
+      "var _forMobileFaultController = require(_dependencyMap[0]);\nObject.assign(require, { hostile: true });",
+    ],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "android", "e2e", replaceOnce(e2eBundleSource(), before, after));
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /Metro|require|binding|alias|mutation/i);
+      });
+    });
+  }
+});
+
+test("selected functions reject wrong async or generator flags", async (t) => {
+  const mutations: readonly [string, "production" | "e2e", (source: string) => string][] = [
+    ["async default App", "e2e", (source) => replaceOnce(source, "function App()", "async function App()")],
+    ["generator AppComposition", "e2e", (source) => replaceOnce(source, "function AppComposition(", "function* AppComposition(")],
+    ["async FaultControllerHost", "e2e", (source) => replaceOnce(source, "function FaultControllerHost(", "async function FaultControllerHost(")],
+    ["async parser", "e2e", (source) => replaceOnce(source, "function parseFaultUrl(value)", "async function parseFaultUrl(value)")],
+    [
+      "async-generator listener",
+      "e2e",
+      (source) => replaceOnce(source, "async function installFaultController(onFault, signal)", "async function* installFaultController(onFault, signal)"),
+    ],
+    [
+      "generator root interop helper",
+      "e2e",
+      (source) => replaceOnce(source, "function _interopDefault(value)", "function* _interopDefault(value)"),
+    ],
+    [
+      "async-generator production controller",
+      "production",
+      (source) => replaceOnce(source, "async function installFaultController()", "async function* installFaultController()"),
+    ],
+  ];
+  for (const [name, flavor, mutate] of mutations) {
+    await t.test(name, async () => {
+      const production = flavor === "production" ? mutate(productionBundleSource()) : productionBundleSource();
+      const e2e = flavor === "e2e" ? mutate(e2eBundleSource()) : e2eBundleSource();
+      await withFixture(async ({ root, proof }) => {
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /function|async|generator|App|listener|parser|interop|production/i);
+      }, production, e2e);
+    });
+  }
+});
+
+test("selected evidence rejects sequence-expression side effects", async (t) => {
+  const registryBody = `module.exports = ${JSON.stringify(faultPoints, null, 2)};`;
+  const mutations = [
+    [
+      "dependency-map argument side effect",
+      "require(_dependencyMap[0])",
+      "require((global.__sequenceSideEffect = true, _dependencyMap[0]))",
+    ],
+    [
+      "abort guard side effect",
+      "if (signal?.aborted) return noOp;",
+      "if ((global.__sequenceSideEffect = true, signal?.aborted)) return noOp;",
+    ],
+    [
+      "Linking receiver side effect",
+      'var subscription = _reactNative.Linking.addEventListener("url", handleUrl);',
+      'var subscription = (global.__sequenceSideEffect = true, _reactNative.Linking).addEventListener("url", handleUrl);',
+    ],
+    [
+      "executing Metro root side effect",
+      `__r(${entryModuleId});`,
+      `(global.__sequenceSideEffect = true, __r(${entryModuleId}));`,
+    ],
+    [
+      "registry assignment side effect",
+      registryBody,
+      `(global.__sequenceSideEffect = true, ${registryBody.slice(0, -1)});`,
+    ],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "android", "e2e", replaceOnce(e2eBundleSource(), before, after));
+        await assert.rejects(
+          validateFaultBundleProof(proof, { root, expectedSha: sha }),
+          /sequence|side effect|dependency|listener|binding|runtime|Metro|root|registry/i,
+        );
       });
     });
   }
