@@ -89,7 +89,7 @@ const exactChildPrimaryUploadPaths = {
   ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "f35a836bd6a4971a826f4b17b8c3c82e9ca47bae7ce160296846b89527c9b2bc";
+const exactAndroidRunnerSha256 = "68e590a7b95628d49222d8310cd505957753dd9b7436d6200e6fe0618e9814f7";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -583,6 +583,8 @@ const exactAndroidFailureScreenshotCommand = '    adb -s "$emulator_serial" exec
 const exactAndroidFailureHierarchyCommand = '    adb -s "$emulator_serial" exec-out uiautomator dump /dev/tty > .artifacts/launch/device/android-ui-hierarchy.xml 2>&1';
 const exactAndroidFailureSystemLogCommand = '    adb -s "$emulator_serial" logcat -b all -d > .artifacts/launch/device/android-system.log 2>&1';
 const exactAndroidFailureLastAnrCommand = '    adb -s "$emulator_serial" shell dumpsys activity lastanr > .artifacts/launch/device/android-lastanr.txt 2>&1';
+const exactAndroidFailureRootCommand = '    adb -s "$emulator_serial" root';
+const exactAndroidFailureWaitForDeviceCommand = '    adb -s "$emulator_serial" wait-for-device';
 const exactAndroidFailureAnrFilesCommand = "    adb -s \"$emulator_serial\" shell 'ls -la /data/anr; cat /data/anr/*' > .artifacts/launch/device/android-anr-files.txt 2>&1";
 const exactAndroidFailurePidCommand = String.raw`    app_pid=$(adb -s "$emulator_serial" shell pidof -s com.luyao618.formobile 2>/dev/null | tr -d "\r")`;
 const exactAndroidFailureLogCommand = '      adb -s "$emulator_serial" logcat -d --pid="$app_pid" > .artifacts/launch/device/android-app.log 2>&1';
@@ -592,6 +594,8 @@ const exactAndroidFailureDiagnosticCommands = [
   exactAndroidFailureHierarchyCommand,
   exactAndroidFailureSystemLogCommand,
   exactAndroidFailureLastAnrCommand,
+  exactAndroidFailureRootCommand,
+  exactAndroidFailureWaitForDeviceCommand,
   exactAndroidFailureAnrFilesCommand,
   exactAndroidFailurePidCommand,
   exactAndroidFailureLogCommand,
@@ -813,6 +817,8 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
     exactAndroidFailureHierarchyCommand,
     exactAndroidFailureSystemLogCommand,
     exactAndroidFailureLastAnrCommand,
+    exactAndroidFailureRootCommand,
+    exactAndroidFailureWaitForDeviceCommand,
     exactAndroidFailureAnrFilesCommand,
     exactAndroidFailurePidCommand,
     '    if [ -n "$app_pid" ]; then',
@@ -1407,25 +1413,46 @@ cd "$HARNESS_ROOT"
 emulator_serial=emulator-5554
 metro_pid="$HARNESS_METRO_PID"
 metro_log="$HARNESS_METRO_LOG"
+HARNESS_ADBD_ROOTED=0
+HARNESS_DEVICE_WAITED=0
 adb() {
   command="$*"
   printf '%s\\n' "$command" >> "$HARNESS_ADB_LOG"
+  if [ -n "$HARNESS_FAIL_COMMAND" ] && [[ "$command" == *"$HARNESS_FAIL_COMMAND"* ]]; then
+    return 91
+  fi
   case "$command" in
     *"screencap -p") printf 'png-sentinel' ;;
     *"uiautomator dump /dev/tty") printf 'hierarchy-sentinel' ;;
     *"logcat -b all -d") printf 'system-logcat-sentinel' ;;
     *"dumpsys activity lastanr") printf 'lastanr-sentinel' ;;
-    *"ls -la /data/anr; cat /data/anr/"*) printf 'anr-files-sentinel' ;;
+    *" root") HARNESS_ADBD_ROOTED=1 ;;
+    *" wait-for-device")
+      if [ "$HARNESS_ADBD_ROOTED" -ne 1 ]; then
+        echo 'wait-for-device called before adb root' >&2
+        return 92
+      fi
+      HARNESS_DEVICE_WAITED=1
+      ;;
+    *"ls -la /data/anr; cat /data/anr/"*)
+      if [ "$HARNESS_ADBD_ROOTED" -ne 1 ] || [ "$HARNESS_DEVICE_WAITED" -ne 1 ]; then
+        echo 'cat: /data/anr: Permission denied' >&2
+        return 13
+      fi
+      printf 'anr-files-sentinel'
+      ;;
     *"pidof -s com.luyao618.formobile") printf '%s' "$HARNESS_APP_PID" ;;
     *"logcat -d --pid="*) printf 'pid-logcat-sentinel' ;;
     *"logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V *:S") printf 'logcat-sentinel' ;;
   esac
-  if [ -n "$HARNESS_FAIL_COMMAND" ] && [[ "$command" == *"$HARNESS_FAIL_COMMAND"* ]]; then
-    return 91
-  fi
 }
 kill() { printf 'kill %s\\n' "$*" >> "$HARNESS_ADB_LOG"; }
 wait() { printf 'wait %s\\n' "$*" >> "$HARNESS_ADB_LOG"; }
+if adb -s "$emulator_serial" shell 'ls -la /data/anr; cat /data/anr/*' >/dev/null 2>&1; then
+  echo 'unprivileged /data/anr read unexpectedly succeeded' >&2
+  exit 98
+fi
+: > "$HARNESS_ADB_LOG"
 ${cleanup}
 exit ${status}
 `;
@@ -1463,12 +1490,26 @@ exit ${status}
     assert.equal(await readFile(join(root, ".artifacts/launch/device/android-anr-files.txt"), "utf8"), "anr-files-sentinel");
     assert.equal(await readFile(join(root, ".artifacts/launch/device/android-app.log"), "utf8"), "pid-logcat-sentinel");
     const pidFailureAdbLog = await readFile(adbLog, "utf8");
+    const pidFailureAdbCalls = pidFailureAdbLog.trim().split("\n");
+    for (const exactCall of [
+      "-s emulator-5554 root",
+      "-s emulator-5554 wait-for-device",
+      "-s emulator-5554 shell ls -la /data/anr; cat /data/anr/*",
+    ]) {
+      assert.equal(
+        pidFailureAdbCalls.filter((call) => call === exactCall).length,
+        1,
+        `${exactCall} must run exactly once during failure cleanup`,
+      );
+    }
     ordered(
       pidFailureAdbLog,
       "screencap -p",
       "uiautomator dump /dev/tty",
       "logcat -b all -d",
       "dumpsys activity lastanr",
+      "-s emulator-5554 root",
+      "-s emulator-5554 wait-for-device",
       "ls -la /data/anr; cat /data/anr/*",
       "pidof -s com.luyao618.formobile",
       "logcat -d --pid=1234",
@@ -1488,6 +1529,8 @@ exit ${status}
       ["uiautomator dump /dev/tty", "1234"],
       ["logcat -b all -d", "1234"],
       ["dumpsys activity lastanr", "1234"],
+      ["emulator-5554 root", "1234"],
+      ["wait-for-device", "1234"],
       ["ls -la /data/anr", "1234"],
       ["pidof -s com.luyao618.formobile", "1234"],
       ["logcat -d --pid=", "1234"],
@@ -1794,6 +1837,84 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.throws(
       () => assertAndroidDiagnosticsPolicy(mutatedScript, androidWorkflow),
       /Android cleanup must preserve|failure diagnostic command inventory|non-retried readiness and smoke commands|only the two existing bounded service sleeps|must not dismiss ANR dialogs/,
+    );
+  }
+
+  const androidAnrPrivilegeMutations = [
+    ["removed root", androidRunner.replace(`${exactAndroidFailureRootCommand}\n`, "")],
+    ["removed wait-for-device", androidRunner.replace(`${exactAndroidFailureWaitForDeviceCommand}\n`, "")],
+    ["removed ANR read", androidRunner.replace(`${exactAndroidFailureAnrFilesCommand}\n`, "")],
+    [
+      "root before full logcat",
+      androidRunner.replace(
+        `${exactAndroidFailureSystemLogCommand}\n${exactAndroidFailureLastAnrCommand}\n${exactAndroidFailureRootCommand}`,
+        `${exactAndroidFailureRootCommand}\n${exactAndroidFailureSystemLogCommand}\n${exactAndroidFailureLastAnrCommand}`,
+      ),
+    ],
+    [
+      "root before lastanr",
+      androidRunner.replace(
+        `${exactAndroidFailureLastAnrCommand}\n${exactAndroidFailureRootCommand}`,
+        `${exactAndroidFailureRootCommand}\n${exactAndroidFailureLastAnrCommand}`,
+      ),
+    ],
+    [
+      "wait-for-device before root",
+      androidRunner.replace(
+        `${exactAndroidFailureRootCommand}\n${exactAndroidFailureWaitForDeviceCommand}`,
+        `${exactAndroidFailureWaitForDeviceCommand}\n${exactAndroidFailureRootCommand}`,
+      ),
+    ],
+    [
+      "ANR read before wait-for-device",
+      androidRunner.replace(
+        `${exactAndroidFailureWaitForDeviceCommand}\n${exactAndroidFailureAnrFilesCommand}`,
+        `${exactAndroidFailureAnrFilesCommand}\n${exactAndroidFailureWaitForDeviceCommand}`,
+      ),
+    ],
+    [
+      "duplicated root",
+      androidRunner.replace(
+        exactAndroidFailureRootCommand,
+        `${exactAndroidFailureRootCommand}\n${exactAndroidFailureRootCommand}`,
+      ),
+    ],
+    [
+      "duplicated wait-for-device",
+      androidRunner.replace(
+        exactAndroidFailureWaitForDeviceCommand,
+        `${exactAndroidFailureWaitForDeviceCommand}\n${exactAndroidFailureWaitForDeviceCommand}`,
+      ),
+    ],
+    [
+      "duplicated ANR read",
+      androidRunner.replace(
+        exactAndroidFailureAnrFilesCommand,
+        `${exactAndroidFailureAnrFilesCommand}\n${exactAndroidFailureAnrFilesCommand}`,
+      ),
+    ],
+    [
+      "fail-open root",
+      androidRunner.replace(exactAndroidFailureRootCommand, `${exactAndroidFailureRootCommand} || true`),
+    ],
+    [
+      "fail-open wait-for-device",
+      androidRunner.replace(
+        exactAndroidFailureWaitForDeviceCommand,
+        `${exactAndroidFailureWaitForDeviceCommand} || :`,
+      ),
+    ],
+    [
+      "fail-open ANR read",
+      androidRunner.replace(exactAndroidFailureAnrFilesCommand, `${exactAndroidFailureAnrFilesCommand} || true`),
+    ],
+  ] as const;
+  for (const [label, mutatedScript] of androidAnrPrivilegeMutations) {
+    assert.notEqual(mutatedScript, androidRunner, `${label} fixture must change the runner`);
+    assert.throws(
+      () => assertAndroidDiagnosticsPolicy(mutatedScript, androidWorkflow),
+      /Android cleanup must preserve|failure diagnostic command inventory/,
+      label,
     );
   }
 
