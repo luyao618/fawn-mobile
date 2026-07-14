@@ -14,6 +14,9 @@ cleanup() {
   if [ "$status" -ne 0 ]; then
     adb -s "$emulator_serial" exec-out screencap -p > .artifacts/launch/device/android-failure.png
     adb -s "$emulator_serial" exec-out uiautomator dump /dev/tty > .artifacts/launch/device/android-ui-hierarchy.xml 2>&1
+    adb -s "$emulator_serial" logcat -b all -d > .artifacts/launch/device/android-system.log 2>&1
+    adb -s "$emulator_serial" shell dumpsys activity lastanr > .artifacts/launch/device/android-lastanr.txt 2>&1
+    adb -s "$emulator_serial" shell 'ls -la /data/anr; cat /data/anr/*' > .artifacts/launch/device/android-anr-files.txt 2>&1
     app_pid=$(adb -s "$emulator_serial" shell pidof -s com.luyao618.formobile 2>/dev/null | tr -d "\r")
     if [ -n "$app_pid" ]; then
       adb -s "$emulator_serial" logcat -d --pid="$app_pid" > .artifacts/launch/device/android-app.log 2>&1
