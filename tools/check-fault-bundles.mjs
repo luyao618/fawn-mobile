@@ -192,10 +192,6 @@ function member(node, objectName, memberName) {
   return value?.type === "MemberExpression" && identifier(value.object, objectName) && propertyName(value) === memberName;
 }
 
-function memberCall(node, memberName) {
-  return node?.type === "CallExpression" && propertyName(unwrapExpression(node.callee)) === memberName;
-}
-
 function dependencyMapIndex(node, mapName) {
   const value = unwrapExpression(node);
   if (value?.type !== "MemberExpression" || !value.computed || !identifier(value.object, mapName)) return null;
@@ -293,22 +289,131 @@ function parseMetroBundle(bytes, label) {
   return { modules, roots, byId };
 }
 
-function dependencyBindings(module) {
-  const bindings = [];
-  for (const statement of module.factory.body.body) {
-    if (statement.type !== "VariableDeclaration") continue;
-    for (const declaration of statement.declarations) {
-      const call = declaration.init?.type === "CallExpression" ? declaration.init : null;
-      if (!identifier(declaration.id, declaration.id?.name) || !call || !identifier(unwrapExpression(call.callee), module.requireName)) continue;
-      const dependencyIndex = dependencyMapIndex(call.arguments[0], module.dependencyMapName);
-      if (dependencyIndex !== null) bindings.push({ name: declaration.id.name, dependencyIndex });
-    }
-  }
-  return bindings;
-}
-
 function isModuleExports(node) {
   return member(node, "module", "exports");
+}
+
+function canonicalCallee(node) {
+  let value = node?.type === "ChainExpression" ? node.expression : node;
+  if (value?.type !== "SequenceExpression") return value;
+  if (value.expressions.length !== 2 || !literal(value.expressions[0], 0)) return null;
+  value = value.expressions[1];
+  return value?.type === "ChainExpression" ? value.expression : value;
+}
+
+function directCall(node) {
+  const value = node?.type === "ChainExpression" ? node.expression : node;
+  return value?.type === "CallExpression" ? value : null;
+}
+
+function patternContains(pattern, name) {
+  if (!pattern) return false;
+  if (identifier(pattern, name)) return true;
+  if (pattern.type === "AssignmentPattern") return patternContains(pattern.left, name);
+  if (pattern.type === "RestElement") return patternContains(pattern.argument, name);
+  if (pattern.type === "ArrayPattern") return pattern.elements.some((element) => patternContains(element, name));
+  if (pattern.type === "ObjectPattern") {
+    return pattern.properties.some((property) => property.type === "RestElement"
+      ? patternContains(property.argument, name)
+      : patternContains(property.value, name));
+  }
+  return false;
+}
+
+function bindingDefinitions(scope, name) {
+  const definitions = [];
+  walkAst(scope, (node) => {
+    if (node.type === "VariableDeclarator" && patternContains(node.id, name)) definitions.push(node.id);
+    else if (["FunctionDeclaration", "FunctionExpression", "ClassDeclaration", "ClassExpression"].includes(node.type)
+      && identifier(node.id, name)) definitions.push(node.id);
+    if (["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"].includes(node.type)) {
+      for (const parameter of node.params) if (patternContains(parameter, name)) definitions.push(parameter);
+    }
+    if (node.type === "CatchClause" && patternContains(node.param, name)) definitions.push(node.param);
+  });
+  return definitions;
+}
+
+function bindingWrites(scope, name) {
+  return astNodes(scope, (node) => (
+    node.type === "AssignmentExpression" && patternContains(node.left, name)
+    || node.type === "UpdateExpression" && identifier(node.argument, name)
+    || node.type === "UnaryExpression" && node.operator === "delete" && identifier(node.argument, name)
+    || ["ForInStatement", "ForOfStatement"].includes(node.type)
+      && node.left.type !== "VariableDeclaration" && patternContains(node.left, name)
+  ));
+}
+
+function memberRoot(node) {
+  let value = node?.type === "ChainExpression" ? node.expression : node;
+  while (value?.type === "MemberExpression") value = unwrapExpression(value.object);
+  return value?.type === "Identifier" ? value.name : null;
+}
+
+function bindingMemberWrites(scope, name) {
+  return astNodes(scope, (node) => {
+    if (node.type === "AssignmentExpression") return memberRoot(node.left) === name;
+    if (node.type === "UpdateExpression") return memberRoot(node.argument) === name;
+    return node.type === "UnaryExpression" && node.operator === "delete" && memberRoot(node.argument) === name;
+  });
+}
+
+function bindingIsImmutable(scope, name, definition, includeMembers = false) {
+  const definitions = bindingDefinitions(scope, name);
+  return definitions.length === 1 && definitions[0] === definition
+    && bindingWrites(scope, name).length === 0
+    && (!includeMembers || bindingMemberWrites(scope, name).length === 0);
+}
+
+function topLevelVariable(module, name, label, { before, includeMembers = false } = {}) {
+  const matches = [];
+  for (const [statementIndex, statement] of module.factory.body.body.entries()) {
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations) {
+      if (identifier(declaration.id, name)) matches.push({ declaration, statement, statementIndex });
+    }
+  }
+  assert.equal(matches.length, 1, `${label} binding must have one top-level declaration`);
+  const match = matches[0];
+  assert.equal(match.statement.declarations.length, 1, `${label} binding declaration must be standalone`);
+  assert(bindingIsImmutable(module.factory.body, name, match.declaration.id, includeMembers), `${label} binding must be immutable and unshadowed`);
+  if (before) {
+    const beforeIndex = module.factory.body.body.findIndex((statement) => statement === before || astNodes(statement, (node) => node === before).length === 1);
+    assert(beforeIndex >= 0 && match.statementIndex < beforeIndex, `${label} binding must precede its use`);
+  }
+  return match;
+}
+
+function dependencyBinding(module, name, label, before) {
+  const binding = topLevelVariable(module, name, label, { before, includeMembers: true });
+  const call = binding.declaration.init;
+  assert(call?.type === "CallExpression" && identifier(call.callee, module.requireName) && call.arguments.length === 1,
+    `${label} must be one direct Metro dependency import`);
+  const dependencyIndex = dependencyMapIndex(call.arguments[0], module.dependencyMapName);
+  assert.notEqual(dependencyIndex, null, `${label} must use the Metro dependency map`);
+  assert(module.usedDependencyIndexes.includes(dependencyIndex), `${label} import must be reachable before termination`);
+  return { ...binding, name, dependencyIndex };
+}
+
+function canonicalInteropFunction(module, name, label, before) {
+  const fn = functionDeclaration(module, name);
+  assert(fn && fn.params.length === 1 && fn.params[0].type === "Identifier" && fn.body.body.length === 1,
+    `${label} interop helper must be one immutable top-level function`);
+  const beforeIndex = module.factory.body.body.findIndex((statement) => statement === before || astNodes(statement, (node) => node === before).length === 1);
+  const functionIndex = module.factory.body.body.indexOf(fn);
+  assert(beforeIndex >= 0 && functionIndex >= 0 && functionIndex < beforeIndex, `${label} interop helper must precede its use`);
+  const parameterName = fn.params[0].name;
+  const returned = fn.body.body[0].type === "ReturnStatement" ? fn.body.body[0].argument : null;
+  const test = returned?.type === "ConditionalExpression" ? returned.test : null;
+  const alternate = returned?.type === "ConditionalExpression" ? returned.alternate : null;
+  const properties = alternate?.type === "ObjectExpression" ? alternate.properties : [];
+  assert(test?.type === "LogicalExpression" && test.operator === "&&" && identifier(test.left, parameterName)
+    && test.right.type === "MemberExpression" && !test.right.computed && identifier(test.right.object, parameterName)
+    && propertyName(test.right) === "__esModule" && identifier(returned.consequent, parameterName)
+    && properties.length === 1 && properties[0].type === "Property" && properties[0].kind === "init"
+    && !properties[0].computed && propertyName({ type: "MemberExpression", computed: false, property: properties[0].key }) === "default"
+    && identifier(properties[0].value, parameterName), `${label} interop helper is noncanonical`);
+  return fn;
 }
 
 function namedExportTarget(node, name) {
@@ -351,78 +456,59 @@ function finalNamedExport(module, name) {
 
 function assertClosedExports(module, allowedNames, label) {
   const allowed = new Set(["__esModule", ...allowedNames]);
-  const aliases = new Set(["exports"]);
-  const candidates = astNodes(module.factory.body, (node) => node.type === "VariableDeclarator" && node.id.type === "Identifier");
-  const aliasDeclarations = [];
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const declaration of candidates) {
-      if (aliases.has(declaration.id.name)) continue;
-      const value = unwrapExpression(declaration.init);
-      if (!isModuleExports(value) && !(value?.type === "Identifier" && aliases.has(value.name))) continue;
-      aliases.add(declaration.id.name);
-      aliasDeclarations.push(declaration);
-      changed = true;
-    }
-  }
-  assert.equal(aliasDeclarations.length, 0, `${label} export object must not escape through an alias`);
-
-  const exportReference = (node) => {
-    const value = unwrapExpression(node);
-    return isModuleExports(value) || (value?.type === "Identifier" && aliases.has(value.name));
-  };
   const definitions = new Map();
-  walkAst(module.factory.body, (node) => {
-    if (node.type === "AssignmentExpression") {
-      assert(!isModuleExports(node.left), `${label} must not replace module.exports`);
-      const target = unwrapExpression(node.left);
-      if (target?.type !== "MemberExpression" || !exportReference(target.object)) return;
-      const name = propertyName(target);
-      assert(node.operator === "=" && name && allowed.has(name), `${label} contains an unrecognized export assignment`);
+  const parents = new Map();
+  walkAst(module.factory.body, (node, parent) => parents.set(node, parent));
+  const isExportObject = (node) => identifier(node, "exports") || isModuleExports(node);
+  const topLevelStatement = (node) => {
+    let current = node;
+    while (parents.get(current) && parents.get(current) !== module.factory.body) current = parents.get(current);
+    return parents.get(current) === module.factory.body ? current : null;
+  };
+  walkAst(module.factory.body, (node, parent) => {
+    if (identifier(node, "exports") && parent?.type === "MemberExpression" && !parent.computed
+      && identifier(parent.object, "module") && parent.property === node) return;
+    if (!isExportObject(node)) return;
+    if (parent?.type === "MemberExpression" && parent.object === node) {
+      const assignment = parents.get(parent);
+      const statement = topLevelStatement(assignment);
+      const name = propertyName(parent);
+      assert(assignment?.type === "AssignmentExpression" && assignment.left === parent && assignment.operator === "="
+        && statement?.type === "ExpressionStatement" && statement.expression === assignment
+        && name && allowed.has(name), `${label} contains an unrecognized or non-top-level export assignment`);
       definitions.set(name, (definitions.get(name) ?? 0) + 1);
       return;
     }
-    if (node.type === "UpdateExpression" || node.type === "UnaryExpression" && node.operator === "delete") {
-      const target = unwrapExpression(node.argument);
-      assert(!(target?.type === "MemberExpression" && exportReference(target.object)), `${label} contains an unrecognized export mutation`);
-      return;
-    }
-    if (node.type !== "CallExpression") return;
-    const call = unwrapExpression(node);
-    const defineProperty = member(call.callee, "Object", "defineProperty") && exportReference(call.arguments[0]);
-    if (defineProperty) {
-      const name = call.arguments[1]?.value;
-      assert(typeof name === "string" && allowed.has(name), `${label} defines an unrecognized export`);
+    if (parent?.type === "CallExpression" && parent.arguments[0] === node) {
+      const statement = topLevelStatement(parent);
+      const name = parent.arguments[1]?.value;
+      assert(member(canonicalCallee(parent.callee), "Object", "defineProperty") && parent.arguments.length === 3
+        && statement?.type === "ExpressionStatement" && directCall(statement.expression) === parent
+        && typeof name === "string" && allowed.has(name) && parent.arguments[2]?.type === "ObjectExpression",
+      `${label} contains an unrecognized or non-top-level export definition`);
+      if (name === "__esModule") {
+        const descriptor = parent.arguments[2];
+        assert(descriptor.properties.length === 1 && descriptor.properties[0].type === "Property"
+          && propertyName({ type: "MemberExpression", computed: descriptor.properties[0].computed, property: descriptor.properties[0].key }) === "value"
+          && literal(descriptor.properties[0].value, true), `${label} __esModule export descriptor is invalid`);
+      }
       definitions.set(name, (definitions.get(name) ?? 0) + 1);
       return;
     }
-    const receiver = unwrapExpression(call.callee)?.type === "MemberExpression" ? unwrapExpression(call.callee).object : null;
-    const exposesExports = exportReference(receiver) || call.arguments.some(exportReference);
-    assert(!exposesExports, `${label} contains an unrecognized export mutation path`);
+    assert.fail(`${label} export object must not be rebound, read, aliased, wrapped, or escaped`);
   });
-  for (const [name, count] of definitions) assert.equal(count, 1, `${label} export ${name} must have one final definition`);
+  for (const name of allowed) assert.equal(definitions.get(name), 1, `${label} export ${name} must have one top-level definition`);
 }
 
 function functionDeclaration(module, name) {
   const declarations = module.factory.body.body.filter((statement) => statement.type === "FunctionDeclaration" && statement.id?.name === name);
   if (declarations.length !== 1) return null;
-  const writes = astNodes(module.factory.body, (node) => (
-    (node.type === "AssignmentExpression" && identifier(node.left, name))
-    || (node.type === "UpdateExpression" && identifier(node.argument, name))
-    || (node.type === "VariableDeclarator" && identifier(node.id, name) && node.init !== null)
-  ));
-  return writes.length === 0 ? declarations[0] : null;
+  return bindingIsImmutable(module.factory.body, name, declarations[0].id) ? declarations[0] : null;
 }
 
 function exportedFunction(module, name) {
   const exported = finalNamedExport(module, name);
   return exported?.type === "Identifier" ? functionDeclaration(module, exported.name) : null;
-}
-
-function variableDeclaration(block, name) {
-  const declarations = astNodes(block, (node) => node.type === "VariableDeclarator" && identifier(node.id, name));
-  return declarations.length === 1 ? declarations[0] : null;
 }
 
 function resolveDependency(graph, module, dependencyIndex, label) {
@@ -451,12 +537,53 @@ function reachableModules(graph, label) {
   return reachable;
 }
 
-function functionInvokes(fn, name) {
-  if (fn.body.body.length !== 1 || fn.body.body[0].type !== "ReturnStatement") return false;
-  const call = unwrapExpression(fn.body.body[0].argument);
-  if (call?.type !== "CallExpression") return false;
-  const callee = unwrapExpression(call.callee);
-  return identifier(callee, name) || identifier(call.arguments[0], name);
+function objectProperties(node, name) {
+  if (node?.type !== "ObjectExpression") return [];
+  return node.properties.filter((property) => property.type === "Property" && property.kind === "init" && !property.computed
+    && propertyName({ type: "MemberExpression", computed: false, property: property.key }) === name);
+}
+
+function jsxCall(node) {
+  const call = directCall(node);
+  const callee = call ? canonicalCallee(call.callee) : null;
+  const method = propertyName(callee);
+  if (!call || callee?.type !== "MemberExpression" || !["jsx", "jsxs"].includes(method)
+    || callee.object.type !== "Identifier" || call.arguments.length !== 2 || call.arguments[1]?.type !== "ObjectExpression") return null;
+  return { call, runtimeName: callee.object.name, component: call.arguments[0], props: call.arguments[1] };
+}
+
+function renderedComponent(expression, componentName) {
+  const matches = [];
+  const runtimeNames = new Set();
+  const visit = (value, root = false) => {
+    if (value?.type === "ArrayExpression") {
+      for (const element of value.elements) visit(element);
+      return true;
+    }
+    const call = directCall(value);
+    if (!call) return false;
+    const callee = canonicalCallee(call.callee);
+    if (identifier(callee, componentName)) {
+      if (call.arguments.length === 1 && call.arguments[0]?.type === "ObjectExpression") matches.push({ call, props: call.arguments[0] });
+      return true;
+    }
+    const jsx = jsxCall(call);
+    if (!jsx) return false;
+    runtimeNames.add(jsx.runtimeName);
+    if (identifier(jsx.component, componentName)) matches.push({ call, props: jsx.props });
+    for (const property of jsx.props.properties) {
+      if (property.type !== "Property" || property.kind !== "init") return false;
+      visit(property.value);
+    }
+    return true;
+  };
+  const validRoot = visit(expression, true);
+  return { matches, runtimeNames: [...runtimeNames], validRoot };
+}
+
+function assertJsxRuntimeBindings(module, runtimeNames, before, label) {
+  assert(runtimeNames.length <= 1, `${label} must use one JSX runtime namespace`);
+  if (runtimeNames.length === 1) dependencyBinding(module, runtimeNames[0], `${label} JSX runtime`, before);
 }
 
 function appEvidence(module, graph, label) {
@@ -464,46 +591,64 @@ function appEvidence(module, graph, label) {
   if (!appComposition) return null;
   assertClosedExports(module, ["AppComposition", "default"], `${label} App`);
   const defaultApp = exportedFunction(module, "default");
-  if (!defaultApp || !functionInvokes(defaultApp, "AppComposition")) return null;
-  const parameter = appComposition.params[0];
-  if (parameter?.type !== "ObjectPattern") return null;
-  const installProperty = parameter.properties.find((property) => property.type === "Property" && propertyName({
-    type: "MemberExpression",
-    computed: property.computed,
-    property: property.key,
-  }) === "installFaults");
-  const defaultValue = installProperty?.value?.type === "AssignmentPattern" ? unwrapExpression(installProperty.value.right) : null;
-  if (defaultValue?.type !== "MemberExpression" || propertyName(defaultValue) !== "installFaultController" || defaultValue.object.type !== "Identifier") return null;
-  const binding = dependencyBindings(module).find((candidate) => candidate.name === defaultValue.object.name);
-  if (!binding) return null;
+  if (!defaultApp || defaultApp.params.length !== 0 || defaultApp.body.body.length !== 1
+    || defaultApp.body.body[0].type !== "ReturnStatement") return null;
+  const appRender = renderedComponent(defaultApp.body.body[0].argument, "AppComposition");
+  if (!appRender.validRoot || appRender.matches.length !== 1 || appRender.matches[0].props.properties.length !== 0) return null;
+  assertJsxRuntimeBindings(module, appRender.runtimeNames, defaultApp, `${label} default App`);
+
+  const parameter = appComposition.params.length === 1 ? appComposition.params[0] : null;
+  if (parameter?.type !== "ObjectPattern" || parameter.properties.length !== 1) return null;
+  const installProperty = parameter.properties[0];
+  const installPattern = installProperty?.type === "Property" && installProperty.kind === "init" && !installProperty.computed
+    && propertyName({ type: "MemberExpression", computed: false, property: installProperty.key }) === "installFaults"
+    ? installProperty.value : null;
+  const defaultValue = installPattern?.type === "AssignmentPattern" && identifier(installPattern.left, "installFaults")
+    ? installPattern.right : null;
+  if (defaultValue?.type !== "MemberExpression" || defaultValue.computed || propertyName(defaultValue) !== "installFaultController"
+    || defaultValue.object.type !== "Identifier" || !bindingIsImmutable(appComposition, "installFaults", parameter)) return null;
+  const controllerBinding = dependencyBinding(module, defaultValue.object.name, `${label} App controller`, appComposition);
+
+  if (appComposition.body.body.length !== 1 || appComposition.body.body[0].type !== "ReturnStatement") return null;
+  const hostRender = renderedComponent(appComposition.body.body[0].argument, "FaultControllerHost");
+  if (!hostRender.validRoot || hostRender.matches.length !== 1) return null;
+  assertJsxRuntimeBindings(module, hostRender.runtimeNames, appComposition, `${label} AppComposition`);
+  const installProperties = objectProperties(hostRender.matches[0].props, "installFaults");
+  if (installProperties.length !== 1 || !identifier(installProperties[0].value, "installFaults")) return null;
+
   const host = functionDeclaration(module, "FaultControllerHost");
-  if (!host || astNodes(host.body, (node) => node.type === "CallExpression" && identifier(unwrapExpression(node.callee), "installFaults")).length !== 1) return null;
-  const installedProperties = astNodes(appComposition.body, (node) => (
-    node.type === "Property" && !node.computed && identifier(node.key, "installFaults") && identifier(node.value, "installFaults")
-  ));
-  if (installedProperties.length < 1) return null;
-  return { module, controller: resolveDependency(graph, module, binding.dependencyIndex, `${label} App controller`) };
+  if (!host) return null;
+  const hostParameter = host.params.find((candidate) => candidate.type === "ObjectPattern" && patternContains(candidate, "installFaults"));
+  if (!hostParameter || !bindingIsImmutable(host, "installFaults", hostParameter)) return null;
+  const installs = astNodes(host.body, (node) => node.type === "CallExpression" && identifier(canonicalCallee(node.callee), "installFaults"));
+  if (installs.length !== 1) return null;
+  return { module, controller: resolveDependency(graph, module, controllerBinding.dependencyIndex, `${label} App controller`) };
 }
 
 function rootRegistersApp(graph, app, label) {
   const registrations = [];
   for (const rootId of graph.roots) {
     const root = graph.byId.get(rootId);
-    const bindings = dependencyBindings(root);
     for (const statement of root.factory.body.body) {
       if (statement.type === "ReturnStatement" || statement.type === "ThrowStatement") break;
-      const call = statement.type === "ExpressionStatement" ? unwrapExpression(statement.expression) : null;
-      if (call?.type !== "CallExpression" || propertyName(unwrapExpression(call.callee)) !== "registerRootComponent") continue;
-      const runtimeName = unwrapExpression(call.callee).object?.name;
-      const runtimeBinding = bindings.find(({ name }) => name === runtimeName);
-      const argument = unwrapExpression(call.arguments[0]);
-      if (!runtimeBinding || argument?.type !== "MemberExpression" || propertyName(argument) !== "default" || argument.object.type !== "Identifier") continue;
-      const interop = variableDeclaration(root.factory.body, argument.object.name)?.init;
-      const importedName = interop?.type === "CallExpression" && interop.arguments.length === 1 && interop.arguments[0]?.type === "Identifier"
-        ? interop.arguments[0].name
-        : null;
-      const appBinding = bindings.find(({ name }) => name === importedName);
-      if (!appBinding) continue;
+      const call = statement.type === "ExpressionStatement" ? directCall(statement.expression) : null;
+      const callee = call ? canonicalCallee(call.callee) : null;
+      if (callee?.type !== "MemberExpression" || propertyName(callee) !== "registerRootComponent") continue;
+      assert(callee.object.type === "Identifier" && call.arguments.length === 1, `${label} root registration call is malformed`);
+      const argument = call.arguments[0];
+      assert(argument?.type === "MemberExpression" && !argument.computed && propertyName(argument) === "default"
+        && argument.object.type === "Identifier", `${label} root must register the imported default App binding`);
+
+      const appInterop = topLevelVariable(root, argument.object.name, `${label} root App interop`, { before: statement, includeMembers: true });
+      const interopCall = appInterop.declaration.init;
+      assert(interopCall?.type === "CallExpression" && interopCall.arguments.length === 1
+        && interopCall.arguments[0]?.type === "Identifier" && canonicalCallee(interopCall.callee)?.type === "Identifier",
+      `${label} root App interop call is invalid`);
+      const helperName = canonicalCallee(interopCall.callee).name;
+      canonicalInteropFunction(root, helperName, `${label} root`, appInterop.statement);
+      const importedName = interopCall.arguments[0].name;
+      const appBinding = dependencyBinding(root, importedName, `${label} root App import`, appInterop.statement);
+      const runtimeBinding = dependencyBinding(root, callee.object.name, `${label} root runtime import`, statement);
       const importedApp = resolveDependency(graph, root, appBinding.dependencyIndex, `${label} root App`);
       resolveDependency(graph, root, runtimeBinding.dependencyIndex, `${label} root runtime`);
       if (importedApp.moduleId === app.moduleId) registrations.push({ root, call });
@@ -512,131 +657,183 @@ function rootRegistersApp(graph, app, label) {
   assert.equal(registrations.length, 1, `${label} one top-level Metro root must import and register the default App`);
 }
 
-function parserDelivery(module, handler, urlName, onFaultName) {
-  const bindings = dependencyBindings(module);
-  const matches = [];
-  walkAst(handler.body, (node, parent) => {
-    if (node.type !== "CallExpression") return;
-    const call = node;
-    const callee = unwrapExpression(call.callee);
-    if (callee?.type !== "MemberExpression" || propertyName(callee) !== "parseFaultUrl") return;
-    const binding = bindings.find((candidate) => identifier(callee.object, candidate.name));
-    if (binding && call.arguments.length === 1 && identifier(call.arguments[0], urlName)
-      && parent?.type === "VariableDeclarator" && parent.id.type === "Identifier" && parent.init === call) {
-      matches.push({ binding, call, declaration: parent });
-    }
-  });
-  if (matches.length !== 1) return null;
-  const match = matches[0];
-  const requestName = match.declaration.id.name;
-  const declarations = astNodes(handler.body, (node) => node.type === "VariableDeclarator" && identifier(node.id, requestName));
-  const writes = astNodes(handler.body, (node) => (
-    node.type === "AssignmentExpression" && identifier(node.left, requestName)
-    || node.type === "UpdateExpression" && identifier(node.argument, requestName)
-  ));
-  if (declarations.length !== 1 || writes.length !== 0) return null;
-  const parseIndex = handler.body.body.findIndex((statement) => statement.type === "VariableDeclaration" && statement.declarations.includes(match.declaration));
-  const deliveryIndex = handler.body.body.findIndex((statement) => statement.type === "IfStatement" && identifier(statement.test, requestName)
-    && astNodes(statement.consequent, (node) => node.type === "CallExpression" && identifier(unwrapExpression(node.callee), onFaultName)
-      && node.arguments.length === 1 && identifier(node.arguments[0], requestName)).length === 1);
-  const allDeliveries = astNodes(handler.body, (node) => node.type === "CallExpression" && identifier(unwrapExpression(node.callee), onFaultName));
-  if (parseIndex < 0 || deliveryIndex <= parseIndex || allDeliveries.length !== 1) return null;
-  return match.binding;
+function standaloneVariable(statement, name) {
+  if (statement?.type !== "VariableDeclaration" || statement.declarations.length !== 1) return null;
+  const declaration = statement.declarations[0];
+  return identifier(declaration.id, name) ? declaration : null;
+}
+
+function callOnIdentifier(call, objectName, methodName) {
+  const callee = call ? canonicalCallee(call.callee) : null;
+  return callee?.type === "MemberExpression" && identifier(callee.object, objectName) && propertyName(callee) === methodName;
+}
+
+function linkingCall(call, runtimeName, methodName) {
+  const callee = call ? canonicalCallee(call.callee) : null;
+  const linking = callee?.type === "MemberExpression" ? unwrapExpression(callee.object) : null;
+  return propertyName(callee) === methodName && linking?.type === "MemberExpression" && !linking.computed
+    && propertyName(linking) === "Linking" && identifier(linking.object, runtimeName);
+}
+
+function expressionCall(statement) {
+  return statement?.type === "ExpressionStatement" ? directCall(statement.expression) : null;
 }
 
 function listenerEvidence(module, graph, label) {
   assertClosedExports(module, ["E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL", "installFaultController"], `${label} listener`);
   const install = exportedFunction(module, "installFaultController");
-  assert(install && install.params.length >= 2 && install.params.every((parameter) => parameter.type === "Identifier"),
+  assert(install?.async && install.params.length === 2 && install.params.every((parameter) => parameter.type === "Identifier"),
     `${label} listener final installFaultController export is invalid`);
   const [onFaultName, signalName] = install.params.map((parameter) => parameter.name);
-  const handlerCandidates = [];
-  for (const statement of install.body.body) {
-    if (statement.type !== "VariableDeclaration") continue;
-    for (const declaration of statement.declarations) {
-      const handler = declaration.init;
-      const parameter = handler?.params?.[0];
-      if (!identifier(declaration.id, declaration.id?.name) || !["ArrowFunctionExpression", "FunctionExpression"].includes(handler?.type) || parameter?.type !== "ObjectPattern") continue;
-      const urlProperty = parameter.properties.find((property) => property.type === "Property" && identifier(property.key, "url") && identifier(property.value, "url"));
-      if (!urlProperty || handler.body.type !== "BlockStatement") continue;
-      const parserBinding = parserDelivery(module, handler, "url", onFaultName);
-      if (parserBinding) handlerCandidates.push({ name: declaration.id.name, handler, parserBinding, declaration });
-    }
-  }
-  assert.equal(handlerCandidates.length, 1, `${label} listener must parse URL and invoke onFault(request)`);
-  const handler = handlerCandidates[0];
-  const calls = astNodes(install.body, (node) => node.type === "CallExpression");
-  const registration = install.body.body.flatMap((statement) => statement.type === "VariableDeclaration" ? statement.declarations : [])
-    .find((declaration) => declaration.init?.type === "CallExpression" && memberCall(declaration.init, "addEventListener")
-      && literal(declaration.init.arguments[0], "url") && identifier(declaration.init.arguments[1], handler.name));
-  assert(registration && registration.id.type === "Identifier", `${label} listener URL registration is invalid`);
-  const handlerIndex = install.body.body.findIndex((statement) => statement.type === "VariableDeclaration" && statement.declarations.includes(handler.declaration));
-  const registrationIndex = install.body.body.findIndex((statement) => statement.type === "VariableDeclaration" && statement.declarations.includes(registration));
-  assert(handlerIndex >= 0 && registrationIndex > handlerIndex, `${label} listener installation statement order is invalid`);
-  const preInstallation = install.body.body.slice(0, registrationIndex);
-  assert(preInstallation.every((statement) => {
-    if (statement.type === "VariableDeclaration") return true;
-    if (statement.type !== "IfStatement" || statement.alternate) return false;
-    const abortChecks = astNodes(statement.test, (node) => node.type === "MemberExpression"
-      && identifier(node.object, signalName) && propertyName(node) === "aborted");
-    const returns = astNodes(statement.consequent, (node) => node.type === "ReturnStatement");
-    return abortChecks.length === 1 && returns.length === 1;
-  }), `${label} listener has noncanonical control flow before installation`);
-  const registrationCallee = unwrapExpression(registration.init.callee);
+  assert(bindingIsImmutable(install, onFaultName, install.params[0]) && bindingIsImmutable(install, signalName, install.params[1]),
+    `${label} listener parameters must be immutable and unshadowed`);
+  const body = install.body.body;
+  assert.equal(body.length, 8, `${label} listener control flow must use the exact installation statement sequence`);
+
+  const noOpExport = topLevelVariable(module, "noOp", `${label} listener no-op`, { before: install });
+  const noOp = noOpExport.declaration.init;
+  assert(noOp?.type === "ArrowFunctionExpression" && noOp.params.length === 0 && noOp.body.type === "BlockStatement"
+    && noOp.body.body.length === 0, `${label} listener no-op is invalid`);
+  const initialGuard = body[0];
+  assert(initialGuard.type === "IfStatement" && !initialGuard.alternate && member(initialGuard.test, signalName, "aborted")
+    && initialGuard.consequent.type === "ReturnStatement" && identifier(initialGuard.consequent.argument, "noOp"),
+  `${label} listener initial abort guard is invalid`);
+
+  const activeDeclaration = standaloneVariable(body[1], "active");
+  const removedDeclaration = standaloneVariable(body[2], "removed");
+  assert(activeDeclaration && literal(activeDeclaration.init, true) && removedDeclaration && literal(removedDeclaration.init, false),
+    `${label} listener lifecycle declarations are invalid`);
+
+  const handlerDeclaration = standaloneVariable(body[3], "handleUrl");
+  const handler = handlerDeclaration?.init;
+  const handlerParameter = handler?.params?.length === 1 ? handler.params[0] : null;
+  assert(handler?.type === "ArrowFunctionExpression" && !handler.async && handlerParameter?.type === "ObjectPattern"
+    && handlerParameter.properties.length === 1 && handlerParameter.properties[0].type === "Property"
+    && identifier(handlerParameter.properties[0].key, "url") && identifier(handlerParameter.properties[0].value, "url")
+    && handler.body.type === "BlockStatement" && handler.body.body.length === 3,
+  `${label} listener URL handler is invalid`);
+  assert(bindingIsImmutable(handler, "url", handlerParameter), `${label} listener URL binding must be immutable and unshadowed`);
+  const handlerGuard = handler.body.body[0];
+  const guardTest = handlerGuard?.type === "IfStatement" ? handlerGuard.test : null;
+  assert(guardTest?.type === "LogicalExpression" && guardTest.operator === "||"
+    && guardTest.left.type === "UnaryExpression" && guardTest.left.operator === "!" && identifier(guardTest.left.argument, "active")
+    && member(guardTest.right, signalName, "aborted") && !handlerGuard.alternate
+    && handlerGuard.consequent.type === "ReturnStatement" && handlerGuard.consequent.argument === null,
+  `${label} listener handler abort guard is invalid`);
+
+  const requestDeclaration = standaloneVariable(handler.body.body[1], "request");
+  const parserCall = requestDeclaration?.init;
+  const parserCallee = parserCall?.type === "CallExpression" ? canonicalCallee(parserCall.callee) : null;
+  assert(parserCallee?.type === "MemberExpression" && parserCallee.object.type === "Identifier"
+    && propertyName(parserCallee) === "parseFaultUrl" && parserCall.arguments.length === 1 && identifier(parserCall.arguments[0], "url"),
+  `${label} listener parser delivery binding is invalid`);
+  assert(bindingIsImmutable(handler, "request", requestDeclaration.id), `${label} listener parser result must be immutable and unshadowed`);
+  const parserBinding = dependencyBinding(module, parserCallee.object.name, `${label} listener parser`, install);
+
+  const delivery = handler.body.body[2];
+  const deliveryCall = delivery?.type === "IfStatement" && !delivery.alternate && identifier(delivery.test, "request")
+    ? expressionCall(delivery.consequent) : null;
+  assert(deliveryCall && identifier(canonicalCallee(deliveryCall.callee), onFaultName) && deliveryCall.arguments.length === 1
+    && identifier(deliveryCall.arguments[0], "request"), `${label} listener must directly deliver onFault(request)`);
+
+  const registration = standaloneVariable(body[4], "subscription");
+  const registrationCall = registration?.init;
+  const registrationCallee = registrationCall?.type === "CallExpression" ? canonicalCallee(registrationCall.callee) : null;
   const registrationLinking = registrationCallee?.type === "MemberExpression" ? unwrapExpression(registrationCallee.object) : null;
   const runtimeName = registrationLinking?.type === "MemberExpression" && propertyName(registrationLinking) === "Linking"
     && registrationLinking.object.type === "Identifier" ? registrationLinking.object.name : null;
-  const runtimeBinding = dependencyBindings(module).find(({ name }) => name === runtimeName);
-  assert(runtimeBinding, `${label} listener Linking registration is not bound to an imported runtime namespace`);
+  assert(runtimeName && linkingCall(registrationCall, runtimeName, "addEventListener") && registrationCall.arguments.length === 2
+    && literal(registrationCall.arguments[0], "url") && identifier(registrationCall.arguments[1], "handleUrl"),
+  `${label} listener URL registration is invalid`);
+  const runtimeBinding = dependencyBinding(module, runtimeName, `${label} listener runtime`, install);
   resolveDependency(graph, module, runtimeBinding.dependencyIndex, `${label} listener runtime`);
-  const initialUrl = variableDeclaration(install.body, "url");
-  assert(initialUrl?.init?.type === "AwaitExpression" && memberCall(initialUrl.init.argument, "getInitialURL"),
+
+  const disposeDeclaration = standaloneVariable(body[5], "dispose");
+  const dispose = disposeDeclaration?.init;
+  assert(dispose?.type === "ArrowFunctionExpression" && dispose.params.length === 0 && dispose.body.type === "BlockStatement"
+    && dispose.body.body.length === 5, `${label} listener disposer is invalid`);
+  const [removedGuard, deactivate, markRemoved, abortRemoval, subscriptionRemoval] = dispose.body.body;
+  assert(removedGuard.type === "IfStatement" && !removedGuard.alternate && identifier(removedGuard.test, "removed")
+    && removedGuard.consequent.type === "ReturnStatement" && removedGuard.consequent.argument === null,
+  `${label} listener disposer guard is invalid`);
+  const deactivateAssignment = deactivate.type === "ExpressionStatement" ? unwrapExpression(deactivate.expression) : null;
+  const removedAssignment = markRemoved.type === "ExpressionStatement" ? unwrapExpression(markRemoved.expression) : null;
+  assert(deactivateAssignment?.type === "AssignmentExpression" && deactivateAssignment.operator === "="
+    && identifier(deactivateAssignment.left, "active") && literal(deactivateAssignment.right, false)
+    && removedAssignment?.type === "AssignmentExpression" && removedAssignment.operator === "="
+    && identifier(removedAssignment.left, "removed") && literal(removedAssignment.right, true),
+  `${label} listener disposer lifecycle writes are invalid`);
+  const abortRemovalCall = expressionCall(abortRemoval);
+  const subscriptionRemovalCall = expressionCall(subscriptionRemoval);
+  assert(abortRemovalCall && callOnIdentifier(abortRemovalCall, signalName, "removeEventListener")
+    && abortRemovalCall.arguments.length === 2 && literal(abortRemovalCall.arguments[0], "abort")
+    && identifier(abortRemovalCall.arguments[1], "dispose"), `${label} listener abort removal is invalid`);
+  assert(subscriptionRemovalCall && callOnIdentifier(subscriptionRemovalCall, "subscription", "remove")
+    && subscriptionRemovalCall.arguments.length === 0, `${label} listener subscription disposal is invalid`);
+
+  assert(bindingDefinitions(install, "active").length === 1 && bindingDefinitions(install, "active")[0] === activeDeclaration.id
+    && bindingWrites(install, "active").length === 1 && bindingWrites(install, "active")[0] === deactivateAssignment,
+  `${label} listener active binding writes are invalid`);
+  assert(bindingDefinitions(install, "removed").length === 1 && bindingDefinitions(install, "removed")[0] === removedDeclaration.id
+    && bindingWrites(install, "removed").length === 1 && bindingWrites(install, "removed")[0] === removedAssignment,
+  `${label} listener removed binding writes are invalid`);
+  assert(bindingIsImmutable(install, "handleUrl", handlerDeclaration.id)
+    && bindingIsImmutable(install, "subscription", registration.id)
+    && bindingIsImmutable(install, "dispose", disposeDeclaration.id), `${label} listener local bindings must be immutable and unshadowed`);
+
+  const abortRegistration = expressionCall(body[6]);
+  const onceProperties = abortRegistration?.arguments[2]?.type === "ObjectExpression"
+    ? objectProperties(abortRegistration.arguments[2], "once") : [];
+  assert(abortRegistration && callOnIdentifier(abortRegistration, signalName, "addEventListener")
+    && abortRegistration.arguments.length === 3 && literal(abortRegistration.arguments[0], "abort")
+    && identifier(abortRegistration.arguments[1], "dispose") && onceProperties.length === 1
+    && abortRegistration.arguments[2].properties.length === 1 && literal(onceProperties[0].value, true),
+  `${label} listener abort registration is invalid`);
+
+  const initialFlow = body[7];
+  assert(initialFlow.type === "TryStatement" && !initialFlow.finalizer && initialFlow.block.body.length === 3
+    && initialFlow.handler?.param?.type === "Identifier" && initialFlow.handler.body.body.length === 2,
+  `${label} listener initial URL control flow is invalid`);
+  const initialUrl = standaloneVariable(initialFlow.block.body[0], "url");
+  const initialCall = initialUrl?.init?.type === "AwaitExpression" ? directCall(initialUrl.init.argument) : null;
+  assert(initialCall && linkingCall(initialCall, runtimeName, "getInitialURL") && initialCall.arguments.length === 0,
     `${label} listener initial URL lookup is invalid`);
-  const initialCallee = unwrapExpression(initialUrl.init.argument.callee);
-  const initialLinking = initialCallee?.type === "MemberExpression" ? unwrapExpression(initialCallee.object) : null;
-  assert(initialLinking?.type === "MemberExpression" && propertyName(initialLinking) === "Linking"
-    && identifier(initialLinking.object, runtimeName), `${label} listener Linking calls must share one imported runtime namespace`);
-  const initialStatementIndex = install.body.body.findIndex((statement) => astNodes(statement, (node) => node === initialUrl).length === 1);
-  assert(initialStatementIndex > registrationIndex, `${label} listener initial URL lookup must follow listener installation`);
-  const initialDispatch = astNodes(install.body, (node) => node.type === "IfStatement" && identifier(node.test, "url")
-    && astNodes(node.consequent, (candidate) => candidate.type === "CallExpression" && identifier(unwrapExpression(candidate.callee), handler.name)
-      && candidate.arguments[0]?.type === "ObjectExpression"
-      && candidate.arguments[0].properties.some((property) => property.type === "Property" && identifier(property.key, "url") && identifier(property.value, "url"))).length === 1);
-  assert.equal(initialDispatch.length, 1, `${label} listener initial URL dispatch is invalid`);
-  const abortRegistration = calls.find((call) => memberCall(call, "addEventListener") && literal(call.arguments[0], "abort")
-    && call.arguments[1]?.type === "Identifier" && call.arguments[2]?.type === "ObjectExpression"
-    && call.arguments[2].properties.some((property) => property.type === "Property" && identifier(property.key, "once") && literal(property.value, true)));
-  const disposeName = abortRegistration?.arguments[1]?.name;
-  const dispose = disposeName ? variableDeclaration(install.body, disposeName)?.init : null;
-  assert(dispose && dispose.body?.type === "BlockStatement", `${label} listener abort registration is invalid`);
-  const disposeCalls = astNodes(dispose.body, (node) => node.type === "CallExpression");
-  assert(disposeCalls.some((call) => memberCall(call, "removeEventListener") && literal(call.arguments[0], "abort") && identifier(call.arguments[1], disposeName)),
-    `${label} listener abort removal is invalid`);
-  assert(disposeCalls.some((call) => memberCall(call, "remove") && identifier(unwrapExpression(call.callee).object, registration.id.name)),
-    `${label} listener subscription disposal is invalid`);
-  const abortChecks = astNodes(install.body, (node) => {
-    return node.type === "MemberExpression" && identifier(node.object, signalName) && propertyName(node) === "aborted";
-  });
-  assert(abortChecks.length >= 2, `${label} listener abort guards are invalid`);
-  assert(astNodes(install.body, (node) => node.type === "ReturnStatement" && identifier(node.argument, disposeName)).length,
+  const initialDispatch = initialFlow.block.body[1];
+  const initialDispatchCall = initialDispatch.type === "IfStatement" && !initialDispatch.alternate && identifier(initialDispatch.test, "url")
+    ? expressionCall(initialDispatch.consequent) : null;
+  const dispatchProperties = initialDispatchCall?.arguments[0]?.type === "ObjectExpression"
+    ? objectProperties(initialDispatchCall.arguments[0], "url") : [];
+  assert(initialDispatchCall && identifier(canonicalCallee(initialDispatchCall.callee), "handleUrl")
+    && initialDispatchCall.arguments.length === 1 && initialDispatchCall.arguments[0].properties.length === 1
+    && dispatchProperties.length === 1 && identifier(dispatchProperties[0].value, "url"),
+  `${label} listener initial URL dispatch is invalid`);
+  assert(initialFlow.block.body[2].type === "ReturnStatement" && identifier(initialFlow.block.body[2].argument, "dispose"),
     `${label} listener must return its disposer`);
-  assert(calls.filter((call) => identifier(unwrapExpression(call.callee), disposeName)).length >= 1,
-    `${label} listener error path must dispose`);
+  const catchParameter = initialFlow.handler.param.name;
+  const catchDispose = expressionCall(initialFlow.handler.body.body[0]);
+  assert(catchDispose && identifier(canonicalCallee(catchDispose.callee), "dispose") && catchDispose.arguments.length === 0
+    && initialFlow.handler.body.body[1].type === "ThrowStatement"
+    && identifier(initialFlow.handler.body.body[1].argument, catchParameter), `${label} listener error path must dispose and rethrow`);
+
+  const sentinelExport = finalNamedExport(module, "E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL");
+  assert(identifier(sentinelExport, "E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL"), `${label} listener sentinel export is invalid`);
+  const sentinel = topLevelVariable(module, "E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL", `${label} listener sentinel`);
+  assert(literal(sentinel.declaration.init, FAULT_CONTROLLER_SENTINEL), `${label} listener sentinel binding is invalid`);
   const sentinelLiterals = astNodes(module.factory.body, (node) => literal(node, FAULT_CONTROLLER_SENTINEL));
   assert.equal(sentinelLiterals.length, 1, `${label} listener sentinel must be one live literal`);
   return {
     module,
-    parser: resolveDependency(graph, module, handler.parserBinding.dependencyIndex, `${label} listener parser`),
+    parser: resolveDependency(graph, module, parserBinding.dependencyIndex, `${label} listener parser`),
   };
 }
 
 function allowedHas(node, argumentCheck) {
-  const call = unwrapExpression(node);
-  return call?.type === "CallExpression" && member(call.callee, "allowed", "has") && call.arguments.length === 1 && argumentCheck(call.arguments[0]);
+  const call = directCall(node);
+  return call && member(canonicalCallee(call.callee), "allowed", "has") && call.arguments.length === 1 && argumentCheck(call.arguments[0]);
 }
 
 function matchIndexOne(node) {
-  const value = unwrapExpression(node);
+  const value = node?.type === "ChainExpression" ? node.expression : node;
   return value?.type === "MemberExpression" && value.computed && identifier(value.object, "match") && literal(value.property, 1);
 }
 
@@ -644,11 +841,14 @@ function parserEvidence(module, graph, label) {
   assertClosedExports(module, ["FAULT_POINTS", "canonicalFaultUrl", "parseFaultUrl"], `${label} parser`);
   const canonical = exportedFunction(module, "canonicalFaultUrl");
   const parser = exportedFunction(module, "parseFaultUrl");
-  if (!canonical || !parser || !identifier(canonical.params[0], "point") || !identifier(parser.params[0], "value")) return null;
+  if (!canonical || !parser || canonical.params.length !== 1 || parser.params.length !== 1
+    || !identifier(canonical.params[0], "point") || !identifier(parser.params[0], "value")
+    || !bindingIsImmutable(canonical, "point", canonical.params[0]) || !bindingIsImmutable(parser, "value", parser.params[0])) return null;
   if (canonical.body.body.length !== 2 || parser.body.body.length !== 4) return null;
   const [canonicalGuard, canonicalReturn] = canonical.body.body;
   if (canonicalGuard.type !== "IfStatement" || canonicalGuard.test.type !== "UnaryExpression" || canonicalGuard.test.operator !== "!"
-    || !allowedHas(canonicalGuard.test.argument, (argument) => identifier(argument, "point")) || canonicalGuard.consequent.type !== "ThrowStatement") return null;
+    || canonicalGuard.alternate || !allowedHas(canonicalGuard.test.argument, (argument) => identifier(argument, "point"))
+    || canonicalGuard.consequent.type !== "ThrowStatement") return null;
   const template = canonicalReturn.type === "ReturnStatement" ? canonicalReturn.argument : null;
   if (template?.type !== "TemplateLiteral" || template.expressions.length !== 1 || !identifier(template.expressions[0], "point")
     || template.quasis[0].value.raw !== "formobile-test://fault?point=" || template.quasis[1].value.raw !== "&mode=crash_once") return null;
@@ -657,7 +857,7 @@ function parserEvidence(module, graph, label) {
   const matchCall = matchDeclaration?.init;
   const regex = matchCall?.callee?.type === "MemberExpression" ? matchCall.callee.object : null;
   if (!identifier(matchDeclaration?.id, "match") || matchStatement.declarations.length !== 1 || matchCall?.type !== "CallExpression"
-    || propertyName(matchCall.callee) !== "exec" || regex?.type !== "Literal"
+    || propertyName(canonicalCallee(matchCall.callee)) !== "exec" || matchCall.arguments.length !== 1 || regex?.type !== "Literal"
     || regex.regex?.pattern !== String.raw`^formobile-test:\/\/fault\?point=([a-z][a-z0-9_.]*)&mode=crash_once$`
     || regex.regex.flags !== "" || !identifier(matchCall.arguments[0], "value")) return null;
   const guardTest = parseGuard.type === "IfStatement" ? parseGuard.test : null;
@@ -665,7 +865,7 @@ function parserEvidence(module, graph, label) {
   if (guardTest?.type !== "LogicalExpression" || guardTest.operator !== "||" || guardTest.left.type !== "UnaryExpression"
     || guardTest.left.operator !== "!" || !identifier(guardTest.left.argument, "match") || guardTest.right.type !== "UnaryExpression"
     || guardTest.right.operator !== "!" || !allowedHas(guardTest.right.argument, matchIndexOne)
-    || guardReturn.type !== "ReturnStatement" || !literal(guardReturn.argument, null)) return null;
+    || parseGuard.alternate || guardReturn.type !== "ReturnStatement" || !literal(guardReturn.argument, null)) return null;
   const requestDeclaration = requestStatement.type === "VariableDeclaration" ? requestStatement.declarations[0] : null;
   const requestProperties = requestDeclaration?.init?.type === "ObjectExpression" ? requestDeclaration.init.properties : [];
   if (!identifier(requestDeclaration?.id, "request") || requestStatement.declarations.length !== 1 || requestProperties.length !== 2
@@ -674,19 +874,36 @@ function parserEvidence(module, graph, label) {
   const conditional = parseReturn.type === "ReturnStatement" ? parseReturn.argument : null;
   const equality = conditional?.type === "ConditionalExpression" ? conditional.test : null;
   const canonicalCall = equality?.type === "BinaryExpression" ? equality.left : null;
-  if (equality?.operator !== "===" || canonicalCall?.type !== "CallExpression" || !identifier(unwrapExpression(canonicalCall.callee), "canonicalFaultUrl")
+  if (equality?.operator !== "===" || canonicalCall?.type !== "CallExpression" || !identifier(canonicalCallee(canonicalCall.callee), "canonicalFaultUrl")
+    || canonicalCall.arguments.length !== 1
     || canonicalCall.arguments[0]?.type !== "MemberExpression" || !identifier(canonicalCall.arguments[0].object, "request")
     || propertyName(canonicalCall.arguments[0]) !== "point" || !identifier(equality.right, "value")
     || !identifier(conditional.consequent, "request") || !literal(conditional.alternate, null)) return null;
-  const registryBinding = dependencyBindings(module).find(({ name }) => name === "_faultPointsJson");
-  const faultPointsImport = variableDeclaration(module.factory.body, "faultPoints")?.init;
-  const frozenPoints = variableDeclaration(module.factory.body, "FAULT_POINTS")?.init;
-  const allowed = variableDeclaration(module.factory.body, "allowed")?.init;
-  if (!registryBinding || faultPointsImport?.type !== "CallExpression" || !identifier(unwrapExpression(faultPointsImport.callee), "_interopDefault")
-    || !identifier(faultPointsImport.arguments[0], "_faultPointsJson") || frozenPoints?.type !== "CallExpression"
-    || !member(frozenPoints.callee, "Object", "freeze") || frozenPoints.arguments[0]?.type !== "ArrayExpression"
-    || frozenPoints.arguments[0].elements[0]?.type !== "SpreadElement" || !member(frozenPoints.arguments[0].elements[0].argument, "faultPoints", "default")
-    || allowed?.type !== "NewExpression" || !identifier(allowed.callee, "Set") || !identifier(allowed.arguments[0], "FAULT_POINTS")) return null;
+  if (!bindingIsImmutable(parser, "match", matchDeclaration.id) || !bindingIsImmutable(parser, "request", requestDeclaration.id)) return null;
+
+  const faultPointsBinding = topLevelVariable(module, "faultPoints", `${label} parser interop result`, { includeMembers: true });
+  const registryBinding = dependencyBinding(module, "_faultPointsJson", `${label} parser registry import`, faultPointsBinding.statement);
+  const faultPointsImport = faultPointsBinding.declaration.init;
+  const interopName = faultPointsImport?.type === "CallExpression" && faultPointsImport.arguments.length === 1
+    && identifier(faultPointsImport.arguments[0], "_faultPointsJson") && canonicalCallee(faultPointsImport.callee)?.type === "Identifier"
+    ? canonicalCallee(faultPointsImport.callee).name : null;
+  if (!interopName) return null;
+  canonicalInteropFunction(module, interopName, `${label} parser`, faultPointsBinding.statement);
+
+  const frozenBinding = topLevelVariable(module, "FAULT_POINTS", `${label} parser frozen registry`, { includeMembers: true });
+  const allowedBinding = topLevelVariable(module, "allowed", `${label} parser allowlist`, { before: canonical, includeMembers: true });
+  const frozenPoints = frozenBinding.declaration.init;
+  const allowed = allowedBinding.declaration.init;
+  const faultPointsIndex = module.factory.body.body.indexOf(faultPointsBinding.statement);
+  const frozenIndex = module.factory.body.body.indexOf(frozenBinding.statement);
+  const allowedIndex = module.factory.body.body.indexOf(allowedBinding.statement);
+  if (faultPointsIndex < 0 || frozenIndex <= faultPointsIndex || allowedIndex <= frozenIndex
+    || frozenPoints?.type !== "CallExpression" || !member(canonicalCallee(frozenPoints.callee), "Object", "freeze")
+    || frozenPoints.arguments.length !== 1 || frozenPoints.arguments[0]?.type !== "ArrayExpression"
+    || frozenPoints.arguments[0].elements.length !== 1 || frozenPoints.arguments[0].elements[0]?.type !== "SpreadElement"
+    || !member(frozenPoints.arguments[0].elements[0].argument, "faultPoints", "default")
+    || allowed?.type !== "NewExpression" || !identifier(allowed.callee, "Set") || allowed.arguments.length !== 1
+    || !identifier(allowed.arguments[0], "FAULT_POINTS") || !identifier(finalNamedExport(module, "FAULT_POINTS"), "FAULT_POINTS")) return null;
   return { module, registry: resolveDependency(graph, module, registryBinding.dependencyIndex, `${label} parser registry`) };
 }
 
@@ -706,10 +923,10 @@ function noOpController(module) {
   const install = exportedFunction(module, "installFaultController");
   if (!install?.async || install.body.body.length !== 1 || install.body.body[0].type !== "ReturnStatement" || install.body.body[0].argument?.type !== "Identifier") return false;
   const noOpName = install.body.body[0].argument.name;
-  const declaration = variableDeclaration(module.factory.body, noOpName);
-  const initializer = declaration?.init;
-  if (!["ArrowFunctionExpression", "FunctionExpression"].includes(initializer?.type) || initializer.body.type !== "BlockStatement" || initializer.body.body.length !== 0) return false;
-  return astNodes(module.factory.body, (node) => node.type === "AssignmentExpression" && identifier(node.left, noOpName)).length === 0;
+  const binding = topLevelVariable(module, noOpName, "production controller no-op", { before: install });
+  const initializer = binding.declaration.init;
+  return ["ArrowFunctionExpression", "FunctionExpression"].includes(initializer?.type) && initializer.params.length === 0
+    && initializer.body.type === "BlockStatement" && initializer.body.body.length === 0;
 }
 
 function moduleGraph(bytes, label, flavor) {

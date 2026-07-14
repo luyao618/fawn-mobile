@@ -72,6 +72,19 @@ test("initial URL rejection removes the listener and rejects setup", async () =>
   expect(remove).toHaveBeenCalledTimes(1);
 });
 
+test("active canonical initial URL is parsed and delivered exactly once", async () => {
+  const remove = jest.fn();
+  const point = NORMATIVE_FAULT_POINTS[0];
+  jest.spyOn(Linking, "addEventListener").mockReturnValue({ remove } as never);
+  jest.spyOn(Linking, "getInitialURL").mockResolvedValue(canonicalFaultUrl(point));
+  const onFault = jest.fn();
+  const cleanup = await installE2EFaultController(onFault);
+  expect(onFault).toHaveBeenCalledTimes(1);
+  expect(onFault).toHaveBeenCalledWith({ point, mode: "crash_once" });
+  cleanup();
+  expect(remove).toHaveBeenCalledTimes(1);
+});
+
 test("abort during pending initial URL removes the listener and suppresses post-disposal delivery", async () => {
   const initial = deferred<string | null>();
   const remove = jest.fn();
