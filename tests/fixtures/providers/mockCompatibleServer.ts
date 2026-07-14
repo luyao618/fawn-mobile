@@ -4,8 +4,29 @@ import type { AddressInfo } from "node:net";
 type RunningServer = Readonly<{
   baseUrl: string;
   observedCookieHeaders: () => readonly (string | undefined)[];
+  waitForAbortRequest: () => Promise<void>;
   close: () => Promise<void>;
 }>;
+
+const ABORT_REQUEST_OBSERVATION_TIMEOUT_MS = 1_000;
+
+function waitForObservation(observation: Promise<void>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error("Timed out waiting for a validated abort request"));
+    }, ABORT_REQUEST_OBSERVATION_TIMEOUT_MS);
+    observation.then(
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+      (error: unknown) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
 
 async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Uint8Array[] = [];
@@ -48,6 +69,10 @@ async function writeProfileB(response: ServerResponse): Promise<void> {
 
 export async function startMockCompatibleServer(port = 0): Promise<RunningServer> {
   const cookieHeaders: (string | undefined)[] = [];
+  let resolveAbortRequest!: () => void;
+  const abortRequestObserved = new Promise<void>((resolve) => {
+    resolveAbortRequest = resolve;
+  });
   const server = createServer(async (request, response) => {
     try {
       cookieHeaders.push(request.headers.cookie);
@@ -57,6 +82,7 @@ export async function startMockCompatibleServer(port = 0): Promise<RunningServer
         return;
       }
       await readJson(request);
+      if (request.url.startsWith("/abort/")) resolveAbortRequest();
       response.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
@@ -84,6 +110,7 @@ export async function startMockCompatibleServer(port = 0): Promise<RunningServer
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     observedCookieHeaders: () => Object.freeze([...cookieHeaders]),
+    waitForAbortRequest: () => waitForObservation(abortRequestObserved),
     close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
   };
 }
