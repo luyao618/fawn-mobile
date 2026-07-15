@@ -89,7 +89,7 @@ const exactChildPrimaryUploadPaths = {
   ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "68e590a7b95628d49222d8310cd505957753dd9b7436d6200e6fe0618e9814f7";
+const exactAndroidRunnerSha256 = "cb4c0f30c3311dd450f7e8e73c866d0da80e27fd46c0a08d4c8af8b7750ea218";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -584,7 +584,7 @@ const exactAndroidFailureHierarchyCommand = '    adb -s "$emulator_serial" exec-
 const exactAndroidFailureSystemLogCommand = '    adb -s "$emulator_serial" logcat -b all -d > .artifacts/launch/device/android-system.log 2>&1';
 const exactAndroidFailureLastAnrCommand = '    adb -s "$emulator_serial" shell dumpsys activity lastanr > .artifacts/launch/device/android-lastanr.txt 2>&1';
 const exactAndroidFailureRootCommand = '    adb -s "$emulator_serial" root';
-const exactAndroidFailureWaitForDeviceCommand = '    adb -s "$emulator_serial" wait-for-device';
+const exactAndroidFailureWaitForDeviceCommand = '    timeout 30s adb -s "$emulator_serial" wait-for-device';
 const exactAndroidFailureAnrFilesCommand = "    adb -s \"$emulator_serial\" shell 'ls -la /data/anr; cat /data/anr/*' > .artifacts/launch/device/android-anr-files.txt 2>&1";
 const exactAndroidFailurePidCommand = String.raw`    app_pid=$(adb -s "$emulator_serial" shell pidof -s com.luyao618.formobile 2>/dev/null | tr -d "\r")`;
 const exactAndroidFailureLogCommand = '      adb -s "$emulator_serial" logcat -d --pid="$app_pid" > .artifacts/launch/device/android-app.log 2>&1';
@@ -1398,9 +1398,9 @@ test("Android EXIT cleanup preserves success and failure status with failure-onl
     const runCleanup = async (
       status: number,
       appPid = "",
-      options: { failCommand?: string; metroPid?: string; metroLogPresent?: boolean } = {},
+      options: { failCommand?: string; metroPid?: string; metroLogPresent?: boolean; timeoutStatus?: number } = {},
     ) => {
-      const { failCommand = "", metroPid = "424242", metroLogPresent = true } = options;
+      const { failCommand = "", metroPid = "424242", metroLogPresent = true, timeoutStatus = 0 } = options;
       const deviceDir = join(root, ".artifacts/launch/device");
       const metroLog = join(root, `metro-${status}-${metroPid || "empty"}.log`);
       await rm(deviceDir, { recursive: true, force: true });
@@ -1446,6 +1446,18 @@ adb() {
     *"logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V *:S") printf 'logcat-sentinel' ;;
   esac
 }
+timeout() {
+  printf 'timeout %s\\n' "$*" >> "$HARNESS_ADB_LOG"
+  duration="$1"
+  shift
+  if [ "$duration" != "30s" ]; then
+    return 93
+  fi
+  if [ "$HARNESS_TIMEOUT_STATUS" -ne 0 ]; then
+    return "$HARNESS_TIMEOUT_STATUS"
+  fi
+  "$@"
+}
 kill() { printf 'kill %s\\n' "$*" >> "$HARNESS_ADB_LOG"; }
 wait() { printf 'wait %s\\n' "$*" >> "$HARNESS_ADB_LOG"; }
 if adb -s "$emulator_serial" shell 'ls -la /data/anr; cat /data/anr/*' >/dev/null 2>&1; then
@@ -1464,6 +1476,7 @@ exit ${status}
         HARNESS_FAIL_COMMAND: failCommand,
         HARNESS_METRO_PID: metroPid,
         HARNESS_METRO_LOG: metroLog,
+        HARNESS_TIMEOUT_STATUS: String(timeoutStatus),
       } });
     };
 
@@ -1493,6 +1506,7 @@ exit ${status}
     const pidFailureAdbCalls = pidFailureAdbLog.trim().split("\n");
     for (const exactCall of [
       "-s emulator-5554 root",
+      "timeout 30s adb -s emulator-5554 wait-for-device",
       "-s emulator-5554 wait-for-device",
       "-s emulator-5554 shell ls -la /data/anr; cat /data/anr/*",
     ]) {
@@ -1509,6 +1523,7 @@ exit ${status}
       "logcat -b all -d",
       "dumpsys activity lastanr",
       "-s emulator-5554 root",
+      "timeout 30s adb -s emulator-5554 wait-for-device",
       "-s emulator-5554 wait-for-device",
       "ls -la /data/anr; cat /data/anr/*",
       "pidof -s com.luyao618.formobile",
@@ -1523,6 +1538,34 @@ exit ${status}
     assert.equal(await readFile(join(root, ".artifacts/launch/device/android-app.log"), "utf8"), "logcat-sentinel");
     assert.match(await readFile(adbLog, "utf8"), /logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V \*:S/);
     assert.doesNotMatch(await readFile(adbLog, "utf8"), /logcat -d --pid=/);
+
+    const reconnectTimeout = await runCleanup(74, "1234", { timeoutStatus: 124 });
+    assert.equal(reconnectTimeout.status, 74, `timeout status 124 must preserve the original status: ${reconnectTimeout.stderr}`);
+    assert.equal(reconnectTimeout.stdout, "metro-sentinel\n");
+    assert.match(
+      await readFile(join(root, ".artifacts/launch/device/android-anr-files.txt"), "utf8"),
+      /cat: \/data\/anr: Permission denied/,
+    );
+    assert.equal(await readFile(join(root, ".artifacts/launch/device/android-app.log"), "utf8"), "pid-logcat-sentinel");
+    const reconnectTimeoutLog = await readFile(adbLog, "utf8");
+    assert.equal(
+      reconnectTimeoutLog.split("\n").filter((call) => call === "timeout 30s adb -s emulator-5554 wait-for-device").length,
+      1,
+      "failure cleanup must invoke the exact reconnect timeout once",
+    );
+    assert.doesNotMatch(reconnectTimeoutLog, /^-s emulator-5554 wait-for-device$/m, "timed-out reconnect must not complete");
+    ordered(
+      reconnectTimeoutLog,
+      "logcat -b all -d",
+      "dumpsys activity lastanr",
+      "-s emulator-5554 root",
+      "timeout 30s adb -s emulator-5554 wait-for-device",
+      "ls -la /data/anr; cat /data/anr/*",
+      "pidof -s com.luyao618.formobile",
+      "logcat -d --pid=1234",
+      "kill 424242",
+      "wait 424242",
+    );
 
     for (const [failCommand, appPid] of [
       ["screencap -p", "1234"],
@@ -1842,7 +1885,15 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
 
   const androidAnrPrivilegeMutations = [
     ["removed root", androidRunner.replace(`${exactAndroidFailureRootCommand}\n`, "")],
-    ["removed wait-for-device", androidRunner.replace(`${exactAndroidFailureWaitForDeviceCommand}\n`, "")],
+    [
+      "bare wait-for-device",
+      androidRunner.replace(exactAndroidFailureWaitForDeviceCommand, '    adb -s "$emulator_serial" wait-for-device'),
+    ],
+    ["removed timeout wrapper", androidRunner.replace(`${exactAndroidFailureWaitForDeviceCommand}\n`, "")],
+    [
+      "widened timeout wrapper",
+      androidRunner.replace(exactAndroidFailureWaitForDeviceCommand, '    timeout 60s adb -s "$emulator_serial" wait-for-device'),
+    ],
     ["removed ANR read", androidRunner.replace(`${exactAndroidFailureAnrFilesCommand}\n`, "")],
     [
       "root before full logcat",
@@ -1859,7 +1910,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
       ),
     ],
     [
-      "wait-for-device before root",
+      "reordered timeout wrapper before root",
       androidRunner.replace(
         `${exactAndroidFailureRootCommand}\n${exactAndroidFailureWaitForDeviceCommand}`,
         `${exactAndroidFailureWaitForDeviceCommand}\n${exactAndroidFailureRootCommand}`,
@@ -1880,7 +1931,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
       ),
     ],
     [
-      "duplicated wait-for-device",
+      "duplicated timeout wrapper",
       androidRunner.replace(
         exactAndroidFailureWaitForDeviceCommand,
         `${exactAndroidFailureWaitForDeviceCommand}\n${exactAndroidFailureWaitForDeviceCommand}`,
@@ -1898,7 +1949,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
       androidRunner.replace(exactAndroidFailureRootCommand, `${exactAndroidFailureRootCommand} || true`),
     ],
     [
-      "fail-open wait-for-device",
+      "fail-open timeout wrapper",
       androidRunner.replace(
         exactAndroidFailureWaitForDeviceCommand,
         `${exactAndroidFailureWaitForDeviceCommand} || :`,
