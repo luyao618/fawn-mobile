@@ -620,6 +620,13 @@ const exactIosOpenConfirmationFlow = `appId: com.luyao618.formobile
       - tapOn:
           point: '69%,54%'
           label: 'Tap the right-side Open button in the iOS confirmation alert'
+      - runFlow:
+          when:
+            visible: '^Open in .For Mobile.\\?$'
+          commands:
+            - tapOn:
+                point: '69%,54%'
+                label: 'Retry the right-side Open button'
       - assertNotVisible: '^Open in .For Mobile.\\?$'
 `;
 
@@ -1804,24 +1811,62 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     );
   }
 
-  const confirmationFlowMutations = [
-    confirmation.replace("- runFlow:\n", ""),
-    confirmation.replace("- runFlow:\n", "- runFlow:\n- runFlow:\n"),
-    confirmation.replace(
-      "      - tapOn:\n          point: '69%,54%'\n          label: 'Tap the right-side Open button in the iOS confirmation alert'\n      - assertNotVisible: '^Open in .For Mobile.\\?$'",
-      "      - assertNotVisible: '^Open in .For Mobile.\\?$'\n      - tapOn:\n          point: '69%,54%'\n          label: 'Tap the right-side Open button in the iOS confirmation alert'",
-    ),
-    confirmation.replaceAll("^Open in .For Mobile.\\?$", "^Open in For Mobile\\?$"),
-    confirmation.replace("point: '69%,54%'", "point: '50%,50%'"),
-    confirmation.replace("      - assertNotVisible: '^Open in .For Mobile.\\?$'\n", ""),
-    confirmation.replace(
-      "          label: 'Tap the right-side Open button in the iOS confirmation alert'\n",
-      "          label: 'Tap the right-side Open button in the iOS confirmation alert'\n          optional: true\n",
-    ),
+  const exactInitialConfirmationTap = "      - tapOn:\n          point: '69%,54%'\n          label: 'Tap the right-side Open button in the iOS confirmation alert'\n";
+  const exactConditionalConfirmationRetry = "      - runFlow:\n          when:\n            visible: '^Open in .For Mobile.\\?$'\n          commands:\n            - tapOn:\n                point: '69%,54%'\n                label: 'Retry the right-side Open button'\n";
+  const exactFinalConfirmationAssertion = "      - assertNotVisible: '^Open in .For Mobile.\\?$'\n";
+  const confirmationFlowMutations: [string, string][] = [
+    ["missing outer prompt-conditioned flow", confirmation.replace("- runFlow:\n", "")],
+    ["duplicated outer prompt-conditioned flow", confirmation.replace("- runFlow:\n", "- runFlow:\n- runFlow:\n")],
+    ["missing conditional retry", confirmation.replace(exactConditionalConfirmationRetry, "")],
+    [
+      "unconditional retry",
+      confirmation.replace(
+        "          when:\n            visible: '^Open in .For Mobile.\\?$'\n          commands:\n",
+        "          commands:\n",
+      ),
+    ],
+    [
+      "optional retry",
+      confirmation.replace(
+        "                label: 'Retry the right-side Open button'\n",
+        "                label: 'Retry the right-side Open button'\n                optional: true\n",
+      ),
+    ],
+    [
+      "changed retry point",
+      confirmation.replace(
+        "                point: '69%,54%'\n                label: 'Retry the right-side Open button'",
+        "                point: '50%,50%'\n                label: 'Retry the right-side Open button'",
+      ),
+    ],
+    [
+      "reordered retry",
+      confirmation.replace(
+        `${exactConditionalConfirmationRetry}${exactFinalConfirmationAssertion}`,
+        `${exactFinalConfirmationAssertion}${exactConditionalConfirmationRetry}`,
+      ),
+    ],
+    [
+      "duplicated third retry",
+      confirmation.replace(exactConditionalConfirmationRetry, exactConditionalConfirmationRetry.repeat(2)),
+    ],
+    ["removed final assertion", confirmation.replace(exactFinalConfirmationAssertion, "")],
+    ["changed confirmation prompt", confirmation.replaceAll("^Open in .For Mobile.\\?$", "^Open in For Mobile\\?$")],
+    [
+      "changed initial tap point",
+      confirmation.replace(
+        exactInitialConfirmationTap,
+        exactInitialConfirmationTap.replace("point: '69%,54%'", "point: '50%,50%'"),
+      ),
+    ],
   ];
-  for (const mutatedFlow of confirmationFlowMutations) {
-    assert.notEqual(mutatedFlow, confirmation);
-    assert.throws(() => assertIosOpenConfirmationFlow(mutatedFlow), /flow bytes must remain exact/);
+  for (const [label, mutatedFlow] of confirmationFlowMutations) {
+    assert.notEqual(mutatedFlow, confirmation, `${label} fixture must change the confirmation flow`);
+    assert.throws(
+      () => assertIosOpenConfirmationFlow(mutatedFlow),
+      /flow bytes must remain exact/,
+      `${label} must be rejected`,
+    );
   }
 
   const withReadinessWait = `${confirmation}- extendedWaitUntil:\n    visible: "照护空间尚未设置"\n    timeout: 120000\n`;
