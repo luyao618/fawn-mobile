@@ -67,9 +67,22 @@ test("two real local mock profiles and delayed abort use the same adapter", asyn
   assert.deepEqual(server.observedCookieHeaders(), [undefined, undefined]);
   const controller = new AbortController();
   const request = streamChatCompletion(fetch, new URL(`${server.baseUrl}/abort/chat/completions`), payload, controller.signal);
+  const readiness = server.waitForAbortRequest();
+  const prematureSettlement = request.then(
+    () => { throw new Error("Abort request resolved before server observation"); },
+    () => { throw new Error("Abort request rejected before server observation"); },
+  );
+  await Promise.race([readiness, prematureSettlement]);
+  await readiness;
   setTimeout(() => controller.abort(), 20);
   await assert.rejects(request, (error: unknown) => error instanceof TransportError && error.category === "cancelled");
   assert.deepEqual(server.observedCookieHeaders(), [undefined, undefined, undefined]);
+});
+
+test("missing abort request observation fails within a bounded timeout", async (t) => {
+  const server = await startMockCompatibleServer();
+  t.after(server.close);
+  await assert.rejects(server.waitForAbortRequest(), /Timed out waiting for a validated abort request/);
 });
 
 test("UT-MODEL-004 AbortController produces the cancelled category", async () => {

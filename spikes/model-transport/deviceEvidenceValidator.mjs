@@ -6,7 +6,6 @@ import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const G017_SOURCE_PATHS = Object.freeze([
-  ".gitignore",
   "spikes/model-transport/App.tsx",
   "spikes/model-transport/app.json",
   "spikes/model-transport/deviceEvidenceValidator.mjs",
@@ -38,15 +37,9 @@ export const G017_SOURCE_PATHS = Object.freeze([
   "tools/export-g017.mjs",
   "tools/redaction.d.mts",
   "tools/redaction.mjs",
-  "tools/run-slice0.mjs",
-  "tools/run-typecheck.mjs",
-  "tools/run-expo-doctor-isolated.mjs",
   "tools/start-mock-provider.mts",
   "dependencies.slice0.lock.json",
   "licenses.slice0.json",
-  "package-lock.json",
-  "package.json",
-  "tsconfig.json",
 ]);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -217,9 +210,9 @@ export function validateProofText(text, platform, fingerprint) {
   return failures;
 }
 
-function hermesCompilerPath(root) {
+export function hermesCompilerPath(root = REPO_ROOT) {
   const binary = process.platform === "darwin" ? "osx-bin/hermesc" : process.platform === "linux" ? "linux64-bin/hermesc" : "win64-bin/hermesc.exe";
-  return resolve(root, "node_modules/hermes-compiler/hermesc", binary);
+  return resolve(root, "spikes/model-transport/node_modules/hermes-compiler/hermesc", binary);
 }
 
 async function regularFile(path, label, failures) {

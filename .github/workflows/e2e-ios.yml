@@ -1,0 +1,156 @@
+name: iOS E2E
+
+on:
+  workflow_call:
+    inputs:
+      expected_sha:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.expected_sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.18.0
+          cache: npm
+      - run: test "$(git rev-parse HEAD)" = "${{ inputs.expected_sha }}"
+      - name: Preflight pinned Xcode and Swift
+        run: |
+          set -euo pipefail
+          test "$DEVELOPER_DIR" = "/Applications/Xcode_26.3.app/Contents/Developer"
+          test -d "$DEVELOPER_DIR"
+          xcode_version=$(/usr/bin/xcodebuild -version)
+          printf '%s\n' "$xcode_version"
+          test "$(printf '%s\n' "$xcode_version" | sed -n '1p')" = "Xcode 26.3"
+          swift_version=$(/usr/bin/xcrun swift --version)
+          printf '%s\n' "$swift_version"
+          SWIFT_VERSION="$swift_version" node - <<'NODE'
+          const match = /^Apple Swift version (\d+)\.(\d+)(?:\.\d+)?/m.exec(process.env.SWIFT_VERSION ?? "");
+          if (match === null) throw new Error("Unable to parse Apple Swift version");
+          const major = Number(match[1]);
+          const minor = Number(match[2]);
+          if (major < 6 || (major === 6 && minor < 2)) {
+            throw new Error("Apple Swift 6.2 or newer is required; found " + major + "." + minor);
+          }
+          console.log("Apple Swift preflight passed: " + major + "." + minor);
+          NODE
+      - run: npm ci --workspaces --include-workspace-root
+      - name: Install pinned Maestro
+        run: |
+          curl --fail --location --silent --show-error https://github.com/mobile-dev-inc/Maestro/releases/download/cli-2.6.1/maestro.zip --output /tmp/maestro.zip
+          echo "3440825f514f537c6a96bcf5de995780c2a4a7f83a43208fdc95d4f1fecfad3b  /tmp/maestro.zip" | shasum -a 256 --check
+          unzip -q /tmp/maestro.zip -d "$HOME/.maestro"
+          echo "$HOME/.maestro/maestro/bin" >> "$GITHUB_PATH"
+      - name: Resolve config reports
+        run: node tools/check-app-config.mjs --platform ios --expected-sha "${{ inputs.expected_sha }}" --output-dir .artifacts/config
+      - name: Serial production and E2E builds, install, and smoke
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/launch/maestro .artifacts/launch/simulator .artifacts/test-results
+          simulator_udid=$(xcrun simctl list devices available -j | node -e '
+            let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
+              const devices = JSON.parse(input).devices;
+              const matches = Object.entries(devices).flatMap(([runtime, values]) => values.filter(device => device.name === "iPhone 16").map(device => ({ runtime, udid: device.udid })));
+              matches.sort((a, b) => a.runtime.localeCompare(b.runtime, undefined, { numeric: true }));
+              if (matches.length === 0) throw new Error("No available iPhone 16 simulator found");
+              process.stdout.write(matches.at(-1).udid);
+            });')
+          test -n "$simulator_udid"
+          simulator_state=$(xcrun simctl list devices -j | SIMULATOR_UDID="$simulator_udid" node -e '
+            let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
+              const udid = process.env.SIMULATOR_UDID;
+              const match = Object.values(JSON.parse(input).devices).flat().find(device => device.udid === udid);
+              if (!match) throw new Error(`Simulator ${udid} disappeared`);
+              process.stdout.write(match.state);
+            });')
+          case "$simulator_state" in
+            Shutdown) xcrun simctl boot "$simulator_udid" ;;
+            Booted) ;;
+            *) echo "Unexpected simulator state: $simulator_state" >&2; exit 1 ;;
+          esac
+          open "$DEVELOPER_DIR/Applications/Simulator.app" --args -CurrentDeviceUDID "$simulator_udid"
+          xcrun simctl bootstatus "$simulator_udid" -b
+
+          npm run prebuild:ios:production
+          mkdir -p .artifacts/native/ios/production
+          cp ios/ForMobile/Info.plist .artifacts/native/ios/production/Info.plist
+          node tools/check-native-schemes.mjs --platform ios --flavor production --input .artifacts/native/ios/production/Info.plist --expected-sha "${{ inputs.expected_sha }}" --output .artifacts/schemes/ios-production.json
+          (cd ios && pod install)
+          xcodebuild -workspace ios/ForMobile.xcworkspace -scheme ForMobile -configuration Debug -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_udid" -derivedDataPath /tmp/g018-ios-production CODE_SIGNING_ALLOWED=NO build
+
+          npm run prebuild:ios:e2e
+          mkdir -p .artifacts/native/ios/e2e
+          cp ios/ForMobile/Info.plist .artifacts/native/ios/e2e/Info.plist
+          node tools/check-native-schemes.mjs --platform ios --flavor e2e --input .artifacts/native/ios/e2e/Info.plist --expected-sha "${{ inputs.expected_sha }}" --output .artifacts/schemes/ios-e2e.json
+          (cd ios && pod install)
+          xcodebuild -workspace ios/ForMobile.xcworkspace -scheme ForMobile -configuration Debug -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_udid" -derivedDataPath /tmp/g018-ios-e2e CODE_SIGNING_ALLOWED=NO build
+          app_path=$(find /tmp/g018-ios-e2e/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$app_path"
+          xcrun simctl install "$simulator_udid" "$app_path"
+          CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &
+          metro_pid=$!
+          cleanup() {
+            status=$?
+            trap - EXIT
+            set +e
+            if [ "$status" -ne 0 ]; then
+              xcrun simctl io "$simulator_udid" screenshot .artifacts/launch/simulator/ios-failure.png
+              xcrun simctl spawn "$simulator_udid" log show --style compact --last 15m --predicate 'process == "ForMobile" OR process == "SpringBoard"' > .artifacts/launch/simulator/ios-simulator-app.log 2>&1
+            fi
+            kill "$metro_pid" 2>/dev/null
+            cat /tmp/metro.log
+            exit "$status"
+          }
+          trap cleanup EXIT
+          for attempt in $(seq 1 60); do curl --silent --fail http://127.0.0.1:8081/status >/dev/null && break; sleep 2; done
+          curl --silent --fail http://127.0.0.1:8081/status
+          dev_client_url='formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081'
+          printf 'device=%s\nurl=%s\n' "$simulator_udid" "$dev_client_url" | tee .artifacts/launch/ios-dev-client.log
+          xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log
+          maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-open-confirmation e2e/maestro/ios-open-confirmation.yaml 2>&1 | tee .artifacts/launch/ios-open-confirmation.log
+          xcrun simctl openurl "$simulator_udid" "$dev_client_url" 2>&1 | tee -a .artifacts/launch/ios-dev-client.log
+          maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-open-confirmation e2e/maestro/ios-open-confirmation.yaml 2>&1 | tee .artifacts/launch/ios-open-confirmation.log
+          maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-readiness e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/launch/ios-readiness.log
+          maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-smoke e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log
+          mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log
+      - name: Collect same-SHA evidence
+        run: |
+          node tools/collect-ci-evidence.mjs \
+            --expected-sha "${{ inputs.expected_sha }}" --platform ios --flavor e2e \
+            --test-result pass --test-result-file .artifacts/test-results/ios-maestro.log \
+            --config-report-production .artifacts/config/ios-production.json \
+            --config-report-e2e .artifacts/config/ios-e2e.json \
+            --scheme-report-production .artifacts/schemes/ios-production.json \
+            --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
+            --output .artifacts/ios-e2e.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ios-e2e-evidence-${{ inputs.expected_sha }}
+          path: |
+            .artifacts/ios-e2e.json
+            .artifacts/config/ios-*.json
+            .artifacts/schemes/ios-*.json
+            .artifacts/native/ios/**
+            .artifacts/launch/ios-dev-client.log
+            .artifacts/test-results/ios-maestro.log
+          if-no-files-found: error
+      - name: Retain Ios launch and Maestro diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ios-e2e-diagnostics-${{ inputs.expected_sha }}
+          path: |
+            .artifacts/launch/**
+            .artifacts/test-results/**
+          include-hidden-files: true
+          if-no-files-found: ignore

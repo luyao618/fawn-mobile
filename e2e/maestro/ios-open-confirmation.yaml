@@ -1,0 +1,17 @@
+appId: com.luyao618.formobile
+---
+- runFlow:
+    when:
+      visible: '^Open in .For Mobile.\?$'
+    commands:
+      - tapOn:
+          point: '69%,54%'
+          label: 'Tap the right-side Open button in the iOS confirmation alert'
+      - runFlow:
+          when:
+            visible: '^Open in .For Mobile.\?$'
+          commands:
+            - tapOn:
+                point: '69%,54%'
+                label: 'Retry the right-side Open button'
+      - assertNotVisible: '^Open in .For Mobile.\?$'

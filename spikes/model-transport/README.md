@@ -20,6 +20,14 @@ Release runs must set `EXPO_PUBLIC_G017_SOURCE_FINGERPRINT` to the output of:
 node spikes/model-transport/deviceEvidenceValidator.mjs --fingerprint
 ```
 
+The fingerprint owns the G017 spike runtime, provider fixtures, shared redaction and Slice 0 policy
+files used by that runtime, its verifier/export tooling, and the tests that lock those contracts. It
+deliberately excludes mutable root-app and generic orchestration files (`.gitignore`, root
+`package.json`, `package-lock.json`, and `tsconfig.json`, plus `tools/run-slice0.mjs`,
+`tools/run-typecheck.mjs`, and `tools/run-expo-doctor-isolated.mjs`). Those files can evolve for the
+production app without invalidating retained G017 proof; changes to G017-owned spike inputs still
+change the fingerprint.
+
 The app emits exactly one bounded `G017_TRANSPORT_PROOF` terminal JSON record. PASS requires Release,
 Hermes, New Architecture, both mock profiles, cancellation, exact dependency identity, and the source
 fingerprint. The record explicitly reports only an emulator/simulator local mock; it does not claim

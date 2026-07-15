@@ -10,10 +10,48 @@ import test from "node:test";
 import {
   G017_SOURCE_PATHS,
   computeG017SourceFingerprint,
+  hermesCompilerPath,
   validateExportArtifact,
   validateG017Evidence,
   validateProofText,
 } from "../../../spikes/model-transport/deviceEvidenceValidator.mjs";
+
+const EXACT_G017_SOURCE_PATHS = [
+  "spikes/model-transport/App.tsx",
+  "spikes/model-transport/app.json",
+  "spikes/model-transport/deviceEvidenceValidator.mjs",
+  "spikes/model-transport/index.ts",
+  "spikes/model-transport/metro.config.cjs",
+  "spikes/model-transport/package-lock.json",
+  "spikes/model-transport/package.json",
+  "spikes/model-transport/README.md",
+  "spikes/model-transport/plugins/withLocalMockNetwork.cjs",
+  "spikes/model-transport/src/adapter.ts",
+  "spikes/model-transport/src/contracts.ts",
+  "spikes/model-transport/src/deviceProof.ts",
+  "spikes/model-transport/src/sse.ts",
+  "spikes/model-transport/src/url.ts",
+  "spikes/model-transport/tsconfig.json",
+  "tests/fixtures/providers/chat-completions/malformed-json.sse",
+  "tests/fixtures/providers/chat-completions/premature-eof.sse",
+  "tests/fixtures/providers/chat-completions/profile-a.sse",
+  "tests/fixtures/providers/chat-completions/profile-b.sse",
+  "tests/fixtures/providers/mockCompatibleServer.ts",
+  "tests/unit/model/device-evidence-validator.test.ts",
+  "tests/unit/model/provider-contract.test.ts",
+  "tests/unit/model/sse-parser.test.ts",
+  "tests/unit/model/transport-lifecycle.test.ts",
+  "tests/unit/tooling/redaction.test.ts",
+  "tests/unit/tooling/typecheck-fixture-lifecycle.test.ts",
+  "tools/check-audit.mjs",
+  "tools/check-licenses.mjs",
+  "tools/export-g017.mjs",
+  "tools/redaction.d.mts",
+  "tools/redaction.mjs",
+  "tools/start-mock-provider.mts",
+  "dependencies.slice0.lock.json",
+  "licenses.slice0.json",
+] as const;
 
 function proofRecord(platform: "android" | "ios", fingerprint: string) {
   return `G017_TRANSPORT_PROOF ${JSON.stringify({
@@ -210,10 +248,66 @@ test("fresh canonical Android and iOS exports pass Hermes validation and local-c
   assert.equal(result.status, "PASS", result.failures.join("; "));
 });
 
-test("G017 source boundary remains exactly 41 unique existing paths", async () => {
-  assert.equal(G017_SOURCE_PATHS.length, 41);
-  assert.equal(new Set(G017_SOURCE_PATHS).size, 41);
-  assert(G017_SOURCE_PATHS.includes(".gitignore"));
+test("G017 source boundary remains exactly 34 unique existing spike-owned paths", async () => {
+  const excludedRootAppPaths = [
+    ".gitignore",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "tools/run-slice0.mjs",
+    "tools/run-typecheck.mjs",
+    "tools/run-expo-doctor-isolated.mjs",
+  ];
+  assert.deepEqual(G017_SOURCE_PATHS, EXACT_G017_SOURCE_PATHS);
+  assert.equal(G017_SOURCE_PATHS.length, 34);
+  assert.equal(new Set(G017_SOURCE_PATHS).size, 34);
+  const sourcePaths: readonly string[] = G017_SOURCE_PATHS;
+  for (const path of excludedRootAppPaths) assert(!sourcePaths.includes(path), path);
   assert(G017_SOURCE_PATHS.includes("tools/redaction.d.mts"));
   for (const path of G017_SOURCE_PATHS) await assert.doesNotReject(readFile(resolve(path)), path);
+});
+
+test("G017 Hermes compiler identity is owned by the spike lock while the root lock remains excluded", async () => {
+  const spikeLock = JSON.parse(await readFile("spikes/model-transport/package-lock.json", "utf8"));
+  const currentHermesVersion = "250829098.0.14";
+  assert.equal(spikeLock.packages["node_modules/hermes-compiler"].version, currentHermesVersion);
+  assert.equal(
+    hermesCompilerPath(),
+    resolve("spikes/model-transport/node_modules/hermes-compiler/hermesc", process.platform === "darwin" ? "osx-bin/hermesc" : process.platform === "linux" ? "linux64-bin/hermesc" : "win64-bin/hermesc.exe"),
+  );
+  assert.match(hermesCompilerPath(), /spikes\/model-transport\/node_modules\/hermes-compiler\/hermesc/);
+  assert(!G017_SOURCE_PATHS.includes("package-lock.json"));
+  assert(G017_SOURCE_PATHS.includes("spikes/model-transport/package-lock.json"));
+});
+
+test("G017 fingerprint ignores excluded root-app mutations but changes for spike-owned mutations", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "g017-source-boundary-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const path of G017_SOURCE_PATHS) {
+    await mkdir(resolve(root, path, ".."), { recursive: true });
+    await writeFile(resolve(root, path), await readFile(resolve(path)));
+  }
+
+  const baseline = await computeG017SourceFingerprint(root);
+  for (const path of [
+    ".gitignore",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "tools/run-slice0.mjs",
+    "tools/run-typecheck.mjs",
+    "tools/run-expo-doctor-isolated.mjs",
+  ]) {
+    await mkdir(resolve(root, path, ".."), { recursive: true });
+    await writeFile(resolve(root, path), `root-app mutation: ${path}\n`);
+  }
+  assert.equal(await computeG017SourceFingerprint(root), baseline);
+
+  for (const path of EXACT_G017_SOURCE_PATHS) {
+    const original = await readFile(resolve(root, path));
+    await writeFile(resolve(root, path), Buffer.concat([original, Buffer.from(`\nG017 owned mutation: ${path}\n`)]));
+    assert.notEqual(await computeG017SourceFingerprint(root), baseline, path);
+    await writeFile(resolve(root, path), original);
+    assert.equal(await computeG017SourceFingerprint(root), baseline, `${path} restoration`);
+  }
 });

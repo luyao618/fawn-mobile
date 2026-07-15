@@ -1,0 +1,106 @@
+name: Android E2E
+
+on:
+  workflow_call:
+    inputs:
+      expected_sha:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      MAESTRO_DRIVER_STARTUP_TIMEOUT: "60000"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.expected_sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.18.0
+          cache: npm
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: test "$(git rev-parse HEAD)" = "${{ inputs.expected_sha }}"
+      - name: Enable KVM hardware acceleration
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+      - run: npm ci --workspaces --include-workspace-root
+      - name: Install pinned Maestro
+        run: |
+          curl --fail --location --silent --show-error https://github.com/mobile-dev-inc/Maestro/releases/download/cli-2.6.1/maestro.zip --output /tmp/maestro.zip
+          echo "3440825f514f537c6a96bcf5de995780c2a4a7f83a43208fdc95d4f1fecfad3b  /tmp/maestro.zip" | sha256sum --check
+          unzip -q /tmp/maestro.zip -d "$HOME/.maestro"
+          echo "$HOME/.maestro/maestro/bin" >> "$GITHUB_PATH"
+      - name: Resolve config reports
+        run: node tools/check-app-config.mjs --platform android --expected-sha "${{ inputs.expected_sha }}" --output-dir .artifacts/config
+      - name: Clean-prebuild, inspect, and build production
+        run: |
+          npm run prebuild:android:production
+          mkdir -p .artifacts/native/android/production
+          cp android/app/src/main/AndroidManifest.xml .artifacts/native/android/production/AndroidManifest.xml
+          node tools/check-native-schemes.mjs --platform android --flavor production --input .artifacts/native/android/production/AndroidManifest.xml --expected-sha "${{ inputs.expected_sha }}" --output .artifacts/schemes/android-production.json
+          (cd android && ./gradlew :app:assembleDebug --no-daemon)
+      - name: Clean-prebuild, inspect, and build E2E
+        run: |
+          npm run prebuild:android:e2e
+          mkdir -p .artifacts/native/android/e2e
+          cp android/app/src/main/AndroidManifest.xml .artifacts/native/android/e2e/AndroidManifest.xml
+          node tools/check-native-schemes.mjs --platform android --flavor e2e --input .artifacts/native/android/e2e/AndroidManifest.xml --expected-sha "${{ inputs.expected_sha }}" --output .artifacts/schemes/android-e2e.json
+          (cd android && ./gradlew :app:assembleDebug -PreactNativeArchitectures=x86_64 --no-daemon)
+      - name: Verify KVM immediately before emulator launch
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+      - uses: ReactiveCircus/android-emulator-runner@1dcd0090116d15e7c562f8db72807de5e036a4ed
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          disable-linux-hw-accel: false
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -accel on
+          script: bash scripts/e2e/run-android-emulator.sh
+      - name: Collect same-SHA evidence
+        run: |
+          node tools/collect-ci-evidence.mjs \
+            --expected-sha "${{ inputs.expected_sha }}" --platform android --flavor e2e \
+            --test-result pass --test-result-file .artifacts/test-results/android-maestro.log \
+            --config-report-production .artifacts/config/android-production.json \
+            --config-report-e2e .artifacts/config/android-e2e.json \
+            --scheme-report-production .artifacts/schemes/android-production.json \
+            --scheme-report-e2e .artifacts/schemes/android-e2e.json \
+            --output .artifacts/android-e2e.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: android-e2e-evidence-${{ inputs.expected_sha }}
+          path: |
+            .artifacts/android-e2e.json
+            .artifacts/config/android-*.json
+            .artifacts/schemes/android-*.json
+            .artifacts/native/android/**
+            .artifacts/launch/android-dev-client.log
+            .artifacts/test-results/android-maestro.log
+          if-no-files-found: error
+      - name: Retain Android launch and Maestro diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: android-e2e-diagnostics-${{ inputs.expected_sha }}
+          path: |
+            .artifacts/launch/**
+            .artifacts/test-results/**
+          include-hidden-files: true
+          if-no-files-found: ignore

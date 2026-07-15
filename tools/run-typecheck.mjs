@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const generatedDirectory = resolve(repoRoot, "spikes/sqlite-fts/.generated");
 
-function run(command, args) {
+function run(command, args, cwd = repoRoot) {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(command, args, { cwd: repoRoot, env: process.env, stdio: "inherit" });
+    const child = spawn(command, args, { cwd, env: process.env, stdio: "inherit" });
     child.once("error", reject);
     child.once("exit", (code, signal) => {
       if (code === 0) resolveRun();
@@ -20,7 +20,10 @@ function run(command, args) {
 export async function runTypecheck() {
   try {
     await run(process.execPath, ["spikes/sqlite-fts/scripts/generate-fixtures.mjs"]);
-    await run(process.execPath, ["node_modules/typescript/bin/tsc", "--noEmit"]);
+    for (const project of ["tsconfig.json", "tsconfig.tests.json", "tsconfig.node.json", "spikes/sqlite-fts/tsconfig.json", "spikes/backup-crypto/tsconfig.json"]) {
+      await run(process.execPath, ["node_modules/typescript/bin/tsc", "--project", project, "--noEmit"]);
+    }
+    await run(process.execPath, ["node_modules/typescript/bin/tsc", "--project", "tsconfig.json", "--noEmit"], resolve(repoRoot, "spikes/model-transport"));
   } finally {
     await rm(generatedDirectory, { recursive: true, force: true });
   }
