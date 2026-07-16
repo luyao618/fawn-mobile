@@ -273,7 +273,7 @@ function pinnedAndroidActionScript(workflow: Workflow): string {
   assert.deepEqual(step.with, {
     "api-level": 35,
     arch: "x86_64",
-    profile: "pixel_6",
+    profile: "pixel_2",
     cores: 4,
     "disable-linux-hw-accel": false,
     "emulator-options": "-no-window -gpu swiftshader -no-snapshot -noaudio -no-boot-anim -accel on",
@@ -2335,6 +2335,20 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
       () => assertNativeWorkflowPolicy(unsafeAccelerationOptions),
       /Android emulator action inputs must remain exact/,
       `Android emulator must reject acceleration options ${String(hostileOptions)}`,
+    );
+  }
+
+  for (const hostileProfile of [undefined, "pixel_6", "pixel_7", 2] as const) {
+    const wrongProfile = structuredClone(workflows);
+    const emulatorWithProfile = requiredSteps(requiredJob(wrongProfile.android, "android"), "android")
+      .find((step) => step.uses === androidEmulatorAction);
+    assert.ok(emulatorWithProfile?.with);
+    if (hostileProfile === undefined) delete emulatorWithProfile.with.profile;
+    else emulatorWithProfile.with.profile = hostileProfile;
+    assert.throws(
+      () => assertNativeWorkflowPolicy(wrongProfile),
+      /Android emulator action inputs must remain exact/,
+      `Android emulator must reject profile ${String(hostileProfile)}`,
     );
   }
 
