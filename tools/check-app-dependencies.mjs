@@ -7,6 +7,12 @@ const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const exactVersion = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const registryIntegrity = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
 
+export const APPROVED_EXPO_INSTALL_EXCLUSIONS = Object.freeze([
+  "expo",
+  "expo-dev-client",
+  "jest-expo",
+]);
+
 export const APPROVED_APP_DEPENDENCIES = Object.freeze({
   runtime: Object.freeze({
     "@react-native-vector-icons/lucide": "13.1.2",
@@ -14,6 +20,7 @@ export const APPROVED_APP_DEPENDENCIES = Object.freeze({
     "@react-navigation/native": "7.3.8",
     expo: "57.0.4",
     "expo-dev-client": "57.0.5",
+    "expo-sqlite": "57.0.1",
     react: "19.2.3",
     "react-native": "0.86.0",
     "react-native-safe-area-context": "5.7.0",
@@ -35,12 +42,30 @@ export const APPROVED_APP_DEPENDENCIES = Object.freeze({
   }),
 });
 
+export const APPROVED_NATIVE_TRANSITIVE_GRAPH = Object.freeze({
+  "expo-modules-core": Object.freeze({
+    version: "57.0.3",
+    resolved: "https://registry.npmjs.org/expo-modules-core/-/expo-modules-core-57.0.3.tgz",
+    integrity: "sha512-fuD3DjPQvdaldtCJm2erV2/trPMrDJvEwPdz0RuxAQnduiNwZ3yxBoi81ZEKC5GBSJauMo53YXSwogsFagjwFQ==",
+    license: "MIT",
+    requiredBy: Object.freeze({ name: "expo", range: "~57.0.3" }),
+  }),
+  "expo-modules-jsi": Object.freeze({
+    version: "57.0.1",
+    resolved: "https://registry.npmjs.org/expo-modules-jsi/-/expo-modules-jsi-57.0.1.tgz",
+    integrity: "sha512-dECN3pOFv+KrQcGrOhJKEBc1/ob7SBjTTYGRB1bc84zmQ65La0FSrAPxpvnEQf8g9giLB5y9RLqwGxHspjXigQ==",
+    license: "MIT",
+    requiredBy: Object.freeze({ name: "expo-modules-core", range: "~57.0.1" }),
+  }),
+});
+
 export const APPROVED_APP_LICENSES = Object.freeze({
   "@react-native-vector-icons/lucide": "MIT",
   "@react-navigation/bottom-tabs": "MIT",
   "@react-navigation/native": "MIT",
   expo: "MIT",
   "expo-dev-client": "MIT",
+  "expo-sqlite": "MIT",
   react: "MIT",
   "react-native": "MIT",
   "react-native-safe-area-context": "MIT",
@@ -73,6 +98,11 @@ function approvedDeclarations() {
 }
 
 export function validateAppDependencyPolicy(packageJson, packageLock, artifactLock, licenseInventory) {
+  assert.deepEqual(
+    packageJson.expo?.install?.exclude,
+    APPROVED_EXPO_INSTALL_EXCLUSIONS,
+    "Expo install exclusions must exactly match the approved ordered native-regression exceptions",
+  );
   const declared = declarations(packageJson);
   const approved = approvedDeclarations();
   assert.deepEqual(
@@ -95,6 +125,21 @@ export function validateAppDependencyPolicy(packageJson, packageLock, artifactLo
   assert.equal(artifactLock.schema_version, 1, "App dependency schema must be version 1");
   assert.equal(licenseInventory.schema_version, 1, "App license schema must be version 1");
   assert.equal(packageLock.lockfileVersion, 3, "Root npm lockfile version must be 3");
+  for (const [name, approved] of Object.entries(APPROVED_NATIVE_TRANSITIVE_GRAPH)) {
+    const installed = packageLock.packages[`node_modules/${name}`];
+    assert(installed && !installed.link, `${name} is missing or linked in the root package lock`);
+    assert.equal(installed.version, approved.version, `${name} native transitive version drifted`);
+    assert.equal(installed.integrity, approved.integrity, `${name} native transitive integrity drifted`);
+    assert.equal(installed.license, approved.license, `${name} native transitive license drifted`);
+    assert.equal(installed.resolved, approved.resolved, `${name} native transitive registry resolution drifted`);
+    const parent = packageLock.packages[`node_modules/${approved.requiredBy.name}`];
+    assert(parent && !parent.link, `${approved.requiredBy.name} is missing or linked in the root package lock`);
+    assert.equal(
+      parent.dependencies?.[name],
+      approved.requiredBy.range,
+      `${approved.requiredBy.name} dependency on ${name} must exactly match ${approved.requiredBy.range}`,
+    );
+  }
   for (const [name, declaration] of declaredByName) {
     assert.match(declaration.version, exactVersion, `${name} must be exact-pinned`);
     const artifact = artifactByName.get(name);
