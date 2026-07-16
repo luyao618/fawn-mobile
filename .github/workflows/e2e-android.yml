@@ -71,7 +71,7 @@ jobs:
           profile: pixel_6
           cores: 4
           disable-linux-hw-accel: false
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -accel on
+          emulator-options: -no-window -gpu swiftshader -no-snapshot -noaudio -no-boot-anim -accel on
           script: bash scripts/e2e/run-android-emulator.sh
       - name: Collect same-SHA evidence
         run: |
