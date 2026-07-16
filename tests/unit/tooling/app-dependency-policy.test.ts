@@ -19,11 +19,12 @@ function clone<T>(value: T): T {
 
 test("app dependency policy pins the independently approved names, versions, and ownership", async () => {
   const [packageJson, packageLock, artifact, inventory] = await fixtures();
-  assert.deepEqual(validateAppDependencyPolicy(packageJson, packageLock, artifact, inventory), { runtime: 9, development: 12 });
+  assert.deepEqual(validateAppDependencyPolicy(packageJson, packageLock, artifact, inventory), { runtime: 10, development: 12 });
   assert.deepEqual(packageJson.dependencies, APPROVED_APP_DEPENDENCIES.runtime);
   assert.deepEqual(packageJson.devDependencies, APPROVED_APP_DEPENDENCIES.development);
-  assert.equal(Object.keys(APPROVED_APP_LICENSES).length, 21);
+  assert.equal(Object.keys(APPROVED_APP_LICENSES).length, 22);
   assert.equal(APPROVED_APP_LICENSES.expo, "MIT");
+  assert.equal(APPROVED_APP_LICENSES["expo-sqlite"], "MIT");
   assert.equal(APPROVED_APP_LICENSES.typescript, "Apache-2.0");
 });
 
