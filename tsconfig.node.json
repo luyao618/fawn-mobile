@@ -17,6 +17,7 @@
   },
   "include": [
     "tests/fixtures/**/*.ts",
+    "tests/integration/**/*.ts",
     "tests/support/**/*.ts",
     "tests/unit/**/*.ts",
     "tools/**/*.mjs",

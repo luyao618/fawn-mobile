@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { validateResolvedConfigs } from "../../../tools/check-app-config.mjs";
@@ -13,17 +14,42 @@ function config(flavor: string) {
   return JSON.parse(result.stdout);
 }
 
+function introspectedConfig() {
+  const result = spawnSync("npx", ["--no-install", "expo", "config", "--type", "introspect", "--json"], {
+    encoding: "utf8",
+    env: { ...process.env, EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR: "production" },
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
 function validPair() {
   return [config("production"), config("e2e")] as const;
 }
 
-test("resolved configs pin identity, Lucide, dev-client options, and flavor isolation", () => {
+test("resolved configs pin identity, native plugins, and flavor isolation", () => {
   const [production, e2e] = validPair();
   assert.doesNotThrow(() => validateResolvedConfigs(production, e2e));
   assert.deepEqual(production.plugins, [
     "@react-native-vector-icons/lucide",
+    ["expo-secure-store", { configureAndroidBackup: true, faceIDPermission: false }],
     ["expo-dev-client", { toolsButton: false, skipOnboarding: true, showMenuAtLaunch: false }],
   ]);
+  assert.equal(JSON.stringify(production).includes("NSFaceIDUsageDescription"), false);
+  const appJson = JSON.parse(readFileSync(new URL("../../../app.json", import.meta.url), "utf8"));
+  assert.deepEqual(appJson.expo.ios.config, { usesNonExemptEncryption: false });
+});
+
+test("SecureStore introspection configures Android backup without requesting Face ID", () => {
+  const introspected = introspectedConfig();
+  const infoPlist = introspected._internal.modResults.ios.infoPlist;
+  assert.equal(infoPlist.ITSAppUsesNonExemptEncryption, false);
+  assert.equal(Object.hasOwn(infoPlist, "NSFaceIDUsageDescription"), false);
+  const application = introspected._internal.modResults.android.manifest.manifest.application[0].$;
+  assert.equal(application["android:allowBackup"], "true");
+  assert.equal(application["android:fullBackupContent"], "@xml/secure_store_backup_rules");
+  assert.equal(application["android:dataExtractionRules"], "@xml/secure_store_data_extraction_rules");
 });
 
 test("config policy rejects nested Android and iOS privacy permission declarations", () => {
@@ -49,7 +75,7 @@ test("config policy rejects hostile native links, telemetry, and every undeclare
     (value: any) => { value.extra = { telemetryUrl: "https://attacker.example/collect" }; },
     (value: any) => { value.extra = { backendUrl: "https://attacker.example/api" }; },
     (value: any) => { value.android.adaptiveIcon = { foregroundImage: "./attacker.png" }; },
-    (value: any) => { value.ios.config = { usesNonExemptEncryption: false }; },
+    (value: any) => { value.ios.config = { usesNonExemptEncryption: true }; },
     (value: any) => { value.ios.usesIcloudStorage = true; },
     (value: any) => { value.web = { bundler: "metro" }; },
     (value: any) => { value.experiments = { typedRoutes: true }; },

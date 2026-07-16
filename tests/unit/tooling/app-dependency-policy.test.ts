@@ -25,24 +25,28 @@ function clone<T>(value: T): T {
 
 test("app dependency policy pins the independently approved names, versions, and ownership", async () => {
   const [packageJson, packageLock, artifact, inventory] = await fixtures();
-  assert.deepEqual(validateAppDependencyPolicy(packageJson, packageLock, artifact, inventory), { runtime: 10, development: 12 });
+  assert.deepEqual(validateAppDependencyPolicy(packageJson, packageLock, artifact, inventory), { runtime: 11, development: 12 });
   assert.deepEqual(packageJson.dependencies, APPROVED_APP_DEPENDENCIES.runtime);
   assert.deepEqual(packageJson.devDependencies, APPROVED_APP_DEPENDENCIES.development);
-  assert.equal(Object.keys(APPROVED_APP_LICENSES).length, 22);
+  assert.equal(Object.keys(APPROVED_APP_LICENSES).length, 23);
   assert.equal(APPROVED_APP_LICENSES.expo, "MIT");
   assert.equal(APPROVED_APP_LICENSES["expo-sqlite"], "MIT");
+  assert.equal(APPROVED_APP_DEPENDENCIES.runtime["expo-secure-store"], "57.0.1");
+  assert.equal(APPROVED_APP_LICENSES["expo-secure-store"], "MIT");
   assert.equal(APPROVED_APP_LICENSES.typescript, "Apache-2.0");
 });
 
-test("Expo install exclusions reject omission, extras, reordering, and drift while keeping SQLite checked", async () => {
+test("Expo install exclusions reject omission, extras, reordering, and drift while keeping native modules checked", async () => {
   const [basePackageJson, packageLock, artifact, inventory] = await fixtures();
   assert.deepEqual(APPROVED_EXPO_INSTALL_EXCLUSIONS, ["expo", "expo-dev-client", "jest-expo"]);
   assert.deepEqual(basePackageJson.expo.install.exclude, APPROVED_EXPO_INSTALL_EXCLUSIONS);
+  assert.equal(APPROVED_EXPO_INSTALL_EXCLUSIONS.includes("expo-secure-store"), false);
   assert.equal(APPROVED_EXPO_INSTALL_EXCLUSIONS.includes("expo-sqlite"), false);
 
   const mutations = [
     (manifest: any) => { delete manifest.expo.install.exclude; },
     (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client"]; },
+    (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo", "expo-secure-store"]; },
     (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo", "expo-sqlite"]; },
     (manifest: any) => { manifest.expo.install.exclude = ["jest-expo", "expo-dev-client", "expo"]; },
     (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo@57.0.1"]; },
@@ -54,11 +58,12 @@ test("Expo install exclusions reject omission, extras, reordering, and drift whi
   }
 });
 
-test("app dependency policy rejects every approved Expo and SQLite version drift", async () => {
+test("app dependency policy rejects every approved Expo package version drift", async () => {
   const [basePackageJson, packageLock, artifact, inventory] = await fixtures();
   for (const [kind, name] of [
     ["dependencies", "expo"],
     ["dependencies", "expo-dev-client"],
+    ["dependencies", "expo-secure-store"],
     ["dependencies", "expo-sqlite"],
     ["devDependencies", "jest-expo"],
   ] as const) {

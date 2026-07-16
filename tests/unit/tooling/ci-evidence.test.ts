@@ -33,7 +33,7 @@ function baseConfig() {
     userInterfaceStyle: "light",
     android: { package: "com.luyao618.formobile", softwareKeyboardLayoutMode: "resize" },
     ios: { bundleIdentifier: "com.luyao618.formobile", supportsTablet: true },
-    plugins: ["@react-native-vector-icons/lucide", ["expo-dev-client", { toolsButton: false, skipOnboarding: true, showMenuAtLaunch: false }]],
+    plugins: ["@react-native-vector-icons/lucide", ["expo-secure-store", { configureAndroidBackup: true, faceIDPermission: false }], ["expo-dev-client", { toolsButton: false, skipOnboarding: true, showMenuAtLaunch: false }]],
     sdkVersion: "57.0.0",
     platforms: ["ios", "android"],
   };

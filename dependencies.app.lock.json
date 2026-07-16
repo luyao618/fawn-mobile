@@ -7,6 +7,7 @@
     {"name":"@react-navigation/native","version":"7.3.8","kind":"runtime","integrity":"sha512-zHmQcxWBT8GOwsofEOmHqpdM5twkwE/esa9JFGlW4hpXeQTTe/dRcPSLjwsvePtolbDKz0YZbK+I5KrW3j63LQ=="},
     {"name":"expo","version":"57.0.4","kind":"runtime","integrity":"sha512-5wW0SR6OnGUh+UPb3JWlFTAL22IgBcX36RqofjLAH2AuFqxAIpYIdwr9BYR9Wl3xyIe0t9lCoMQIZlAIZUNQvg=="},
     {"name":"expo-dev-client","version":"57.0.5","kind":"runtime","integrity":"sha512-OOQJHb4Cf403AhZAbcZg0OOVJKLc1HArVck92LHd9PO2HuTadj/6YAlWIyXXYfeYYdjoVgLd/cAXnaEAwp6HKg=="},
+    {"name":"expo-secure-store","version":"57.0.1","kind":"runtime","integrity":"sha512-tLa1VmSadOq19mA/dwkl99RbHyjLE0T1qqBYMY3/OsguZTI+rlrDy/DDJjupqlVtmr95hD7o1pYqx5aL+B4YMA=="},
     {"name":"expo-sqlite","version":"57.0.1","kind":"runtime","integrity":"sha512-I6KoUvfGIiROTKxr5D3H+jRIGA/iEvWEtqHK4XMukAA7tVTinz/YdS8zOz6/DdG6vgrNmvF7gyOcbhLinlfxzQ=="},
     {"name":"react","version":"19.2.3","kind":"runtime","integrity":"sha512-Ku/hhYbVjOQnXDZFv2+RibmLFGwFdeeKHFcOTlrt7xplBnya5OGn/hIRDsqDiSUcfORsDC7MPxwork8jBwsIWA=="},
     {"name":"react-native","version":"0.86.0","kind":"runtime","integrity":"sha512-17ALh/dd6AO4pgOVmOO5Axll5PbErEo3XFyLokyzW6usyi+OShIEPwUW26wLPlhVifgSOIfECCH0WN+0IqtJ1w=="},

@@ -10,10 +10,20 @@
     },
     "ios": {
       "bundleIdentifier": "com.luyao618.formobile",
-      "supportsTablet": true
+      "supportsTablet": true,
+      "config": {
+        "usesNonExemptEncryption": false
+      }
     },
     "plugins": [
       "@react-native-vector-icons/lucide",
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true,
+          "faceIDPermission": false
+        }
+      ],
       [
         "expo-dev-client",
         {

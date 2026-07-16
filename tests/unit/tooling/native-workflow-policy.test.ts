@@ -276,7 +276,7 @@ function pinnedAndroidActionScript(workflow: Workflow): string {
     profile: "pixel_6",
     cores: 4,
     "disable-linux-hw-accel": false,
-    "emulator-options": "-no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -accel on",
+    "emulator-options": "-no-window -gpu swiftshader -no-snapshot -noaudio -no-boot-anim -accel on",
     script: "bash scripts/e2e/run-android-emulator.sh",
   }, "Android emulator action inputs must remain exact");
   assertUnconditionalFailClosed(step, "Android emulator action");
@@ -2324,7 +2324,7 @@ test("parsed workflow policy rejects hostile structural counterexamples", async 
     );
   }
 
-  for (const hostileOptions of [undefined, "-accel auto", "-accel off"] as const) {
+  for (const hostileOptions of [undefined, "-gpu swiftshader_indirect -accel on", "-accel auto", "-accel off"] as const) {
     const unsafeAccelerationOptions = structuredClone(workflows);
     const emulator = requiredSteps(requiredJob(unsafeAccelerationOptions.android, "android"), "android")
       .find((step) => step.uses === androidEmulatorAction);
