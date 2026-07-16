@@ -68,7 +68,7 @@ jobs:
         with:
           api-level: 35
           arch: x86_64
-          profile: pixel_6
+          profile: pixel_2
           cores: 4
           disable-linux-hw-accel: false
           emulator-options: -no-window -gpu swiftshader -no-snapshot -noaudio -no-boot-anim -accel on
