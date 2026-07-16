@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const DEV_CLIENT_PLUGIN = ["expo-dev-client", { toolsButton: false, skipOnboarding: true, showMenuAtLaunch: false }];
+const SECURE_STORE_PLUGIN = ["expo-secure-store", { configureAndroidBackup: true, faceIDPermission: false }];
 
 function option(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -43,7 +44,7 @@ const APPROVED_PUBLIC_CONFIG = {
     bundleIdentifier: "com.luyao618.formobile",
     supportsTablet: true,
   },
-  plugins: ["@react-native-vector-icons/lucide", DEV_CLIENT_PLUGIN],
+  plugins: ["@react-native-vector-icons/lucide", SECURE_STORE_PLUGIN, DEV_CLIENT_PLUGIN],
   sdkVersion: "57.0.0",
   platforms: ["ios", "android"],
 };
