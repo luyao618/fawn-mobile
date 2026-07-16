@@ -3,10 +3,14 @@ import { cp, lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, resolve } from "node:path";
 
+import { rewriteExpoDoctorManifest } from "./expo-doctor-manifest.mjs";
+
 const source = resolve(new URL("../spikes/model-transport", import.meta.url).pathname);
 const temporary = await realpath(await mkdtemp(resolve(tmpdir(), "g017-expo-doctor-")));
 const excluded = new Set(["node_modules", ".expo", ".expo-export", "android", "ios"]);
 const placeholderFingerprint = "0".repeat(64);
+const sourceManifest = resolve(source, "package.json");
+const doctorCli = resolve(new URL("../node_modules/expo-doctor/bin/expo-doctor.js", import.meta.url).pathname);
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -50,14 +54,19 @@ async function verifyExport(platform) {
 }
 
 try {
+  const sourceManifestBytes = await readFile(sourceManifest);
   await cp(source, temporary, {
     recursive: true,
     filter(path) {
       return path === source || !excluded.has(basename(path));
     },
   });
+  await rewriteExpoDoctorManifest(resolve(temporary, "package.json"));
+  if (!(await readFile(sourceManifest)).equals(sourceManifestBytes)) {
+    throw new Error("isolated Expo Doctor preparation modified the source spike manifest");
+  }
   run("npm", ["ci", "--ignore-scripts", "--workspaces=false"]);
-  const doctor = run("npx", ["expo-doctor", "--verbose"], { capture: true });
+  const doctor = run(process.execPath, [doctorCli, "--verbose"], { capture: true });
   if (!/20\/20 checks passed\./.test(`${doctor.stdout}\n${doctor.stderr}`)) {
     throw new Error("isolated expo-doctor did not report 20/20 checks passed");
   }
