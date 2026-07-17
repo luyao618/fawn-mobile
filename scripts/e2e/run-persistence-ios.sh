@@ -8,7 +8,7 @@ mkdir -p "$artifacts"
 data_container=$(xcrun simctl get_app_container "$udid" "$app_id" data)
 device_db="$data_container/Documents/SQLite/user.db"
 local_db="$artifacts/user.db"
-stop() { xcrun simctl terminate "$udid" "$app_id" 2>/dev/null || true; }
+stop() { xcrun simctl terminate "$udid" "$app_id"; }
 pull_db() {
   rm -f "$local_db" "$local_db-wal" "$local_db-shm"
   cp "$device_db" "$local_db"; test -s "$local_db"

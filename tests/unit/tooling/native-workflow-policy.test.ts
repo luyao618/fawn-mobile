@@ -2632,12 +2632,27 @@ test("static evidence is recorded only after all gates and requires explicit has
 });
 
 
+const exactIosPersistenceStopHelper = 'stop() { xcrun simctl terminate "$udid" "$app_id"; }';
+
+function assertIosPersistenceTerminatePolicy(wrapper: string): string {
+  const terminateLines = wrapper
+    .split(/\r\n|\n|\r/)
+    .filter((line) => line.includes("simctl terminate"));
+  assert.deepEqual(
+    terminateLines,
+    [exactIosPersistenceStopHelper],
+    "iOS persistence stop helper must remain the exact fail-closed terminate command",
+  );
+  return terminateLines[0];
+}
+
 function assertPersistenceWrapper(wrapper: string, platform: "android" | "ios") {
   assert.match(wrapper, /set -euo pipefail/);
   assert.match(wrapper, /-wal/);
   assert.match(wrapper, /-shm/);
   assert.match(wrapper, /recovered-noop\.json/);
   assert.match(wrapper, /bootstrap-retry\.yaml/);
+  if (platform === "ios") assertIosPersistenceTerminatePolicy(wrapper);
   ordered(
     wrapper,
     'node tools/persistence-evidence.mjs --action corrupt-hash --database "$local_db"',
@@ -2694,6 +2709,45 @@ ${pushCommands[0]}
     ]);
   } finally {
     await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("iOS persistence termination is exact, fail closed, and rejects swallowed failures", async () => {
+  const wrapper = await readFile("scripts/e2e/run-persistence-ios.sh", "utf8");
+  const stopHelper = assertIosPersistenceTerminatePolicy(wrapper);
+  const result = spawnSync("bash", ["-c", `set -euo pipefail
+xcrun() {
+  printf '<%s>\\n' "$@" >&2
+  return 73
+}
+udid=simulator-udid
+app_id=com.luyao618.formobile
+${stopHelper}
+stop
+printf '%s\\n' evidence-collected
+`], { encoding: "utf8" });
+  assert.equal(result.status, 73, "a failed iOS termination must abort evidence collection");
+  assert.equal(result.stdout, "", "no evidence step may run after a failed iOS termination");
+  assert.deepEqual(result.stderr.trimEnd().split("\n"), [
+    "<simctl>",
+    "<terminate>",
+    "<simulator-udid>",
+    "<com.luyao618.formobile>",
+  ], "iOS termination stderr must remain visible");
+
+  for (const [label, hostileHelper] of [
+    ["stderr suppression", 'stop() { xcrun simctl terminate "$udid" "$app_id" 2>/dev/null; }'],
+    ["true swallow", 'stop() { xcrun simctl terminate "$udid" "$app_id" || true; }'],
+    ["no-op swallow", 'stop() { xcrun simctl terminate "$udid" "$app_id" || :; }'],
+    ["suppressed true swallow", 'stop() { xcrun simctl terminate "$udid" "$app_id" 2>/dev/null || true; }'],
+  ] as const) {
+    const mutation = wrapper.replace(exactIosPersistenceStopHelper, hostileHelper);
+    assert.notEqual(mutation, wrapper, `${label} fixture must change the iOS persistence wrapper`);
+    assert.throws(
+      () => assertIosPersistenceTerminatePolicy(mutation),
+      /exact fail-closed terminate command/,
+      `${label} must be rejected`,
+    );
   }
 });
 
