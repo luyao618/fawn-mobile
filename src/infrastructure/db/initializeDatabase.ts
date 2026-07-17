@@ -38,12 +38,31 @@ PRAGMA busy_timeout = ${USER_DATABASE_BUSY_TIMEOUT_MS};
   }
 }
 
-export async function initializeUserDatabase(
+export async function openConfiguredUserDatabase(
   openDatabase: OpenUserDatabase,
 ): Promise<UserDatabaseConnection> {
   const database = await openDatabase(USER_DATABASE_NAME, USER_DATABASE_OPEN_OPTIONS);
   try {
     await configureUserDatabase(database);
+    return database;
+  } catch (initializationError) {
+    try {
+      await database.closeAsync();
+    } catch (closeError) {
+      throw new AggregateError(
+        [initializationError, closeError],
+        "User database configuration failed and closing the connection also failed",
+      );
+    }
+    throw initializationError;
+  }
+}
+
+export async function initializeUserDatabase(
+  openDatabase: OpenUserDatabase,
+): Promise<UserDatabaseConnection> {
+  const database = await openConfiguredUserDatabase(openDatabase);
+  try {
     await applyUserDatabaseMigrations(database);
     return database;
   } catch (initializationError) {

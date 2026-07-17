@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react-native";
+import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StyleSheet } from "react-native";
 
@@ -8,12 +8,18 @@ jest.mock("@react-native-vector-icons/lucide/static", () => ({
   Lucide: () => null,
 }));
 
-function renderNavigator() {
-  return render(<SafeAreaProvider initialMetrics={{ frame: { x: 0, y: 0, width: 390, height: 844 }, insets: { top: 47, left: 0, right: 0, bottom: 34 } }}><RootNavigator /></SafeAreaProvider>);
+async function renderNavigator() {
+  const view = render(
+    <SafeAreaProvider initialMetrics={{ frame: { x: 0, y: 0, width: 390, height: 844 }, insets: { top: 47, left: 0, right: 0, bottom: 34 } }}>
+      <RootNavigator bootstrap={async () => ({ close: async () => {} })} />
+    </SafeAreaProvider>,
+  );
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  return view;
 }
 
-test("renders exactly five accessible tabs with 管家 selected initially", () => {
-  renderNavigator();
+test("renders exactly five accessible tabs with 管家 selected initially", async () => {
+  await renderNavigator();
   expect(screen.getByRole("header", { name: "照护空间尚未设置" })).toBeTruthy();
   const labels = ["管家", "记录", "成长", "相册", "我的"];
   const tabs = screen.getAllByRole("button").filter((item) => labels.includes(item.props.accessibilityLabel));
@@ -27,8 +33,8 @@ test.each([
   ["成长", "还没有可展示的成长数据"],
   ["相册", "还没有照片"],
   ["我的", "本机设置尚未启用"],
-])("visits %s through its accessible tab", (label, heading) => {
-  renderNavigator();
+])("visits %s through its accessible tab", async (label, heading) => {
+  await renderNavigator();
   fireEvent.press(screen.getByLabelText(label));
   expect(screen.getByRole("header", { name: heading })).toBeTruthy();
 });

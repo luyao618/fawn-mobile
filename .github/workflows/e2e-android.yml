@@ -65,6 +65,8 @@ jobs:
           test -r /dev/kvm
           test -w /dev/kvm
       - uses: ReactiveCircus/android-emulator-runner@1dcd0090116d15e7c562f8db72807de5e036a4ed
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
         with:
           api-level: 35
           arch: x86_64
@@ -82,6 +84,7 @@ jobs:
             --config-report-e2e .artifacts/config/android-e2e.json \
             --scheme-report-production .artifacts/schemes/android-production.json \
             --scheme-report-e2e .artifacts/schemes/android-e2e.json \
+            --persistence-report .artifacts/android-persistence.json \
             --output .artifacts/android-e2e.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -93,6 +96,8 @@ jobs:
             .artifacts/native/android/**
             .artifacts/launch/android-dev-client.log
             .artifacts/test-results/android-maestro.log
+            .artifacts/android-persistence.json
+            .artifacts/persistence/android/*.json
           if-no-files-found: error
       - name: Retain Android launch and Maestro diagnostics
         if: always()

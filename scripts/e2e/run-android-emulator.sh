@@ -68,3 +68,6 @@ adb -s "$emulator_serial" shell am start -a android.intent.action.VIEW -d "$dev_
 maestro --device "$emulator_serial" test --debug-output .artifacts/launch/maestro/android-readiness e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/launch/android-readiness.log
 maestro --device "$emulator_serial" test --debug-output .artifacts/launch/maestro/android-smoke e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/android-maestro.attempt.log
 mv .artifacts/test-results/android-maestro.attempt.log .artifacts/test-results/android-maestro.log
+if [ -n "${EXPECTED_SHA:-}" ]; then
+  bash scripts/e2e/run-persistence-android.sh "$emulator_serial" "$EXPECTED_SHA"
+fi

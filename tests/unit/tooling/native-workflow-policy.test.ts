@@ -85,11 +85,11 @@ const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
 const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/android/production/**/*.js\n.artifacts/fault-bundles/android/production/metadata.json\n.artifacts/fault-bundles/android/e2e/**/*.js\n.artifacts/fault-bundles/android/e2e/metadata.json\n.artifacts/fault-bundles/ios/production/**/*.js\n.artifacts/fault-bundles/ios/production/metadata.json\n.artifacts/fault-bundles/ios/e2e/**/*.js\n.artifacts/fault-bundles/ios/e2e/metadata.json\n";
 const exactChildPrimaryUploadPaths = {
-  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n",
-  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n",
+  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n.artifacts/android-persistence.json\n.artifacts/persistence/android/*.json\n",
+  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/persistence/ios/*.json\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "cb4c0f30c3311dd450f7e8e73c866d0da80e27fd46c0a08d4c8af8b7750ea218";
+const exactAndroidRunnerSha256 = "bfdb3d0495949c188658078f7e80fe7f0b11747866ffd0acc95b0320e3db3549";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -160,6 +160,7 @@ const exactChildCollectorRuns = {
   --config-report-e2e .artifacts/config/android-e2e.json \
   --scheme-report-production .artifacts/schemes/android-production.json \
   --scheme-report-e2e .artifacts/schemes/android-e2e.json \
+  --persistence-report .artifacts/android-persistence.json \
   --output .artifacts/android-e2e.json` + "\n",
   ios: String.raw`node tools/collect-ci-evidence.mjs \
   --expected-sha "${expectedShaInput}" --platform ios --flavor e2e \
@@ -168,6 +169,7 @@ const exactChildCollectorRuns = {
   --config-report-e2e .artifacts/config/ios-e2e.json \
   --scheme-report-production .artifacts/schemes/ios-production.json \
   --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
+  --persistence-report .artifacts/ios-persistence.json \
   --output .artifacts/ios-e2e.json` + "\n",
 } as const;
 
@@ -2627,4 +2629,58 @@ test("static evidence is recorded only after all gates and requires explicit has
     ".artifacts/static.json",
     ".artifacts/test-results/static-gates.log",
   );
+});
+
+
+function assertPersistenceWrapper(wrapper: string, platform: "android" | "ios") {
+  assert.match(wrapper, /set -euo pipefail/);
+  assert.match(wrapper, /-wal/);
+  assert.match(wrapper, /-shm/);
+  assert.match(wrapper, /recovered-noop\.json/);
+  assert.match(wrapper, /bootstrap-retry\.yaml/);
+  ordered(
+    wrapper,
+    'node tools/persistence-evidence.mjs --action corrupt-hash --database "$local_db"',
+    "push_db; launch; error_screen",
+    'node tools/persistence-evidence.mjs --action repair-hash --database "$local_db"',
+    "push_db; retry; stop; pull_db",
+    'node tools/persistence-evidence.mjs --action snapshot --database "$local_db" --output "$artifacts/retried.json"',
+    'cp "$local_db" "$artifacts/canonical.db"',
+    'rm -f "$local_db"',
+    'node tools/persistence-evidence.mjs --action create-poison --database "$local_db"',
+    "push_db; launch; error_screen; pull_db",
+    'node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison.json"',
+    'cp "$artifacts/canonical.db" "$local_db"',
+    "push_db; retry; stop",
+    `node tools/persistence-evidence.mjs --action report --platform ${platform}`,
+    'rm -f "$artifacts"/*.db "$artifacts"/*.db-wal "$artifacts"/*.db-shm',
+  );
+}
+
+test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only uploads", async () => {
+  const [android, ios, androidWorkflow, iosWorkflow, errorFlow] = await Promise.all([
+    readFile("scripts/e2e/run-persistence-android.sh", "utf8"),
+    readFile("scripts/e2e/run-persistence-ios.sh", "utf8"),
+    readFile(".github/workflows/e2e-android.yml", "utf8"),
+    readFile(".github/workflows/e2e-ios.yml", "utf8"),
+    readFile("e2e/maestro/bootstrap-error.yaml", "utf8"),
+  ]);
+  assert.match(errorFlow, /visible: "无法打开本机数据"/);
+  assert.doesNotMatch(errorFlow, /页面暂时无法显示/);
+  for (const [platform, wrapper] of [["android", android], ["ios", ios]] as const) {
+    assertPersistenceWrapper(wrapper, platform);
+    const mutations = [
+      wrapper.replace("push_db; retry; stop; pull_db", "push_db; launch; ready; stop; pull_db"),
+      wrapper.replace("push_db; retry; stop", "push_db; launch; ready; stop"),
+      wrapper.replace("push_db; launch; error_screen; pull_db", "push_db; launch; error_screen; stop; pull_db"),
+      wrapper.replace('rm -f "$artifacts"/*.db "$artifacts"/*.db-wal "$artifacts"/*.db-shm', "true"),
+    ];
+    for (const mutation of mutations) assert.throws(() => assertPersistenceWrapper(mutation, platform));
+  }
+  for (const [platform, workflow] of [["android", androidWorkflow], ["ios", iosWorkflow]] as const) {
+    assert(workflow.includes(`.artifacts/persistence/${platform}/*.json`));
+    assert(!workflow.includes(`.artifacts/persistence/${platform}/**`));
+    assert.doesNotMatch(workflow, /\.artifacts\/persistence\/.*\.db/);
+    assert.match(workflow, new RegExp(`--persistence-report \\.artifacts/${platform}-persistence\\.json`));
+  }
 });

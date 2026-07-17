@@ -4,6 +4,7 @@ import { NavigationContainer, type Theme } from "@react-navigation/native";
 import { useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { type Bootstrap, BootstrapHost } from "../features/bootstrap/BootstrapHost";
 import { AlbumScreen, GrowthScreen, MeScreen, RecordsScreen, StewardScreen } from "../features/shell/ShellScreens";
 import { colors } from "../shared/theme/tokens";
 import { ROUTES, type RootTabParamList } from "./routeNames";
@@ -37,12 +38,12 @@ export function getTabBarMetrics(fontScale: number, bottomInset: number) {
   } as const;
 }
 
-export function RootNavigator() {
+export function RootNavigator({ bootstrap }: { bootstrap: Bootstrap }) {
   const { fontScale } = useWindowDimensions();
   const { bottom } = useSafeAreaInsets();
   const tabMetrics = getTabBarMetrics(fontScale, bottom);
 
-  return (
+  const navigation = (
     <NavigationContainer theme={navigationTheme}>
       <Tab.Navigator
         initialRouteName={ROUTES.steward}
@@ -75,4 +76,6 @@ export function RootNavigator() {
       </Tab.Navigator>
     </NavigationContainer>
   );
+
+  return <BootstrapHost bootstrap={bootstrap}>{navigation}</BootstrapHost>;
 }

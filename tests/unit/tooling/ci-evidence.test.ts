@@ -11,6 +11,7 @@ import {
   collectFaultBundleEvidence,
   validateNativeReports,
   validateTestResultInput,
+  validatePersistenceReport,
 } from "../../../tools/collect-ci-evidence.mjs";
 import { NATIVE_EVIDENCE_PATHS, NATIVE_SCHEME_PLACEMENTS } from "../../../tools/check-native-schemes.mjs";
 
@@ -184,4 +185,45 @@ test("schema-v4 fault bundle collector preserves established sentinel leaves exa
       assert.equal((evidence.bundles[platform][flavor] as any).moduleGraph, undefined);
     }
   }
+});
+
+
+test("native persistence evidence requires exact nested same-SHA startup facts", () => {
+  const sha = "a".repeat(40);
+  const migrationSha = "b".repeat(64);
+  const snapshot = {
+    sha256: "c".repeat(64), migration: [{ version: 1, name: "initial-schema", sha256: migrationSha }], journalMode: "wal",
+    objectTypes: [{ type: "index", total: 14 }, { type: "table", total: 26 }, { type: "trigger", total: 3 }],
+    meta: null, jobs: [], turns: [], tasks: [],
+  };
+  const recovered = { ...snapshot, meta: { value_json: '"preserved"' },
+    jobs: [{ id: "e2e-j", status: "queued", lease_owner: null, lease_expires_at: null }],
+    turns: [{ id: "e2e-t", status: "failed", error_code: "startup_interrupted" }],
+    tasks: [{ id: "e2e-p", status: "expired" }],
+  };
+  const report = {
+    schemaVersion: 1, reportType: "startup-persistence", platform: "android",
+    checkedOutSha: sha, expectedSha: sha, migrationSha256: migrationSha, skipped: [],
+    scenarios: {
+      firstOpen: { status: "pass", snapshot },
+      recoveryRelaunch: { status: "pass", snapshot: structuredClone(recovered), noOpSnapshot: structuredClone(recovered) },
+      migrationHashRetry: { status: "pass", snapshot: structuredClone(recovered) },
+      failedMigrationRollback: { status: "pass", snapshot: { objects: ["diagnostic_events"] } },
+    },
+  };
+  assert.deepEqual(validatePersistenceReport(report, "android", sha, migrationSha).scenarios, [
+    "firstOpen", "recoveryRelaunch", "migrationHashRetry", "failedMigrationRollback",
+  ]);
+  assert.throws(() => validatePersistenceReport({ ...report, skipped: ["failedMigrationRollback"] }, "android", sha, migrationSha), /cannot be skipped/);
+  assert.throws(() => validatePersistenceReport({ ...report, checkedOutSha: "d".repeat(40) }, "android", sha, migrationSha), /checked-out SHA/);
+  assert.throws(() => validatePersistenceReport({ ...report, migrationSha256: "e".repeat(64) }, "android", sha, migrationSha), /frozen source/);
+  for (const key of ["meta", "jobs", "turns", "tasks"] as const) {
+    const hostile = structuredClone(report);
+    (hostile.scenarios.migrationHashRetry.snapshot as Record<string, unknown>)[key] = key === "meta" ? null : [];
+    assert.throws(() => validatePersistenceReport(hostile, "android", sha, migrationSha), new RegExp(`migration retry ${key}`));
+  }
+  const hostileRecovery = structuredClone(report); hostileRecovery.scenarios.recoveryRelaunch.snapshot.jobs[0].status = "leased";
+  assert.throws(() => validatePersistenceReport(hostileRecovery, "android", sha, migrationSha), /recovery jobs/);
+  const extra = structuredClone(report); (extra.scenarios.firstOpen.snapshot as Record<string, unknown>).databasePath = "private";
+  assert.throws(() => validatePersistenceReport(extra, "android", sha, migrationSha), /snapshot keys/);
 });

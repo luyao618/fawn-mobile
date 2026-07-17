@@ -1,0 +1,6 @@
+appId: com.luyao618.formobile
+---
+- tapOn: "重试打开本机数据"
+- extendedWaitUntil:
+    visible: "照护空间尚未设置"
+    timeout: 120000

@@ -1,0 +1,5 @@
+appId: com.luyao618.formobile
+---
+- extendedWaitUntil:
+    visible: "照护空间尚未设置"
+    timeout: 120000

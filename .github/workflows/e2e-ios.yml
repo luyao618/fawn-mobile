@@ -123,6 +123,7 @@ jobs:
           maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-readiness e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/launch/ios-readiness.log
           maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-smoke e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log
           mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log
+          bash scripts/e2e/run-persistence-ios.sh "$simulator_udid" "${{ inputs.expected_sha }}"
       - name: Collect same-SHA evidence
         run: |
           node tools/collect-ci-evidence.mjs \
@@ -132,6 +133,7 @@ jobs:
             --config-report-e2e .artifacts/config/ios-e2e.json \
             --scheme-report-production .artifacts/schemes/ios-production.json \
             --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
+            --persistence-report .artifacts/ios-persistence.json \
             --output .artifacts/ios-e2e.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -143,6 +145,8 @@ jobs:
             .artifacts/native/ios/**
             .artifacts/launch/ios-dev-client.log
             .artifacts/test-results/ios-maestro.log
+            .artifacts/ios-persistence.json
+            .artifacts/persistence/ios/*.json
           if-no-files-found: error
       - name: Retain Ios launch and Maestro diagnostics
         if: always()
