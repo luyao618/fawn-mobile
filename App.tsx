@@ -1,15 +1,18 @@
 import { type PropsWithChildren, useEffect, useState } from "react";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import { installFaultController } from "@for-mobile/fault-controller";
+import { createProductionBootstrap } from "./src/infrastructure/bootstrap/createProductionBootstrap";
 import { RootNavigator } from "./src/navigation/RootNavigator";
 import { AppErrorBoundary } from "./src/shared/errors/AppErrorBoundary";
-import { installFaultController } from "@for-mobile/fault-controller";
 import type { FaultRequest } from "./src/testing/faultContract";
 
 type InstallFaults = (
   onFault: (request: FaultRequest) => void,
   signal?: AbortSignal,
 ) => Promise<() => void>;
+
+const productionBootstrap = createProductionBootstrap();
 
 function asError(reason: unknown): Error {
   return reason instanceof Error ? reason : new Error("E2E fault controller setup failed", { cause: reason });
@@ -42,7 +45,7 @@ export function AppComposition({ installFaults = installFaultController }: { ins
     <AppErrorBoundary>
       <FaultControllerHost installFaults={installFaults}>
         <SafeAreaProvider>
-          <RootNavigator />
+          <RootNavigator bootstrap={productionBootstrap} />
         </SafeAreaProvider>
       </FaultControllerHost>
     </AppErrorBoundary>

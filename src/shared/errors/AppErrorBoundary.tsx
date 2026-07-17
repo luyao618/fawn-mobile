@@ -18,7 +18,7 @@ export class AppErrorBoundary extends Component<PropsWithChildren, State> {
   private retry = () => this.setState({ failed: false });
 
   render() {
-    if (this.state.failed) return <BootstrapError onRetry={this.retry} />;
+    if (this.state.failed) return <BootstrapError action={{ label: "重试显示页面", onPress: this.retry }} />;
     return this.props.children;
   }
 }

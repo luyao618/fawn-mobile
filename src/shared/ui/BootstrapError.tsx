@@ -2,17 +2,35 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { colors, radius, spacing } from "../theme/tokens";
 
-export function BootstrapError({ onRetry }: { onRetry: () => void }) {
+export type BootstrapErrorAction = Readonly<{
+  label: string;
+  onPress: () => void;
+  pending?: boolean;
+}>;
+
+type BootstrapErrorProps = Readonly<{
+  action?: BootstrapErrorAction;
+  title?: string;
+  body?: string;
+}>;
+
+export function BootstrapError({
+  action,
+  title = "页面暂时无法显示",
+  body = "可以在本机重试。此操作不会上传错误信息。",
+}: BootstrapErrorProps) {
   return (
     <View style={styles.canvas}>
       <View style={styles.content}>
         <View accessible accessibilityLiveRegion="assertive" accessibilityRole="alert">
-          <Text accessibilityRole="header" allowFontScaling style={styles.title}>页面暂时无法显示</Text>
-          <Text allowFontScaling style={styles.body}>可以在本机重试。此操作不会上传错误信息。</Text>
+          <Text accessibilityRole="header" allowFontScaling style={styles.title}>{title}</Text>
+          <Text allowFontScaling style={styles.body}>{body}</Text>
         </View>
-        <Pressable accessibilityLabel="重试显示页面" accessibilityRole="button" hitSlop={4} onPress={onRetry} style={({ pressed }) => [styles.button, pressed && styles.buttonPressed]}>
-          <Text allowFontScaling style={styles.buttonText}>重试</Text>
-        </Pressable>
+        {action ? (
+          <Pressable accessibilityLabel={action.label} accessibilityRole="button" accessibilityState={{ busy: action.pending, disabled: action.pending }} disabled={action.pending} hitSlop={4} onPress={action.onPress} style={({ pressed }) => [styles.button, pressed && styles.buttonPressed]}>
+            <Text allowFontScaling style={styles.buttonText}>{action.pending ? "正在重试" : "重试"}</Text>
+          </Pressable>
+        ) : null}
       </View>
     </View>
   );

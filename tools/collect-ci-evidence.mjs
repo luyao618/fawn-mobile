@@ -90,6 +90,96 @@ export async function validateNativeReports({ platform, expectedSha, configRepor
   return summary;
 }
 
+export function validatePersistenceReport(report, platform, expectedSha, expectedMigrationSha) {
+  assert(report && typeof report === "object" && !Array.isArray(report), "Persistence report is malformed");
+  assert.deepEqual(Object.keys(report).sort(), ["checkedOutSha", "expectedSha", "migrationSha256", "platform", "reportType", "scenarios", "schemaVersion", "skipped"].sort(), "Persistence report keys are invalid");
+  assert.equal(report.schemaVersion, 2, "Persistence report schema is invalid");
+  assert.equal(report.reportType, "startup-persistence", "Persistence report type is invalid");
+  assert.equal(report.platform, platform, "Persistence report platform disagrees");
+  assert.equal(report.checkedOutSha, expectedSha, "Persistence checked-out SHA disagrees");
+  assert.equal(report.expectedSha, expectedSha, "Persistence expected SHA disagrees");
+  assert.match(report.migrationSha256, /^[0-9a-f]{64}$/, "Persistence migration SHA is invalid");
+  assert.equal(report.migrationSha256, expectedMigrationSha, "Persistence migration SHA disagrees with frozen source");
+  assert.deepEqual(report.skipped, [], "Persistence scenarios cannot be skipped");
+  const expectedScenarios = ["firstOpen", "recoveryRelaunch", "migrationHashRetry", "failedMigrationRollback"];
+  assert.deepEqual(Object.keys(report.scenarios ?? {}).sort(), [...expectedScenarios].sort(), "Persistence scenario inventory is invalid");
+  const exactObjects = [{ type: "index", total: 14 }, { type: "table", total: 26 }, { type: "trigger", total: 3 }];
+  const exactMigration = [{ version: 1, name: "initial-schema", sha256: expectedMigrationSha }];
+  const validateSnapshot = (snapshot, name) => {
+    assert.deepEqual(Object.keys(snapshot ?? {}).sort(), ["jobs", "journalMode", "meta", "migration", "objectTypes", "sha256", "tasks", "turns"].sort(), `${name} snapshot keys are invalid`);
+    assert.match(snapshot.sha256, /^[0-9a-f]{64}$/, `${name} database hash is malformed`);
+    assert.deepEqual(snapshot.migration, exactMigration, `${name} migration identity is invalid`);
+    assert.equal(snapshot.journalMode, "wal", `${name} did not retain WAL mode`);
+    assert.deepEqual(snapshot.objectTypes, exactObjects, `${name} DDL inventory is invalid`);
+  };
+  const first = report.scenarios.firstOpen;
+  assert.deepEqual(Object.keys(first ?? {}).sort(), ["snapshot", "status"], "firstOpen keys are invalid");
+  assert.equal(first.status, "pass"); validateSnapshot(first.snapshot, "firstOpen");
+  assert.equal(first.snapshot.meta, null); assert.deepEqual(first.snapshot.jobs, []); assert.deepEqual(first.snapshot.turns, []); assert.deepEqual(first.snapshot.tasks, []);
+  const recovery = report.scenarios.recoveryRelaunch;
+  assert.deepEqual(Object.keys(recovery ?? {}).sort(), ["noOpSnapshot", "snapshot", "status"], "recoveryRelaunch keys are invalid");
+  assert.equal(recovery.status, "pass"); validateSnapshot(recovery.snapshot, "recoveryRelaunch"); validateSnapshot(recovery.noOpSnapshot, "recoveryNoOp");
+  const recoveredFacts = {
+    meta: { value_json: '"preserved"' },
+    jobs: [{ id: "e2e-j", status: "queued", lease_owner: null, lease_expires_at: null }],
+    turns: [{ id: "e2e-t", status: "failed", error_code: "startup_interrupted" }],
+    tasks: [{ id: "e2e-p", status: "expired" }],
+  };
+  for (const [key, value] of Object.entries(recoveredFacts)) {
+    assert.deepEqual(recovery.snapshot[key], value, `recovery ${key} is invalid`);
+    assert.deepEqual(recovery.noOpSnapshot[key], value, `no-op recovery ${key} is invalid`);
+  }
+  const retry = report.scenarios.migrationHashRetry;
+  assert.deepEqual(Object.keys(retry ?? {}).sort(), ["snapshot", "status"], "migrationHashRetry keys are invalid");
+  assert.equal(retry.status, "pass"); validateSnapshot(retry.snapshot, "migrationHashRetry");
+  for (const [key, value] of Object.entries(recoveredFacts)) {
+    assert.deepEqual(retry.snapshot[key], value, `migration retry ${key} is invalid`);
+  }
+  const rollback = report.scenarios.failedMigrationRollback;
+  assert.deepEqual(Object.keys(rollback ?? {}).sort(), ["afterSnapshot", "beforeSnapshot", "collisionObject", "status"].sort(), "failedMigrationRollback keys are invalid");
+  assert.equal(rollback.status, "pass");
+  assert.equal(rollback.collisionObject, "chat_turns", "Failed migration collision object is invalid");
+  const column = (cid, name, notnull = 0, pk = 0) => ({ cid, name, type: "TEXT", notnull, dflt_value: null, pk });
+  const exactPoison = {
+    objects: ["chat_turns", "committed_job_effects", "local_jobs", "messages", "pending_agent_tasks", "photos"]
+      .map((name) => ({ type: "table", name })),
+    columns: {
+      chat_turns: [column(0, "id", 0, 1), column(1, "conversation_id", 1), column(2, "status", 1), column(3, "error_code"), column(4, "completed_at"), column(5, "updated_at", 1)],
+      committed_job_effects: [column(0, "effect_key", 0, 1)],
+      local_jobs: [column(0, "id", 0, 1), column(1, "effect_key", 1), column(2, "status", 1), column(3, "lease_owner"), column(4, "lease_expires_at"), column(5, "next_attempt_at"), column(6, "last_error_code"), column(7, "updated_at", 1)],
+      messages: [column(0, "id", 0, 1), column(1, "conversation_id", 1), column(2, "turn_id", 1), column(3, "role", 1)],
+      pending_agent_tasks: [column(0, "id", 0, 1), column(1, "status", 1), column(2, "expires_at", 1), column(3, "updated_at", 1)],
+      photos: [column(0, "id", 0, 1), column(1, "import_state", 1)],
+    },
+    rows: {
+      chat_turns: [{ id: "poison-turn", conversation_id: "poison-conversation", status: "completed", error_code: null, completed_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" }],
+      messages: [{ id: "poison-message", conversation_id: "poison-conversation", turn_id: "poison-turn", role: "user" }],
+      pending_agent_tasks: [{ id: "poison-task", status: "completed", expires_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" }],
+      local_jobs: [{ id: "poison-job", effect_key: "poison-effect", status: "queued", lease_owner: null, lease_expires_at: null, next_attempt_at: null, last_error_code: null, updated_at: "2026-01-01T00:00:00.000Z" }],
+      committed_job_effects: [{ effect_key: "poison-effect" }],
+      photos: [{ id: "poison-photo", import_state: "committed" }],
+    },
+    foreignKeyViolations: [],
+    journalMode: "wal",
+  };
+  for (const [name, poison] of [["before", rollback.beforeSnapshot], ["after", rollback.afterSnapshot]]) {
+    assert.deepEqual(Object.keys(poison ?? {}).sort(), ["columns", "foreignKeyViolations", "journalMode", "objects", "rows"].sort(), `Failed migration ${name} snapshot keys are invalid`);
+    assert.deepEqual(poison, exactPoison, `Failed migration ${name} snapshot is invalid`);
+    for (const prefix of ["schema_migrations", "app_meta", "baby_profile", "conversations"]) {
+      assert.equal(poison.objects.some((object) => object.name === prefix), false, `Failed migration retained transaction-created ${prefix}`);
+    }
+  }
+  assert.deepEqual(rollback.afterSnapshot, rollback.beforeSnapshot, "Failed migration changed the poison database");
+  return { migrationSha256: report.migrationSha256, scenarios: expectedScenarios };
+}
+
+async function frozenMigrationSha() {
+  const source = await readFile(resolve(repoRoot, "src/infrastructure/db/migrations/migration1.ts"), "utf8");
+  const match = /export const MIGRATION_1_SHA256 = "([0-9a-f]{64})"/.exec(source);
+  assert(match, "Frozen migration SHA is absent from source");
+  return match[1];
+}
+
 async function loadReport(path) {
   assert(path, "Required CI report path is absent");
   let report;
@@ -127,6 +217,7 @@ async function main() {
   let reports = null;
   let nativeFiles = null;
   let faultBundles = null;
+  let persistence = null;
   if (platform === "host") {
     assert.equal(flavor, "static", "Host evidence must represent static gates");
     const faultBundleProof = await loadReport(option("--fault-bundle-proof", null));
@@ -151,6 +242,12 @@ async function main() {
     };
     for (const group of Object.values(reports)) for (const entry of Object.values(group)) delete entry.report;
     nativeFiles = validated.nativeFiles;
+    const persistenceReport = await loadReport(option("--persistence-report", null));
+    persistence = {
+      path: persistenceReport.path,
+      sha256: persistenceReport.sha256,
+      ...validatePersistenceReport(persistenceReport.report, platform, expectedSha, await frozenMigrationSha()),
+    };
   }
   const evidence = {
     schemaVersion: 4,
@@ -168,6 +265,7 @@ async function main() {
     nativeFiles,
     reports,
     faultBundles,
+    persistence,
     runner: {
       os: process.env.RUNNER_OS ?? process.platform,
       arch: process.env.RUNNER_ARCH ?? process.arch,
