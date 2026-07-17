@@ -19,7 +19,7 @@ pull_db() {
 push_db() {
   test ! -s "$local_db-wal"
   adb -s "$serial" push "$local_db" /data/local/tmp/for-mobile-user.db >/dev/null
-  adb -s "$serial" shell run-as "$app_id" sh -c 'cat /data/local/tmp/for-mobile-user.db > files/SQLite/user.db && rm -f files/SQLite/user.db-wal files/SQLite/user.db-shm'
+  adb -s "$serial" shell "run-as $app_id sh -c 'cat /data/local/tmp/for-mobile-user.db > files/SQLite/user.db && rm -f files/SQLite/user.db-wal files/SQLite/user.db-shm'"
   adb -s "$serial" shell rm -f /data/local/tmp/for-mobile-user.db
 }
 launch() {

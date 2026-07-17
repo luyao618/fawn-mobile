@@ -1,5 +1,5 @@
 appId: com.luyao618.formobile
 ---
 - extendedWaitUntil:
-    visible: "无法打开本机数据"
+    visible: "重试打开本机数据"
     timeout: 120000

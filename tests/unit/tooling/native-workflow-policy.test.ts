@@ -2657,6 +2657,44 @@ function assertPersistenceWrapper(wrapper: string, platform: "android" | "ios") 
   );
 }
 
+const exactBootstrapErrorFlow = `appId: com.luyao618.formobile
+---
+- extendedWaitUntil:
+    visible: "重试打开本机数据"
+    timeout: 120000
+`;
+
+function assertBootstrapErrorFlow(flow: string) {
+  assert.equal(flow, exactBootstrapErrorFlow, "bootstrap error flow bytes must remain exact");
+}
+
+test("Android persistence push preserves the nested shell payload as one adb argument", async () => {
+  const wrapper = await readFile("scripts/e2e/run-persistence-android.sh", "utf8");
+  const pushCommands = wrapper
+    .split(/\r\n|\n|\r/)
+    .filter((line) => line.includes("adb -s") && line.includes("cat /data/local/tmp/for-mobile-user.db"));
+  assert.equal(pushCommands.length, 1, "Android persistence must contain exactly one database push command");
+
+  const cwd = await mkdtemp(join(tmpdir(), "android-persistence-command-"));
+  try {
+    const result = spawnSync("bash", ["-c", `set -euo pipefail
+adb() { printf '<%s>\\n' "$@"; }
+serial=emulator-5554
+app_id=com.luyao618.formobile
+${pushCommands[0]}
+`], { cwd, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.stdout.trimEnd().split("\n"), [
+      "<-s>",
+      "<emulator-5554>",
+      "<shell>",
+      "<run-as com.luyao618.formobile sh -c 'cat /data/local/tmp/for-mobile-user.db > files/SQLite/user.db && rm -f files/SQLite/user.db-wal files/SQLite/user.db-shm'>",
+    ]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only uploads", async () => {
   const [android, ios, androidWorkflow, iosWorkflow, errorFlow] = await Promise.all([
     readFile("scripts/e2e/run-persistence-android.sh", "utf8"),
@@ -2665,8 +2703,19 @@ test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only
     readFile(".github/workflows/e2e-ios.yml", "utf8"),
     readFile("e2e/maestro/bootstrap-error.yaml", "utf8"),
   ]);
-  assert.match(errorFlow, /visible: "无法打开本机数据"/);
-  assert.doesNotMatch(errorFlow, /页面暂时无法显示/);
+  assertBootstrapErrorFlow(errorFlow);
+  for (const [label, mutation] of [
+    ["grouped alert title", errorFlow.replace("重试打开本机数据", "无法打开本机数据")],
+    ["generic fallback", errorFlow.replace("重试打开本机数据", "页面暂时无法显示")],
+    ["optional wait", errorFlow.replace("    timeout: 120000", "    timeout: 120000\n    optional: true")],
+  ]) {
+    assert.notEqual(mutation, errorFlow, `${label} fixture must change the bootstrap error flow`);
+    assert.throws(
+      () => assertBootstrapErrorFlow(mutation),
+      /bootstrap error flow bytes must remain exact/,
+      `${label} must be rejected`,
+    );
+  }
   for (const [platform, wrapper] of [["android", android], ["ios", ios]] as const) {
     assertPersistenceWrapper(wrapper, platform);
     const mutations = [
