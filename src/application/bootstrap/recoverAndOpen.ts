@@ -1,5 +1,6 @@
 import type { DataMutationCoordinator } from "../data/DataMutationCoordinator.ts";
 import type { ExclusiveTransactionPort, QueryRunHandle } from "../data/ExclusiveTransactionPort.ts";
+import { cleanupFailure } from "../../shared/errors/cleanupFailure.ts";
 
 export interface RestoreRecoveryPort {
   recover(signal: AbortSignal): Promise<void>;
@@ -64,7 +65,12 @@ function idempotentRuntime(database: StartupDatabaseHandle): AppRuntime {
   let closing: Promise<void> | undefined;
   return Object.freeze({
     close(): Promise<void> {
-      closing ??= database.close();
+      closing ??= Promise.resolve().then(() => database.close()).catch((closeError: unknown) => {
+        throw cleanupFailure(
+          [closeError],
+          "Closing the application database failed",
+        );
+      });
       return closing;
     },
   });
@@ -111,7 +117,7 @@ export async function recoverAndOpen(
     try {
       await database.close();
     } catch (closeError) {
-      throw new AggregateError(
+      throw cleanupFailure(
         [startupError, closeError],
         "Application startup failed and closing the database also failed",
       );

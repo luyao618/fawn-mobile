@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import test from "node:test";
 
@@ -25,6 +26,7 @@ import {
   USER_DATABASE_OPEN_OPTIONS,
   type UserDatabaseConnection,
 } from "../../../src/infrastructure/db/initializeDatabase.ts";
+import { isCleanupFailure } from "../../../src/shared/errors/cleanupFailure.ts";
 
 function toSqliteParams(params: readonly unknown[]): SQLInputValue[] {
   return params.map((value) => {
@@ -142,6 +144,11 @@ function assertAggregate(error: unknown, primary: Error, secondary: Error): bool
   return true;
 }
 
+function persistenceTool(...args: string[]): void {
+  const result = spawnSync(process.execPath, [resolve("tools/persistence-evidence.mjs"), ...args], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+}
+
 test("user.db initialization uses the approved open contract", async (context) => {
   const directory = mkdtempSync(join(tmpdir(), "fawn-initialize-"));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -172,9 +179,42 @@ test("initialization preserves pragma failure and secondary close failure", asyn
       async getAllAsync<T>() { return [] as T[]; },
       async runAsync() {},
     })),
-    (error) => assertAggregate(error, primary, closeFailure),
+    (error) => {
+      assertAggregate(error, primary, closeFailure);
+      assert.equal(isCleanupFailure(error), true);
+      const marker = Object.getOwnPropertyDescriptor(error, "cleanupFailure");
+      assert.deepEqual(marker && { configurable: marker.configurable, enumerable: marker.enumerable, writable: marker.writable }, {
+        configurable: false, enumerable: false, writable: false,
+      });
+      return true;
+    },
   );
   assert.equal(closeAttempted, true);
+});
+
+test("migration failure and secondary close failure are marked in causal order", async () => {
+  const primary = new Error("migration failed");
+  const closeFailure = new Error("close failed");
+  let closeCount = 0;
+  await assert.rejects(initializeUserDatabase(async () => ({
+    async closeAsync() { closeCount += 1; throw closeFailure; },
+    async execAsync(source: string) {
+      if (source.includes("PRAGMA")) return;
+      if (source === "BEGIN IMMEDIATE") throw primary;
+    },
+    async getAllAsync<T>(source: string) {
+      if (source === "PRAGMA foreign_keys") return [{ foreign_keys: 1 }] as T[];
+      if (source === "PRAGMA journal_mode") return [{ journal_mode: "wal" }] as T[];
+      if (source === "PRAGMA busy_timeout") return [{ timeout: 5_000 }] as T[];
+      return [] as T[];
+    },
+    async runAsync() {},
+  })), (error) => {
+    assertAggregate(error, primary, closeFailure);
+    assert.equal(isCleanupFailure(error), true);
+    return true;
+  });
+  assert.equal(closeCount, 1);
 });
 
 test("initialization closes the failed connection when pragma read-back is hostile", async () => {
@@ -286,17 +326,44 @@ test("migration source hash mismatch fails before touching an empty database", a
   assert.equal(await count(database, "SELECT count(*) AS total FROM sqlite_master"), 0);
 });
 
-test("failed migration rolls back every migration-1 DDL object", async (context) => {
-  const database = new RealDatabase();
-  context.after(() => database.closeAsync());
-  const sql = `${MIGRATION_1_SQL}\nTHIS IS NOT SQL;`;
-  const migration = { version: 1, name: "rollback-proof", sql, sha256: sha256(sql) };
+test("real migration collides at poison chat_turns and rolls back without changing the exact WAL fixture", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "fawn-migration-poison-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, USER_DATABASE_NAME);
+  const beforePath = join(directory, "before.json");
+  const afterPath = join(directory, "after.json");
+  persistenceTool("--action", "create-poison", "--database", path);
+  persistenceTool("--action", "poison-snapshot", "--database", path, "--output", beforePath);
 
-  await assert.rejects(applyUserDatabaseMigrations(database, [migration], fixedNow));
-  assert.equal(await count(
-    database,
-    "SELECT count(*) AS total FROM sqlite_master WHERE name IN ('schema_migrations', 'baby_profile', 'messages')",
-  ), 0);
+  const database = new RealDatabase(path);
+  await configureUserDatabase(database);
+  const originalExec = database.execAsync.bind(database);
+  const commands: string[] = [];
+  let collisionInventory: string[] = [];
+  database.execAsync = async (source) => {
+    commands.push(source);
+    try {
+      await originalExec(source);
+    } catch (error) {
+      if (source === MIGRATION_1_SQL) {
+        collisionInventory = database.raw.prepare(
+          "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+        ).all().map(({ name }) => String(name));
+      }
+      throw error;
+    }
+  };
+  await assert.rejects(applyUserDatabaseMigrations(database, USER_DATABASE_MIGRATIONS, fixedNow), /chat_turns already exists/);
+  assert.equal(commands.filter((source) => source === "BEGIN IMMEDIATE").length, 1);
+  assert.equal(commands.filter((source) => source === "ROLLBACK").length, 1);
+  assert.deepEqual(collisionInventory, [
+    "app_meta", "baby_profile", "chat_turns", "committed_job_effects", "conversations", "local_jobs",
+    "messages", "pending_agent_tasks", "photos", "schema_migrations",
+  ]);
+  await database.closeAsync();
+
+  persistenceTool("--action", "poison-snapshot", "--database", path, "--output", afterPath);
+  assert.deepEqual(JSON.parse(readFileSync(afterPath, "utf8")), JSON.parse(readFileSync(beforePath, "utf8")));
 });
 
 test("migration failure preserves secondary rollback failure", async () => {
@@ -351,6 +418,54 @@ test("startup runs the frozen recovery order and closes idempotently", async () 
   await runtime.close();
   await runtime.close();
   assert.equal(closeCount, 1);
+});
+
+test("runtime close synchronous failure is marked and invokes the handle exactly once", async () => {
+  const closeError = new Error("native close threw");
+  let closeCount = 0;
+  const runtime = await recoverAndOpen({
+    coordinator: new DataMutationCoordinator(), restore: { async recover() {} },
+    database: { async openConfigured() { return {
+      transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
+      async migrate() {},
+      close(): never { closeCount += 1; throw closeError; },
+    }; } },
+    album: { async reconcile() {} },
+    recovery: { async recoverExpiredLeases() {}, async assertInterruptedTurnsConsistent() {}, async failInterruptedTurns() {}, async expireStaleTasks() {}, async validateCoreInvariants() {} },
+    clock: { now: fixedNow },
+  }, new AbortController().signal);
+  const first = runtime.close();
+  const second = runtime.close();
+  assert.equal(first, second);
+  await assert.rejects(first, (error) => {
+    assert.equal(isCleanupFailure(error), true);
+    assert.deepEqual((error as AggregateError).errors, [closeError]);
+    return true;
+  });
+  assert.equal(closeCount, 1);
+});
+
+test("poison startup with migration bypassed reaches ready through real album and recovery SQL", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "fawn-startup-poison-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, USER_DATABASE_NAME);
+  persistenceTool("--action", "create-poison", "--database", path);
+  const runtime = await recoverAndOpen({
+    coordinator: new DataMutationCoordinator(), restore: { async recover() {} },
+    database: { async openConfigured() {
+      const database = new RealDatabase(path);
+      await configureUserDatabase(database);
+      return {
+        transactions: new ExpoSqliteExclusiveTransactionAdapter(database),
+        async migrate() {},
+        async close() { await database.closeAsync(); },
+      };
+    } },
+    album: new RejectPendingAlbumRecovery(),
+    recovery: new StartupRecoveryRepository(),
+    clock: { now: fixedNow },
+  }, new AbortController().signal);
+  await runtime.close();
 });
 
 test("startup recovery updates expired durable state in one real transaction and is idempotent", async (context) => {
@@ -428,6 +543,46 @@ test("startup failure closes before a later retry can reopen", async () => {
   assert.deepEqual(closeCalls, [1]);
   await runtime.close();
   assert.deepEqual(closeCalls, [1, 2]);
+});
+
+test("startup close failure is marked with startup then close errors", async () => {
+  const startupError = new Error("migration drift");
+  const closeError = new Error("close rejected");
+  let closeCount = 0;
+  await assert.rejects(recoverAndOpen({
+    coordinator: new DataMutationCoordinator(), restore: { async recover() {} },
+    database: { async openConfigured() { return {
+      transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
+      async migrate() { throw startupError; },
+      async close() { closeCount += 1; throw closeError; },
+    }; } },
+    album: { async reconcile() {} },
+    recovery: { async recoverExpiredLeases() {}, async assertInterruptedTurnsConsistent() {}, async failInterruptedTurns() {}, async expireStaleTasks() {}, async validateCoreInvariants() {} },
+    clock: { now: fixedNow },
+  }, new AbortController().signal), (error) => {
+    assert.equal(isCleanupFailure(error), true);
+    assert.deepEqual((error as AggregateError).errors, [startupError, closeError]);
+    return true;
+  });
+  assert.equal(closeCount, 1);
+});
+
+test("unmarked migration rollback aggregates remain retryable when database cleanup succeeds", async () => {
+  const rollbackAggregate = new AggregateError([new Error("migration"), new Error("rollback")], "rollback failed");
+  await assert.rejects(recoverAndOpen({
+    coordinator: new DataMutationCoordinator(), restore: { async recover() {} },
+    database: { async openConfigured() { return {
+      transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
+      async migrate() { throw rollbackAggregate; }, async close() {},
+    }; } },
+    album: { async reconcile() {} },
+    recovery: { async recoverExpiredLeases() {}, async assertInterruptedTurnsConsistent() {}, async failInterruptedTurns() {}, async expireStaleTasks() {}, async validateCoreInvariants() {} },
+    clock: { now: fixedNow },
+  }, new AbortController().signal), (error) => {
+    assert.equal(error, rollbackAggregate);
+    assert.equal(isCleanupFailure(error), false);
+    return true;
+  });
 });
 
 

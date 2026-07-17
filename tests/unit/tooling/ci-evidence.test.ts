@@ -187,6 +187,30 @@ test("schema-v4 fault bundle collector preserves established sentinel leaves exa
   }
 });
 
+function poisonSnapshot() {
+  const column = (cid: number, name: string, notnull = 0, pk = 0) => ({ cid, name, type: "TEXT", notnull, dflt_value: null, pk });
+  return {
+    objects: ["chat_turns", "committed_job_effects", "local_jobs", "messages", "pending_agent_tasks", "photos"].map((name) => ({ type: "table", name })),
+    columns: {
+      chat_turns: [column(0, "id", 0, 1), column(1, "conversation_id", 1), column(2, "status", 1), column(3, "error_code"), column(4, "completed_at"), column(5, "updated_at", 1)],
+      committed_job_effects: [column(0, "effect_key", 0, 1)],
+      local_jobs: [column(0, "id", 0, 1), column(1, "effect_key", 1), column(2, "status", 1), column(3, "lease_owner"), column(4, "lease_expires_at"), column(5, "next_attempt_at"), column(6, "last_error_code"), column(7, "updated_at", 1)],
+      messages: [column(0, "id", 0, 1), column(1, "conversation_id", 1), column(2, "turn_id", 1), column(3, "role", 1)],
+      pending_agent_tasks: [column(0, "id", 0, 1), column(1, "status", 1), column(2, "expires_at", 1), column(3, "updated_at", 1)],
+      photos: [column(0, "id", 0, 1), column(1, "import_state", 1)],
+    },
+    rows: {
+      chat_turns: [{ id: "poison-turn", conversation_id: "poison-conversation", status: "completed", error_code: null, completed_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" }],
+      messages: [{ id: "poison-message", conversation_id: "poison-conversation", turn_id: "poison-turn", role: "user" }],
+      pending_agent_tasks: [{ id: "poison-task", status: "completed", expires_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" }],
+      local_jobs: [{ id: "poison-job", effect_key: "poison-effect", status: "queued", lease_owner: null, lease_expires_at: null, next_attempt_at: null, last_error_code: null, updated_at: "2026-01-01T00:00:00.000Z" }],
+      committed_job_effects: [{ effect_key: "poison-effect" }],
+      photos: [{ id: "poison-photo", import_state: "committed" }],
+    },
+    foreignKeyViolations: [], journalMode: "wal",
+  };
+}
+
 
 test("native persistence evidence requires exact nested same-SHA startup facts", () => {
   const sha = "a".repeat(40);
@@ -201,14 +225,15 @@ test("native persistence evidence requires exact nested same-SHA startup facts",
     turns: [{ id: "e2e-t", status: "failed", error_code: "startup_interrupted" }],
     tasks: [{ id: "e2e-p", status: "expired" }],
   };
+  const poison = poisonSnapshot();
   const report = {
-    schemaVersion: 1, reportType: "startup-persistence", platform: "android",
+    schemaVersion: 2, reportType: "startup-persistence", platform: "android",
     checkedOutSha: sha, expectedSha: sha, migrationSha256: migrationSha, skipped: [],
     scenarios: {
       firstOpen: { status: "pass", snapshot },
       recoveryRelaunch: { status: "pass", snapshot: structuredClone(recovered), noOpSnapshot: structuredClone(recovered) },
       migrationHashRetry: { status: "pass", snapshot: structuredClone(recovered) },
-      failedMigrationRollback: { status: "pass", snapshot: { objects: ["diagnostic_events"] } },
+      failedMigrationRollback: { status: "pass", collisionObject: "chat_turns", beforeSnapshot: structuredClone(poison), afterSnapshot: structuredClone(poison) },
     },
   };
   assert.deepEqual(validatePersistenceReport(report, "android", sha, migrationSha).scenarios, [
@@ -226,4 +251,18 @@ test("native persistence evidence requires exact nested same-SHA startup facts",
   assert.throws(() => validatePersistenceReport(hostileRecovery, "android", sha, migrationSha), /recovery jobs/);
   const extra = structuredClone(report); (extra.scenarios.firstOpen.snapshot as Record<string, unknown>).databasePath = "private";
   assert.throws(() => validatePersistenceReport(extra, "android", sha, migrationSha), /snapshot keys/);
+  const poisonMutations = [
+    (value: any) => { value.scenarios.failedMigrationRollback.collisionObject = "messages"; },
+    (value: any) => { value.scenarios.failedMigrationRollback.afterSnapshot.objects.push({ type: "table", name: "schema_migrations" }); },
+    (value: any) => { value.scenarios.failedMigrationRollback.afterSnapshot.columns.chat_turns.pop(); },
+    (value: any) => { value.scenarios.failedMigrationRollback.afterSnapshot.rows.local_jobs[0].status = "leased"; },
+    (value: any) => { value.scenarios.failedMigrationRollback.afterSnapshot.foreignKeyViolations = [{ table: "messages" }]; },
+    (value: any) => { value.scenarios.failedMigrationRollback.afterSnapshot.journalMode = "delete"; },
+    (value: any) => { value.scenarios.failedMigrationRollback.beforeSnapshot.rows.photos = []; },
+  ];
+  for (const mutate of poisonMutations) {
+    const hostile = structuredClone(report);
+    mutate(hostile);
+    assert.throws(() => validatePersistenceReport(hostile, "android", sha, migrationSha));
+  }
 });

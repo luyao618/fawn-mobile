@@ -48,7 +48,52 @@ function setMigrationSha(path, sha) {
 
 function createPoison(path) {
   const db = database(path);
-  db.exec("CREATE TABLE diagnostic_events(id TEXT PRIMARY KEY)");
+  db.exec(`PRAGMA foreign_keys = ON;
+    PRAGMA journal_mode = WAL;
+    BEGIN IMMEDIATE;
+    CREATE TABLE chat_turns (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      error_code TEXT,
+      completed_at TEXT,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      role TEXT NOT NULL
+    );
+    CREATE TABLE pending_agent_tasks (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE local_jobs (
+      id TEXT PRIMARY KEY,
+      effect_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      next_attempt_at TEXT,
+      last_error_code TEXT,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE committed_job_effects (effect_key TEXT PRIMARY KEY);
+    CREATE TABLE photos (id TEXT PRIMARY KEY, import_state TEXT NOT NULL);
+    INSERT INTO chat_turns(id,conversation_id,status,error_code,completed_at,updated_at)
+      VALUES ('poison-turn','poison-conversation','completed',NULL,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');
+    INSERT INTO messages(id,conversation_id,turn_id,role)
+      VALUES ('poison-message','poison-conversation','poison-turn','user');
+    INSERT INTO pending_agent_tasks(id,status,expires_at,updated_at)
+      VALUES ('poison-task','completed','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');
+    INSERT INTO local_jobs(id,effect_key,status,lease_owner,lease_expires_at,next_attempt_at,last_error_code,updated_at)
+      VALUES ('poison-job','poison-effect','queued',NULL,NULL,NULL,NULL,'2026-01-01T00:00:00.000Z');
+    INSERT INTO committed_job_effects(effect_key) VALUES ('poison-effect');
+    INSERT INTO photos(id,import_state) VALUES ('poison-photo','committed');
+    COMMIT;`);
   checkpoint(db);
   db.close();
 }
@@ -70,9 +115,21 @@ function snapshot(path) {
 
 function poisonSnapshot(path) {
   const db = database(path);
-  const objects = db.prepare("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").all().map(({ name }) => name);
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(({ name }) => name);
+  const objects = db.prepare("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all();
+  const columns = Object.fromEntries(tables.map((table) => [table, db.prepare(`PRAGMA table_info(${table})`).all()]));
+  const rows = {
+    chat_turns: db.prepare("SELECT id,conversation_id,status,error_code,completed_at,updated_at FROM chat_turns ORDER BY id").all(),
+    messages: db.prepare("SELECT id,conversation_id,turn_id,role FROM messages ORDER BY id").all(),
+    pending_agent_tasks: db.prepare("SELECT id,status,expires_at,updated_at FROM pending_agent_tasks ORDER BY id").all(),
+    local_jobs: db.prepare("SELECT id,effect_key,status,lease_owner,lease_expires_at,next_attempt_at,last_error_code,updated_at FROM local_jobs ORDER BY id").all(),
+    committed_job_effects: db.prepare("SELECT effect_key FROM committed_job_effects ORDER BY effect_key").all(),
+    photos: db.prepare("SELECT id,import_state FROM photos ORDER BY id").all(),
+  };
+  const foreignKeyViolations = db.prepare("PRAGMA foreign_key_check").all();
+  const journalMode = db.prepare("PRAGMA journal_mode").get()?.journal_mode;
   db.close();
-  return { objects };
+  return { objects, columns, rows, foreignKeyViolations, journalMode };
 }
 
 function report() {
@@ -82,7 +139,8 @@ function report() {
   const recovered = JSON.parse(readFileSync(option("--recovered"), "utf8"));
   const recoveredNoop = JSON.parse(readFileSync(option("--recovered-noop"), "utf8"));
   const retried = JSON.parse(readFileSync(option("--retried"), "utf8"));
-  const poison = JSON.parse(readFileSync(option("--poison"), "utf8"));
+  const poisonBefore = JSON.parse(readFileSync(option("--poison-before"), "utf8"));
+  const poisonAfter = JSON.parse(readFileSync(option("--poison-after"), "utf8"));
   const migrationSha = frozenMigrationSha();
   for (const state of [first, recovered, recoveredNoop, retried]) {
     assert.deepEqual(state.migration, [{ version: 1, name: "initial-schema", sha256: migrationSha }]);
@@ -96,9 +154,9 @@ function report() {
   assert.deepEqual(recoveredNoop.jobs, recovered.jobs);
   assert.deepEqual(recoveredNoop.turns, recovered.turns);
   assert.deepEqual(recoveredNoop.tasks, recovered.tasks);
-  assert.deepEqual(poison.objects, ["diagnostic_events"]);
+  assert.deepEqual(poisonAfter, poisonBefore);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     reportType: "startup-persistence",
     platform,
     checkedOutSha: expectedSha,
@@ -108,7 +166,12 @@ function report() {
       firstOpen: { status: "pass", snapshot: first },
       recoveryRelaunch: { status: "pass", snapshot: recovered, noOpSnapshot: recoveredNoop },
       migrationHashRetry: { status: "pass", snapshot: retried },
-      failedMigrationRollback: { status: "pass", snapshot: poison },
+      failedMigrationRollback: {
+        status: "pass",
+        collisionObject: "chat_turns",
+        beforeSnapshot: poisonBefore,
+        afterSnapshot: poisonAfter,
+      },
     },
     skipped: [],
   };

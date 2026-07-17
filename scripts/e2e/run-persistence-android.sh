@@ -46,9 +46,10 @@ node tools/persistence-evidence.mjs --action snapshot --database "$local_db" --o
 cp "$local_db" "$artifacts/canonical.db"
 rm -f "$local_db"
 node tools/persistence-evidence.mjs --action create-poison --database "$local_db"
+node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison-before.json"
 push_db; launch; error_screen; pull_db
-node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison.json"
+node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison-after.json"
 cp "$artifacts/canonical.db" "$local_db"
 push_db; retry; stop
-node tools/persistence-evidence.mjs --action report --platform android --expected-sha "$expected_sha" --first "$artifacts/first.json" --recovered "$artifacts/recovered.json" --recovered-noop "$artifacts/recovered-noop.json" --retried "$artifacts/retried.json" --poison "$artifacts/poison.json" --output .artifacts/android-persistence.json
+node tools/persistence-evidence.mjs --action report --platform android --expected-sha "$expected_sha" --first "$artifacts/first.json" --recovered "$artifacts/recovered.json" --recovered-noop "$artifacts/recovered-noop.json" --retried "$artifacts/retried.json" --poison-before "$artifacts/poison-before.json" --poison-after "$artifacts/poison-after.json" --output .artifacts/android-persistence.json
 rm -f "$artifacts"/*.db "$artifacts"/*.db-wal "$artifacts"/*.db-shm

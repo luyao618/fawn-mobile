@@ -93,7 +93,7 @@ export async function validateNativeReports({ platform, expectedSha, configRepor
 export function validatePersistenceReport(report, platform, expectedSha, expectedMigrationSha) {
   assert(report && typeof report === "object" && !Array.isArray(report), "Persistence report is malformed");
   assert.deepEqual(Object.keys(report).sort(), ["checkedOutSha", "expectedSha", "migrationSha256", "platform", "reportType", "scenarios", "schemaVersion", "skipped"].sort(), "Persistence report keys are invalid");
-  assert.equal(report.schemaVersion, 1, "Persistence report schema is invalid");
+  assert.equal(report.schemaVersion, 2, "Persistence report schema is invalid");
   assert.equal(report.reportType, "startup-persistence", "Persistence report type is invalid");
   assert.equal(report.platform, platform, "Persistence report platform disagrees");
   assert.equal(report.checkedOutSha, expectedSha, "Persistence checked-out SHA disagrees");
@@ -136,9 +136,40 @@ export function validatePersistenceReport(report, platform, expectedSha, expecte
     assert.deepEqual(retry.snapshot[key], value, `migration retry ${key} is invalid`);
   }
   const rollback = report.scenarios.failedMigrationRollback;
-  assert.deepEqual(Object.keys(rollback ?? {}).sort(), ["snapshot", "status"], "failedMigrationRollback keys are invalid");
+  assert.deepEqual(Object.keys(rollback ?? {}).sort(), ["afterSnapshot", "beforeSnapshot", "collisionObject", "status"].sort(), "failedMigrationRollback keys are invalid");
   assert.equal(rollback.status, "pass");
-  assert.deepEqual(rollback.snapshot, { objects: ["diagnostic_events"] }, "Failed migration did not rollback partial DDL");
+  assert.equal(rollback.collisionObject, "chat_turns", "Failed migration collision object is invalid");
+  const column = (cid, name, notnull = 0, pk = 0) => ({ cid, name, type: "TEXT", notnull, dflt_value: null, pk });
+  const exactPoison = {
+    objects: ["chat_turns", "committed_job_effects", "local_jobs", "messages", "pending_agent_tasks", "photos"]
+      .map((name) => ({ type: "table", name })),
+    columns: {
+      chat_turns: [column(0, "id", 0, 1), column(1, "conversation_id", 1), column(2, "status", 1), column(3, "error_code"), column(4, "completed_at"), column(5, "updated_at", 1)],
+      committed_job_effects: [column(0, "effect_key", 0, 1)],
+      local_jobs: [column(0, "id", 0, 1), column(1, "effect_key", 1), column(2, "status", 1), column(3, "lease_owner"), column(4, "lease_expires_at"), column(5, "next_attempt_at"), column(6, "last_error_code"), column(7, "updated_at", 1)],
+      messages: [column(0, "id", 0, 1), column(1, "conversation_id", 1), column(2, "turn_id", 1), column(3, "role", 1)],
+      pending_agent_tasks: [column(0, "id", 0, 1), column(1, "status", 1), column(2, "expires_at", 1), column(3, "updated_at", 1)],
+      photos: [column(0, "id", 0, 1), column(1, "import_state", 1)],
+    },
+    rows: {
+      chat_turns: [{ id: "poison-turn", conversation_id: "poison-conversation", status: "completed", error_code: null, completed_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" }],
+      messages: [{ id: "poison-message", conversation_id: "poison-conversation", turn_id: "poison-turn", role: "user" }],
+      pending_agent_tasks: [{ id: "poison-task", status: "completed", expires_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" }],
+      local_jobs: [{ id: "poison-job", effect_key: "poison-effect", status: "queued", lease_owner: null, lease_expires_at: null, next_attempt_at: null, last_error_code: null, updated_at: "2026-01-01T00:00:00.000Z" }],
+      committed_job_effects: [{ effect_key: "poison-effect" }],
+      photos: [{ id: "poison-photo", import_state: "committed" }],
+    },
+    foreignKeyViolations: [],
+    journalMode: "wal",
+  };
+  for (const [name, poison] of [["before", rollback.beforeSnapshot], ["after", rollback.afterSnapshot]]) {
+    assert.deepEqual(Object.keys(poison ?? {}).sort(), ["columns", "foreignKeyViolations", "journalMode", "objects", "rows"].sort(), `Failed migration ${name} snapshot keys are invalid`);
+    assert.deepEqual(poison, exactPoison, `Failed migration ${name} snapshot is invalid`);
+    for (const prefix of ["schema_migrations", "app_meta", "baby_profile", "conversations"]) {
+      assert.equal(poison.objects.some((object) => object.name === prefix), false, `Failed migration retained transaction-created ${prefix}`);
+    }
+  }
+  assert.deepEqual(rollback.afterSnapshot, rollback.beforeSnapshot, "Failed migration changed the poison database");
   return { migrationSha256: report.migrationSha256, scenarios: expectedScenarios };
 }
 

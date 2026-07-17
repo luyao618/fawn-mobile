@@ -1,4 +1,5 @@
 import { applyUserDatabaseMigrations, type MigrationDatabase } from "./migrations/index.ts";
+import { cleanupFailure } from "../../shared/errors/cleanupFailure.ts";
 
 export const USER_DATABASE_NAME = "user.db";
 export const USER_DATABASE_BUSY_TIMEOUT_MS = 5_000;
@@ -49,7 +50,7 @@ export async function openConfiguredUserDatabase(
     try {
       await database.closeAsync();
     } catch (closeError) {
-      throw new AggregateError(
+      throw cleanupFailure(
         [initializationError, closeError],
         "User database configuration failed and closing the connection also failed",
       );
@@ -69,7 +70,7 @@ export async function initializeUserDatabase(
     try {
       await database.closeAsync();
     } catch (closeError) {
-      throw new AggregateError(
+      throw cleanupFailure(
         [initializationError, closeError],
         "User database initialization failed and closing the connection also failed",
       );

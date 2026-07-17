@@ -2648,11 +2648,13 @@ function assertPersistenceWrapper(wrapper: string, platform: "android" | "ios") 
     'cp "$local_db" "$artifacts/canonical.db"',
     'rm -f "$local_db"',
     'node tools/persistence-evidence.mjs --action create-poison --database "$local_db"',
+    'node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison-before.json"',
     "push_db; launch; error_screen; pull_db",
-    'node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison.json"',
+    'node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison-after.json"',
     'cp "$artifacts/canonical.db" "$local_db"',
     "push_db; retry; stop",
     `node tools/persistence-evidence.mjs --action report --platform ${platform}`,
+    '--poison-before "$artifacts/poison-before.json" --poison-after "$artifacts/poison-after.json"',
     'rm -f "$artifacts"/*.db "$artifacts"/*.db-wal "$artifacts"/*.db-shm',
   );
 }
@@ -2722,6 +2724,8 @@ test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only
       wrapper.replace("push_db; retry; stop; pull_db", "push_db; launch; ready; stop; pull_db"),
       wrapper.replace("push_db; retry; stop", "push_db; launch; ready; stop"),
       wrapper.replace("push_db; launch; error_screen; pull_db", "push_db; launch; error_screen; stop; pull_db"),
+      wrapper.replace('node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison-before.json"\n', ""),
+      wrapper.replace('poison-after.json"', 'poison-before.json"'),
       wrapper.replace('rm -f "$artifacts"/*.db "$artifacts"/*.db-wal "$artifacts"/*.db-shm', "true"),
     ];
     for (const mutation of mutations) assert.throws(() => assertPersistenceWrapper(mutation, platform));
