@@ -287,6 +287,7 @@ export function BabyProfileScreen() {
       if (savingRef.current) deferRefreshUntilSaveSettles();
       if (replaceOperation) await replaceOperation;
       if (!mountedRef.current || focusSession.current !== session) return;
+      if (generation < ageRefreshFailureGeneration.current) return;
       if (!hasCommittedSnapshot.current) {
         ageRefreshFailureGeneration.current = generation;
         throw new Error("A committed profile snapshot is required for an age refresh.");

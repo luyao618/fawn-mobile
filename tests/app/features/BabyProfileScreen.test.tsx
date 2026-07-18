@@ -642,6 +642,127 @@ test("我的 reruns a refresh that started before a save so the older completion
   view.unmount();
 });
 
+test("我的 keeps age unavailable after a failed save until the inverse refresh rerun completes", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
+  const olderRefresh = deferred<OptionalBabyProfileSnapshot>();
+  const pendingSave = deferred<BabyProfileSnapshot>();
+  const freshRerun = deferred<OptionalBabyProfileSnapshot>();
+  const pendingRetry = deferred<BabyProfileSnapshot>();
+  const olderSnapshot: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedSnapshot.profile,
+      name: "不应采用较旧刷新资料",
+      updatedAt: "2026-07-19T05:00:00.000Z",
+    }),
+    exactAge: Object.freeze({
+      status: "known",
+      localDate: "2026-07-19",
+      timeZone: "Asia/Shanghai",
+      ageDays: 870,
+      completedMonths: 28,
+      remainingDays: 18,
+    }),
+  });
+  const freshSnapshot: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedSnapshot.profile,
+      name: "不应采用重跑刷新资料",
+      updatedAt: "2026-07-19T06:00:00.000Z",
+    }),
+    exactAge: Object.freeze({
+      status: "known",
+      localDate: "2026-07-19",
+      timeZone: "Asia/Shanghai",
+      ageDays: 871,
+      completedMonths: 28,
+      remainingDays: 20,
+    }),
+  });
+  const load = jest.fn()
+    .mockResolvedValueOnce(savedSnapshot)
+    .mockReturnValueOnce(olderRefresh.promise)
+    .mockReturnValueOnce(freshRerun.promise);
+  const save = jest.fn()
+    .mockReturnValueOnce(pendingSave.promise)
+    .mockReturnValueOnce(pendingRetry.promise);
+  const view = renderProfile(service({ load, save }));
+  expect(await screen.findByText("28个月19天")).toBeTruthy();
+
+  act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    emitAppState("background");
+    emitAppState("active");
+  });
+  await act(async () => { await Promise.resolve(); });
+  expect(load).toHaveBeenCalledTimes(2);
+
+  fireEvent.changeText(screen.getByLabelText("宝宝姓名"), "失败后保留的草稿");
+  fireEvent.changeText(screen.getByLabelText("出生日期"), "2024-02-30");
+  fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月19天")).toBeNull();
+
+  await act(async () => {
+    pendingSave.reject(new BabyProfileValidationError("birthDate", "private validation detail"));
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(load).toHaveBeenCalledTimes(2);
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("失败后保留的草稿");
+  expect(screen.getByLabelText("出生日期").props.value).toBe("2024-02-30");
+  expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
+  expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
+  expect(screen.queryByText("private validation detail")).toBeNull();
+
+  await act(async () => {
+    olderRefresh.resolve(olderSnapshot);
+    await olderRefresh.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(load).toHaveBeenCalledTimes(3);
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月18天")).toBeNull();
+  expect(screen.queryByText("不应采用较旧刷新资料")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("失败后保留的草稿");
+  expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
+  expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
+
+  await act(async () => {
+    freshRerun.resolve(freshSnapshot);
+    await freshRerun.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(load).toHaveBeenCalledTimes(3);
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(screen.getByText("测试宝宝")).toBeTruthy();
+  expect(screen.queryByText("不应采用重跑刷新资料")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("失败后保留的草稿");
+  expect(screen.getByLabelText("出生日期").props.value).toBe("2024-02-30");
+  expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
+  expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
+
+  fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+  expect(save).toHaveBeenCalledTimes(2);
+  expect(save).toHaveBeenLastCalledWith({
+    name: "失败后保留的草稿",
+    sex: "female",
+    birthDate: "2024-02-30",
+    birthWeightG: 3_200,
+    birthHeightCm: 50.5,
+    birthHeadCm: 34.2,
+    isPremature: true,
+    gestationalWeeks: 36,
+  }, "2026-07-18T01:00:00.000Z");
+  view.unmount();
+});
+
 test("我的 lets an in-flight save finish without updating state after unmount", async () => {
   const pending = deferred<BabyProfileSnapshot>();
   let operationFinished = false;
