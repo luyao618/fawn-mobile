@@ -258,7 +258,7 @@ test("pending tasks and jobs enforce legal transitions with idempotent terminal 
 });
 
 test("transaction repositories contain no transaction-control SQL and receive handles per call", () => {
-  for (const file of ["turnMessageRepository.ts", "pendingTaskRepository.ts", "localJobRepository.ts", "modelConfigRepository.ts"]) {
+  for (const file of ["turnMessageRepository.ts", "pendingTaskRepository.ts", "localJobRepository.ts", "modelConfigRepository.ts", "babyProfileRepository.ts"]) {
     const source = readFileSync(new URL(`../../../src/infrastructure/db/repositories/${file}`, import.meta.url), "utf8");
     assert.doesNotMatch(source, /\b(?:BEGIN|COMMIT|ROLLBACK)\b/i);
     assert.doesNotMatch(source, /private readonly (?:transaction|database|handle)/i);

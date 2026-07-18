@@ -1,20 +1,37 @@
-import { act, fireEvent, render, screen } from "@testing-library/react-native";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StyleSheet } from "react-native";
 
+import type { AppRuntime, AppServices } from "../../../src/application/bootstrap/appRuntime";
+import type { ProductionBootstrap } from "../../../src/infrastructure/bootstrap/createProductionBootstrap";
 import { getTabBarMetrics, RootNavigator } from "../../../src/navigation/RootNavigator";
 
 jest.mock("@react-native-vector-icons/lucide/static", () => ({
   Lucide: () => null,
 }));
 
-async function renderNavigator() {
+function readyRuntime(load = jest.fn(async () => ({
+  profile: null,
+  exactAge: { status: "unknown" as const, reason: "birth_date_missing" as const, localDate: "2026-07-18", timeZone: "Asia/Shanghai" },
+}))): AppRuntime<AppServices> {
+  return {
+    services: {
+      babyProfile: {
+        load,
+        async save() { throw new Error("not used"); },
+      },
+    },
+    async close() {},
+  };
+}
+
+async function renderNavigator(bootstrap: ProductionBootstrap = async () => readyRuntime()) {
   const view = render(
     <SafeAreaProvider initialMetrics={{ frame: { x: 0, y: 0, width: 390, height: 844 }, insets: { top: 47, left: 0, right: 0, bottom: 34 } }}>
-      <RootNavigator bootstrap={async () => ({ close: async () => {} })} />
+      <RootNavigator bootstrap={bootstrap} />
     </SafeAreaProvider>,
   );
-  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  await waitFor(() => expect(screen.getByRole("header", { name: "照护空间尚未设置" })).toBeTruthy());
   return view;
 }
 
@@ -32,11 +49,11 @@ test.each([
   ["记录", "还没有照护记录"],
   ["成长", "还没有可展示的成长数据"],
   ["相册", "还没有照片"],
-  ["我的", "本机设置尚未启用"],
+  ["我的", "宝宝资料"],
 ])("visits %s through its accessible tab", async (label, heading) => {
   await renderNavigator();
   fireEvent.press(screen.getByLabelText(label));
-  expect(screen.getByRole("header", { name: heading })).toBeTruthy();
+  expect(await screen.findByRole("header", { name: heading })).toBeTruthy();
 });
 
 
@@ -45,4 +62,54 @@ test("tab metrics preserve default geometry and grow for 200% text above the saf
   expect(getTabBarMetrics(1, 34)).toEqual({ height: 83, itemPaddingVertical: 0 });
   expect(getTabBarMetrics(2, 24)).toEqual({ height: 93, itemPaddingVertical: 4 });
   expect(getTabBarMetrics(2, 34)).toEqual({ height: 103, itemPaddingVertical: 4 });
+});
+
+test("does not call profile services or expose navigation before recovered runtime readiness", async () => {
+  let resolve!: (runtime: AppRuntime<AppServices>) => void;
+  const pending = new Promise<AppRuntime<AppServices>>((done) => { resolve = done; });
+  const load = jest.fn(async () => ({
+    profile: null,
+    exactAge: { status: "unknown" as const, reason: "birth_date_missing" as const, localDate: "2026-07-18", timeZone: "Asia/Shanghai" },
+  }));
+  render(
+    <SafeAreaProvider initialMetrics={{ frame: { x: 0, y: 0, width: 390, height: 844 }, insets: { top: 47, left: 0, right: 0, bottom: 34 } }}>
+      <RootNavigator bootstrap={() => pending} />
+    </SafeAreaProvider>,
+  );
+  expect(screen.getByLabelText("正在准备本机数据")).toBeTruthy();
+  expect(screen.queryByLabelText("管家")).toBeNull();
+  expect(load).not.toHaveBeenCalled();
+
+  await act(async () => resolve(readyRuntime(load)));
+  await waitFor(() => expect(load).toHaveBeenCalledTimes(1));
+  expect(screen.getByLabelText("管家")).toBeTruthy();
+});
+
+test("管家 reloads exact age when it regains focus after profile editing", async () => {
+  const missing = {
+    profile: null,
+    exactAge: { status: "unknown" as const, reason: "birth_date_missing" as const, localDate: "2025-02-28", timeZone: "America/Los_Angeles" },
+  };
+  const known = {
+    profile: {
+      name: "测试宝宝", sex: "female" as const, birthDate: "2024-02-29", birthWeightG: null,
+      birthHeightCm: null, birthHeadCm: null, isPremature: false, gestationalWeeks: null,
+      createdAt: "2025-02-28T20:00:00.000Z", updatedAt: "2025-02-28T20:00:00.000Z",
+    },
+    exactAge: {
+      status: "known" as const, localDate: "2025-02-28", timeZone: "America/Los_Angeles",
+      ageDays: 365, completedMonths: 12, remainingDays: 0,
+    },
+  };
+  const load = jest.fn()
+    .mockResolvedValueOnce(missing)
+    .mockResolvedValueOnce(missing)
+    .mockResolvedValueOnce(known);
+  await renderNavigator(async () => readyRuntime(load));
+  await waitFor(() => expect(load).toHaveBeenCalledTimes(1));
+  fireEvent.press(screen.getByLabelText("我的"));
+  await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+  fireEvent.press(screen.getByLabelText("管家"));
+  expect(await screen.findByText("12个月0天")).toBeTruthy();
+  expect(load).toHaveBeenCalledTimes(3);
 });

@@ -5,7 +5,9 @@ import { useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { type Bootstrap, BootstrapHost } from "../features/bootstrap/BootstrapHost";
-import { AlbumScreen, GrowthScreen, MeScreen, RecordsScreen, StewardScreen } from "../features/shell/ShellScreens";
+import { BabyProfileScreen } from "../features/profile/BabyProfileScreen";
+import { BabyProfileServiceProvider } from "../features/profile/BabyProfileServiceContext";
+import { AlbumScreen, GrowthScreen, RecordsScreen, StewardScreen } from "../features/shell/ShellScreens";
 import { colors } from "../shared/theme/tokens";
 import { ROUTES, type RootTabParamList } from "./routeNames";
 
@@ -26,7 +28,7 @@ const tabs: readonly { name: keyof RootTabParamList; label: string; icon: Lucide
   { name: ROUTES.records, label: "记录", icon: "clipboard-list", component: RecordsScreen },
   { name: ROUTES.growth, label: "成长", icon: "chart-line", component: GrowthScreen },
   { name: ROUTES.album, label: "相册", icon: "images", component: AlbumScreen },
-  { name: ROUTES.me, label: "我的", icon: "circle-user-round", component: MeScreen },
+  { name: ROUTES.me, label: "我的", icon: "circle-user-round", component: BabyProfileScreen },
 ];
 
 export function getTabBarMetrics(fontScale: number, bottomInset: number) {
@@ -77,5 +79,13 @@ export function RootNavigator({ bootstrap }: { bootstrap: Bootstrap }) {
     </NavigationContainer>
   );
 
-  return <BootstrapHost bootstrap={bootstrap}>{navigation}</BootstrapHost>;
+  return (
+    <BootstrapHost bootstrap={bootstrap}>
+      {(services) => (
+        <BabyProfileServiceProvider service={services.babyProfile}>
+          {navigation}
+        </BabyProfileServiceProvider>
+      )}
+    </BootstrapHost>
+  );
 }
