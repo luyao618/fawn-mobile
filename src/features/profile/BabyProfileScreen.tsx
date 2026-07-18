@@ -312,6 +312,7 @@ export function BabyProfileScreen() {
     if (savingRef.current) {
       markRefreshDeferred();
     } else if (preserveDraftAfterFailedSave.current || refreshDeferredBySave.current) {
+      markRefreshDeferred();
       requestAgeRefresh();
     } else {
       void load();

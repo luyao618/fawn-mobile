@@ -374,7 +374,11 @@ test("我的 defers a boundary refresh until save settles without publishing the
 });
 
 test("我的 preserves a save rejected while blurred and refocuses with only an age refresh", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
   const pendingSave = deferred<BabyProfileSnapshot>();
+  const pendingRefresh = deferred<OptionalBabyProfileSnapshot>();
+  const pendingRetry = deferred<BabyProfileSnapshot>();
   const refreshedSnapshot: BabyProfileSnapshot = Object.freeze({
     profile: Object.freeze({
       ...savedSnapshot.profile,
@@ -392,8 +396,10 @@ test("我的 preserves a save rejected while blurred and refocuses with only an 
   });
   const load = jest.fn()
     .mockResolvedValueOnce(savedSnapshot)
-    .mockResolvedValueOnce(refreshedSnapshot);
-  const save = jest.fn(() => pendingSave.promise);
+    .mockReturnValueOnce(pendingRefresh.promise);
+  const save = jest.fn()
+    .mockReturnValueOnce(pendingSave.promise)
+    .mockReturnValueOnce(pendingRetry.promise);
   const profileService = service({ load, save });
   const view = renderProfile(profileService);
   expect(await screen.findByText("28个月19天")).toBeTruthy();
@@ -418,8 +424,28 @@ test("我的 preserves a save rejected while blurred and refocuses with only an 
   expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
   expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
 
+  act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+  });
+  expect(screen.getByText("28个月19天")).toBeTruthy();
+
   act(() => setProfileFocused(true));
-  await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+  expect(load).toHaveBeenCalledTimes(2);
+  expect(screen.queryByText("28个月19天")).toBeNull();
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("提交中的草稿");
+  expect(screen.getByLabelText("出生日期").props.value).toBe("2024-02-30");
+  expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
+  expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
+  expect(screen.queryByText("private validation detail")).toBeNull();
+
+  await act(async () => {
+    pendingRefresh.resolve(refreshedSnapshot);
+    await pendingRefresh.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
   expect(screen.getByText("28个月20天")).toBeTruthy();
   expect(screen.getByText("测试宝宝")).toBeTruthy();
   expect(screen.queryByText("不应替换草稿")).toBeNull();
@@ -429,6 +455,18 @@ test("我的 preserves a save rejected while blurred and refocuses with only an 
   expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
   expect(screen.queryByText("private validation detail")).toBeNull();
   expect(appStateListeners.size).toBe(1);
+
+  fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+  expect(save).toHaveBeenLastCalledWith({
+    name: "提交中的草稿",
+    sex: "female",
+    birthDate: "2024-02-30",
+    birthWeightG: 3_200,
+    birthHeightCm: 50.5,
+    birthHeadCm: 34.2,
+    isPremature: true,
+    gestationalWeeks: 36,
+  }, "2026-07-18T01:00:00.000Z");
   view.unmount();
 });
 
