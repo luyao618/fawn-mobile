@@ -3071,6 +3071,44 @@ const exactProfileTextInputs = [
   { label: "出生日期", placeholder: "例如 2024-02-29", value: "2024-02-29" },
 ] as const;
 
+const exactProfileNumericInputs = [
+  { label: "出生体重（克）", placeholder: "100–10000", value: "3200" },
+  { label: "出生身长（厘米）", placeholder: "10–100", value: "50.5" },
+  { label: "出生头围（厘米）", placeholder: "10–80", value: "34.2" },
+  { label: "出生孕周（周）", placeholder: "20–45，可暂不填", value: "36" },
+] as const;
+
+function exactProfileKeyboardDismissal(label: string): string {
+  return `- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "${label}"`;
+}
+
+function assertProfileKeyboardDismissalPolicy(flow: string): void {
+  assert.doesNotMatch(flow, /^- hideKeyboard(?:\s*:.*)?\s*$/m, "Profile save must not use universal hideKeyboard");
+  assert.doesNotMatch(flow, /\b(?:optional|retry|sleep)\b/i, "Profile save must not mask dismissal failures");
+  assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile save must not use coordinate taps");
+  for (const { label } of [...exactProfileTextInputs, ...exactProfileNumericInputs]) {
+    assert.equal(
+      flow.split(exactProfileKeyboardDismissal(label)).length - 1,
+      1,
+      `${label} must use one exact Android hideKeyboard then iOS static-label dismissal block`,
+    );
+    assert.equal(
+      flow.split(`- tapOn: "${label}"`).length - 1,
+      1,
+      `${label} static label must be tapped only by its iOS dismissal branch`,
+    );
+  }
+}
+
 function assertProfileNameToBirthDateTransition(flow: string) {
   const [name, birthDate] = exactProfileTextInputs;
   const nameSelector = `^${name.placeholder}$`;
@@ -3078,30 +3116,22 @@ function assertProfileNameToBirthDateTransition(flow: string) {
   const transition = `- tapOn: "${nameSelector}"
 - inputText: "${name.value}"
 - assertVisible: "${name.value}"
-- hideKeyboard
+${exactProfileKeyboardDismissal(name.label)}
 - tapOn: "${birthDateSelector}"
 - inputText: "${birthDate.value}"
-- hideKeyboard
+${exactProfileKeyboardDismissal(birthDate.label)}
 - assertVisible: "${birthDate.value}"`;
   assert.equal(
     flow.split(transition).length - 1,
     1,
-    "Profile save must target exact text-input placeholders and dismiss the name keyboard before birth date entry",
+    "Profile save must preserve anchored name-before-date entry with exact platform keyboard dismissal",
   );
   for (const { label, placeholder } of exactProfileTextInputs) {
     const selector = `^${placeholder}$`;
     assert.equal(flow.split(`- tapOn: "${selector}"`).length - 1, 1, `${label} exact placeholder must be tapped once`);
     assert.equal(flow.includes(`- tapOn: "${placeholder}"`), false, `${label} placeholder selector must stay anchored`);
-    assert.equal(flow.includes(`- tapOn: "${label}"`), false, `${label} must not be tapped through its label`);
   }
 }
-
-const exactProfileNumericInputs = [
-  { label: "出生体重（克）", placeholder: "100–10000", value: "3200" },
-  { label: "出生身长（厘米）", placeholder: "10–100", value: "50.5" },
-  { label: "出生头围（厘米）", placeholder: "10–80", value: "34.2" },
-  { label: "出生孕周（周）", placeholder: "20–45，可暂不填", value: "36" },
-] as const;
 
 function assertProfileNumericInputTargeting(flow: string) {
   for (const { label, placeholder, value } of exactProfileNumericInputs) {
@@ -3112,12 +3142,12 @@ function assertProfileNumericInputTargeting(flow: string) {
     direction: DOWN
 - tapOn: "${selector}"
 - inputText: "${value}"
-- hideKeyboard
+${exactProfileKeyboardDismissal(label)}
 - assertVisible: "${value}"`;
     assert.equal(
       flow.split(exactInputSequence).length - 1,
       1,
-      `${label} must be scrolled into view and tapped through its anchored exact input placeholder`,
+      `${label} must preserve anchored entry, platform dismissal, and value assertion order`,
     );
     assert.equal(
       flow.split(selector).length - 1,
@@ -3126,7 +3156,6 @@ function assertProfileNumericInputTargeting(flow: string) {
     );
     assert.equal(flow.includes(`- tapOn: "${placeholder}"`), false, `${label} tap selector must stay anchored`);
     assert.equal(flow.includes(`      text: "${placeholder}"`), false, `${label} scroll selector must stay anchored`);
-    assert.equal(flow.includes(`- tapOn: "${label}"`), false, `${label} must not be tapped through its label`);
     assert.equal(flow.includes(`      text: "${label}"`), false, `${label} must not be used as the scroll target`);
   }
 }
@@ -3182,6 +3211,7 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertProfileBootstrapReadiness(androidProfile, "android");
   assertProfileBootstrapReadiness(iosProfile, "ios");
   assertIosDeviceCalendarPolicy(iosProfile, iosCalendarQuery, iosCalendarSource);
+  assertProfileKeyboardDismissalPolicy(saveFlow);
   assertProfileNameToBirthDateTransition(saveFlow);
   assertProfileNumericInputTargeting(saveFlow);
   assertProfileRestartFlowOrder(restartFlow);
@@ -3302,14 +3332,33 @@ printf '%s\\n' survived-no-process
   assert.throws(() => assertNonPipelinedApkInspection(workflowPipelineMutation, androidProfile));
   assert.throws(() => assertNonPipelinedApkInspection(androidWorkflow, profilePipelineMutation));
 
+  const nameDismissal = exactProfileKeyboardDismissal("宝宝姓名");
+  const androidDismissal = `- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard`;
+  const iosDismissal = `- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "宝宝姓名"`;
   const keyboardMutations = [
-    saveFlow.replace('- assertVisible: "G031LeapBaby"\n- hideKeyboard', '- assertVisible: "G031LeapBaby"'),
-    saveFlow.replace('- hideKeyboard\n- tapOn: "^例如 2024-02-29$"', '- tapOn: "^例如 2024-02-29$"\n- hideKeyboard'),
-    saveFlow.replace('- assertVisible: "G031LeapBaby"\n- hideKeyboard', '- hideKeyboard\n- assertVisible: "G031LeapBaby"'),
-  ];
-  for (const mutation of keyboardMutations) {
-    assert.notEqual(mutation, saveFlow, "keyboard transition mutation must change the flow");
-    assert.throws(() => assertProfileNameToBirthDateTransition(mutation));
+    ["missing Android branch", saveFlow.replace(nameDismissal, iosDismissal)],
+    ["missing iOS branch", saveFlow.replace(nameDismissal, androidDismissal)],
+    ["wrong Android platform", saveFlow.replace(nameDismissal, nameDismissal.replace("platform: Android", "platform: Web"))],
+    ["wrong iOS platform", saveFlow.replace(nameDismissal, nameDismissal.replace("platform: iOS", "platform: Web"))],
+    ["reordered platform branches", saveFlow.replace(nameDismissal, `${iosDismissal}\n${androidDismissal}`)],
+    ["universal hideKeyboard", saveFlow.replace(nameDismissal, "- hideKeyboard")],
+    ["wrong iOS label", saveFlow.replace(nameDismissal, nameDismissal.replace('tapOn: "宝宝姓名"', 'tapOn: "出生日期"'))],
+    ["retry", `${saveFlow}\n- retry: 2\n`],
+    ["sleep", `${saveFlow}\n- evalScript: "sleep(1000)"\n`],
+    ["optional command", `${saveFlow}\n- tapOn:\n    text: "宝宝姓名"\n    optional: true\n`],
+    ["coordinate tap", `${saveFlow}\n- tapOn:\n    point: "50%,50%"\n`],
+  ] as const;
+  for (const [label, mutation] of keyboardMutations) {
+    assert.notEqual(mutation, saveFlow, `${label} mutation must change the flow`);
+    assert.throws(() => assertProfileKeyboardDismissalPolicy(mutation), label);
   }
 
   for (const { label, placeholder } of exactProfileTextInputs) {

@@ -10,10 +10,28 @@ appId: com.luyao618.formobile
 - tapOn: "^可暂不填$"
 - inputText: "G031LeapBaby"
 - assertVisible: "G031LeapBaby"
-- hideKeyboard
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "宝宝姓名"
 - tapOn: "^例如 2024-02-29$"
 - inputText: "2024-02-29"
-- hideKeyboard
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "出生日期"
 - assertVisible: "2024-02-29"
 - tapOn: "性别女孩"
 - assertVisible:
@@ -25,7 +43,16 @@ appId: com.luyao618.formobile
     direction: DOWN
 - tapOn: "^100–10000$"
 - inputText: "3200"
-- hideKeyboard
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "出生体重（克）"
 - assertVisible: "3200"
 - scrollUntilVisible:
     element:
@@ -33,7 +60,16 @@ appId: com.luyao618.formobile
     direction: DOWN
 - tapOn: "^10–100$"
 - inputText: "50.5"
-- hideKeyboard
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "出生身长（厘米）"
 - assertVisible: "50.5"
 - scrollUntilVisible:
     element:
@@ -41,7 +77,16 @@ appId: com.luyao618.formobile
     direction: DOWN
 - tapOn: "^10–80$"
 - inputText: "34.2"
-- hideKeyboard
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "出生头围（厘米）"
 - assertVisible: "34.2"
 - scrollUntilVisible:
     element:
@@ -57,7 +102,16 @@ appId: com.luyao618.formobile
     direction: DOWN
 - tapOn: "^20–45，可暂不填$"
 - inputText: "36"
-- hideKeyboard
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "出生孕周（周）"
 - assertVisible: "36"
 - scrollUntilVisible:
     element:
