@@ -200,6 +200,7 @@ export function BabyProfileScreen() {
   const hasCommittedSnapshot = useRef(false);
   const mountedRef = useRef(true);
   const savingRef = useRef(false);
+  const refreshDeferredBySave = useRef(false);
   const [saving, setSaving] = useState(false);
   const [ageRefreshFailed, setAgeRefreshFailed] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
@@ -248,16 +249,19 @@ export function BabyProfileScreen() {
     return operation;
   }, [service]);
 
-  useFocusEffect(useCallback(() => {
-    focusSession.current += 1;
-    void load();
-    return () => {
-      focusSession.current += 1;
-      replaceLoadInFlight.current = null;
-    };
-  }, [load]));
+  const deferRefreshUntilSaveSettles = useCallback((): never => {
+    refreshDeferredBySave.current = true;
+    ageRefreshFailureGeneration.current = Math.max(
+      ageRefreshFailureGeneration.current,
+      requestGeneration.current + 1,
+    );
+    if (mountedRef.current && hasCommittedSnapshot.current) setAgeRefreshFailed(true);
+    throw new Error("Age refresh deferred until profile save settles.");
+  }, []);
 
   const refreshCommitted = useCallback(async (): Promise<void> => {
+    if (savingRef.current) deferRefreshUntilSaveSettles();
+    refreshDeferredBySave.current = false;
     const generation = requestGeneration.current + 1;
     requestGeneration.current = generation;
     const session = focusSession.current;
@@ -266,12 +270,14 @@ export function BabyProfileScreen() {
     try {
       loaded = await service.load();
     } catch (error) {
+      if (savingRef.current) deferRefreshUntilSaveSettles();
       if (mountedRef.current && focusSession.current === session && generation >= appliedGeneration.current) {
         ageRefreshFailureGeneration.current = generation;
         if (hasCommittedSnapshot.current) setAgeRefreshFailed(true);
       }
       throw error;
     }
+    if (savingRef.current) deferRefreshUntilSaveSettles();
     if (replaceOperation) await replaceOperation;
     if (!mountedRef.current || focusSession.current !== session) return;
     if (!hasCommittedSnapshot.current) {
@@ -287,8 +293,21 @@ export function BabyProfileScreen() {
     ageRefreshFailureGeneration.current = 0;
     setAgeRefreshFailed(false);
     setLoadState("ready");
-  }, [service]);
-  useActiveLocalDayRefresh(refreshCommitted);
+  }, [deferRefreshUntilSaveSettles, service]);
+  const requestAgeRefresh = useActiveLocalDayRefresh(refreshCommitted);
+
+  useFocusEffect(useCallback(() => {
+    focusSession.current += 1;
+    if (savingRef.current) {
+      refreshDeferredBySave.current = true;
+    } else {
+      void load();
+    }
+    return () => {
+      focusSession.current += 1;
+      replaceLoadInFlight.current = null;
+    };
+  }, [load]));
 
   const updateDraft = <K extends keyof Draft>(field: K, value: Draft[K]) => {
     if (savingRef.current) return;
@@ -313,13 +332,16 @@ export function BabyProfileScreen() {
     replacementBarrierGeneration.current = requestGeneration.current;
     void service.save(inputFromDraft(draft, isPremature), snapshot?.profile?.updatedAt ?? null).then((saved: BabyProfileSnapshot) => {
       if (!mountedRef.current) return;
+      const refreshPending = refreshDeferredBySave.current;
       requestGeneration.current += 1;
       appliedGeneration.current = requestGeneration.current;
       setSnapshot(saved);
       setDraft(draftFromProfile(saved.profile));
       hasCommittedSnapshot.current = true;
-      ageRefreshFailureGeneration.current = 0;
-      setAgeRefreshFailed(false);
+      if (!refreshPending) {
+        ageRefreshFailureGeneration.current = 0;
+        setAgeRefreshFailed(false);
+      }
       setLoadState("ready");
       setSaveMessage("宝宝资料已保存");
     }).catch((error: unknown) => {
@@ -334,9 +356,11 @@ export function BabyProfileScreen() {
       }
     }).finally(() => {
       savingRef.current = false;
-      if (mountedRef.current) setSaving(false);
+      if (!mountedRef.current) return;
+      setSaving(false);
+      if (refreshDeferredBySave.current) requestAgeRefresh();
     });
-  }, [draft, service, snapshot?.profile?.updatedAt]);
+  }, [draft, requestAgeRefresh, service, snapshot?.profile?.updatedAt]);
 
   const age = !ageRefreshFailed && snapshot ? formatExactAge(snapshot.exactAge) : null;
   return (

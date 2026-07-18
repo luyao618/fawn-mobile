@@ -120,14 +120,18 @@ function service(overrides: Partial<BabyProfileServicePort> = {}): BabyProfileSe
   };
 }
 
-function renderProfile(profileService: BabyProfileServicePort) {
-  return render(
+function profileTree(profileService: BabyProfileServicePort) {
+  return (
     <SafeAreaProvider initialMetrics={{ frame: { x: 0, y: 0, width: 320, height: 568 }, insets: { top: 20, left: 0, right: 0, bottom: 0 } }}>
       <BabyProfileServiceProvider service={profileService}>
         <BabyProfileScreen />
       </BabyProfileServiceProvider>
-    </SafeAreaProvider>,
+    </SafeAreaProvider>
   );
+}
+
+function renderProfile(profileService: BabyProfileServicePort) {
+  return render(profileTree(profileService));
 }
 
 test("我的 exposes every partial profile field with scalable, accessible controls", async () => {
@@ -249,6 +253,127 @@ test("我的 saves canonical field values only after the service commits", async
   await act(async () => resolveSave(savedSnapshot));
   expect(screen.getByText("宝宝资料已保存")).toBeTruthy();
   expect(screen.getByText("28个月19天")).toBeTruthy();
+});
+
+test("我的 defers a boundary refresh until save settles without publishing the saved stale age", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
+  const pendingSave = deferred<BabyProfileSnapshot>();
+  const pendingRefresh = deferred<OptionalBabyProfileSnapshot>();
+  const savedBeforeRefresh: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedSnapshot.profile,
+      name: "边界保存草稿",
+      updatedAt: "2026-07-19T02:00:00.000Z",
+    }),
+    exactAge: savedSnapshot.exactAge,
+  });
+  const refreshedSnapshot: BabyProfileSnapshot = Object.freeze({
+    profile: savedBeforeRefresh.profile,
+    exactAge: Object.freeze({
+      status: "known",
+      localDate: "2026-07-19",
+      timeZone: "Asia/Shanghai",
+      ageDays: 871,
+      completedMonths: 28,
+      remainingDays: 20,
+    }),
+  });
+  const load = jest.fn()
+    .mockResolvedValueOnce(savedSnapshot)
+    .mockReturnValueOnce(pendingRefresh.promise);
+  const save = jest.fn(() => pendingSave.promise);
+  const view = renderProfile(service({ load, save }));
+  expect(await screen.findByText("28个月19天")).toBeTruthy();
+  fireEvent.changeText(screen.getByLabelText("宝宝姓名"), "边界保存草稿");
+  fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+
+  act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    emitAppState("background");
+    emitAppState("active");
+  });
+  await act(async () => { await Promise.resolve(); });
+
+  expect(load).toHaveBeenCalledTimes(1);
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月19天")).toBeNull();
+
+  await act(async () => {
+    pendingSave.resolve(savedBeforeRefresh);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(load).toHaveBeenCalledTimes(2);
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月19天")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("边界保存草稿");
+  expect(screen.getByText("宝宝资料已保存")).toBeTruthy();
+
+  await act(async () => {
+    pendingRefresh.resolve(refreshedSnapshot);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("边界保存草稿");
+  expect(screen.getByText("宝宝资料已保存")).toBeTruthy();
+  view.unmount();
+});
+
+test("我的 skips a replacement refocus load during save and preserves the rejected draft", async () => {
+  const pendingSave = deferred<BabyProfileSnapshot>();
+  const refreshedSnapshot: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedSnapshot.profile,
+      name: "不应替换草稿",
+      updatedAt: "2026-07-19T03:00:00.000Z",
+    }),
+    exactAge: Object.freeze({
+      status: "known",
+      localDate: "2026-07-19",
+      timeZone: "Asia/Shanghai",
+      ageDays: 871,
+      completedMonths: 28,
+      remainingDays: 20,
+    }),
+  });
+  const load = jest.fn()
+    .mockResolvedValueOnce(savedSnapshot)
+    .mockResolvedValueOnce(refreshedSnapshot);
+  const save = jest.fn(() => pendingSave.promise);
+  const profileService = service({ load, save });
+  const view = renderProfile(profileService);
+  expect(await screen.findByText("28个月19天")).toBeTruthy();
+  fireEvent.changeText(screen.getByLabelText("宝宝姓名"), "提交中的草稿");
+  fireEvent.changeText(screen.getByLabelText("出生日期"), "2024-02-30");
+  fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+
+  view.rerender(profileTree({ ...profileService }));
+  await act(async () => { await Promise.resolve(); });
+
+  expect(load).toHaveBeenCalledTimes(1);
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("提交中的草稿");
+  expect(screen.getByText("正在保存…")).toBeTruthy();
+
+  await act(async () => {
+    pendingSave.reject(new BabyProfileValidationError("birthDate", "private validation detail"));
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(screen.getByText("测试宝宝")).toBeTruthy();
+  expect(screen.queryByText("不应替换草稿")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("提交中的草稿");
+  expect(screen.getByLabelText("出生日期").props.value).toBe("2024-02-30");
+  expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
+  expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
+  expect(screen.queryByText("private validation detail")).toBeNull();
+  view.unmount();
 });
 
 test("我的 lets an in-flight save finish without updating state after unmount", async () => {

@@ -1,5 +1,5 @@
 import { useFocusEffect } from "@react-navigation/native";
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 
 const CLOCK_CHECK_INTERVAL_MS = 60_000;
@@ -28,7 +28,9 @@ function millisecondsUntilNextCheck(now: Date): number {
   return Math.min(CLOCK_CHECK_INTERVAL_MS, millisecondsUntilNextLocalDay(now));
 }
 
-export function useActiveLocalDayRefresh(onRefresh: () => void | Promise<void>): void {
+export function useActiveLocalDayRefresh(onRefresh: () => void | Promise<void>): () => void {
+  const requestRefreshRef = useRef<() => void>(() => undefined);
+
   useFocusEffect(useCallback(() => {
     let disposed = false;
     let appState: AppStateStatus | null = AppState.currentState;
@@ -78,6 +80,8 @@ export function useActiveLocalDayRefresh(onRefresh: () => void | Promise<void>):
       );
     }
 
+    requestRefreshRef.current = runRefresh;
+
     const checkCalendar = () => {
       const nextCalendarKey = localCalendarKey(new Date());
       const calendarChanged = nextCalendarKey !== calendarKey;
@@ -110,8 +114,11 @@ export function useActiveLocalDayRefresh(onRefresh: () => void | Promise<void>):
 
     return () => {
       disposed = true;
+      if (requestRefreshRef.current === runRefresh) requestRefreshRef.current = () => undefined;
       clearTimer();
       subscription.remove();
     };
   }, [onRefresh]));
+
+  return useCallback(() => requestRefreshRef.current(), []);
 }
