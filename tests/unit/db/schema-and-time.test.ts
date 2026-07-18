@@ -5,6 +5,12 @@ import { join } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import test from "node:test";
 
+import { calculateExactAge, formatExactAge } from "../../../src/domain/baby/age.ts";
+import { localDateAtInstant, parseLocalDate } from "../../../src/domain/baby/localDate.ts";
+import {
+  BabyProfileValidationError,
+  normalizeBabyProfileInput,
+} from "../../../src/domain/baby/profile.ts";
 import { MIGRATION_1_SQL } from "../../../src/infrastructure/db/migrations/migration1.ts";
 import {
   applyUserDatabaseMigrations,
@@ -334,5 +340,121 @@ test("all four partial unique indexes reject duplicate active rows", async (cont
   await database.runAsync(
     "INSERT INTO local_jobs(id, kind, dedupe_key, effect_key, status, payload_json, created_at, updated_at) VALUES ('job-succeeded', 'kind', 'dedupe', 'effect-3', 'succeeded', '{}', ?, ?)",
     timestamp, timestamp,
+  );
+});
+
+test("UT-DB-005/profile keeps strict calendar dates unchanged across explicit timezones", () => {
+  assert.equal(parseLocalDate("2024-02-29").iso, "2024-02-29");
+  assert.equal(localDateAtInstant("2025-01-01T00:30:00.000Z", "Asia/Tokyo").iso, "2025-01-01");
+  assert.equal(localDateAtInstant("2025-01-01T00:30:00.000Z", "America/Los_Angeles").iso, "2024-12-31");
+
+  for (const invalid of [
+    "2024-2-29",
+    "2023-02-29",
+    "2024-04-31",
+    "2024-02-29T00:00:00.000Z",
+    " 2024-02-29",
+    "2024-02-29 ",
+  ]) {
+    assert.throws(() => parseLocalDate(invalid), /local date/i, invalid);
+  }
+  assert.throws(
+    () => localDateAtInstant("2025-01-01T00:30:00.000Z", "Not/A_Time_Zone"),
+    /time zone/i,
+  );
+});
+
+test("UT-DB-006 validates partial profiles without inventing unavailable facts", () => {
+  assert.deepEqual(
+    normalizeBabyProfileInput({
+      name: " 小鹿 ",
+      sex: null,
+      birthDate: null,
+      birthWeightG: null,
+      birthHeightCm: null,
+      birthHeadCm: null,
+      isPremature: false,
+      gestationalWeeks: null,
+    }, parseLocalDate("2026-07-18")),
+    {
+      name: "小鹿",
+      sex: null,
+      birthDate: null,
+      birthWeightG: null,
+      birthHeightCm: null,
+      birthHeadCm: null,
+      isPremature: false,
+      gestationalWeeks: null,
+    },
+  );
+
+  const full = normalizeBabyProfileInput({
+    name: "测试宝宝",
+    sex: "female",
+    birthDate: "2024-02-29",
+    birthWeightG: 3_200,
+    birthHeightCm: 50.5,
+    birthHeadCm: 34.2,
+    isPremature: true,
+    gestationalWeeks: 36,
+  }, parseLocalDate("2026-07-18"));
+  assert.equal(full.birthDate, "2024-02-29");
+
+  const invalidCases = [
+    [{ ...full, birthDate: "2027-01-01" }, "birthDate"],
+    [{ ...full, birthWeightG: 99 }, "birthWeightG"],
+    [{ ...full, birthWeightG: 10_001 }, "birthWeightG"],
+    [{ ...full, birthWeightG: 3_200.5 }, "birthWeightG"],
+    [{ ...full, birthHeightCm: 9.9 }, "birthHeightCm"],
+    [{ ...full, birthHeightCm: 100.1 }, "birthHeightCm"],
+    [{ ...full, birthHeadCm: 9.9 }, "birthHeadCm"],
+    [{ ...full, birthHeadCm: 80.1 }, "birthHeadCm"],
+    [{ ...full, gestationalWeeks: 19 }, "gestationalWeeks"],
+    [{ ...full, gestationalWeeks: 46 }, "gestationalWeeks"],
+  ] as const;
+  for (const [input, field] of invalidCases) {
+    assert.throws(
+      () => normalizeBabyProfileInput(input, parseLocalDate("2026-07-18")),
+      (error) => error instanceof BabyProfileValidationError && error.field === field,
+    );
+  }
+});
+
+test("UT-DB-006 computes exact age by civil ordinals across leap and DST boundaries", () => {
+  const missing = calculateExactAge(null, "2025-02-28T20:00:00.000Z", "America/Los_Angeles");
+  assert.deepEqual(missing, {
+    status: "unknown",
+    reason: "birth_date_missing",
+    localDate: "2025-02-28",
+    timeZone: "America/Los_Angeles",
+  });
+  assert.equal(formatExactAge(missing), null);
+
+  const fixtures = [
+    ["2024-02-29", "2024-03-01T20:00:00.000Z", "America/Los_Angeles", 1, 0, 1, "0个月1天"],
+    ["2024-02-29", "2025-02-28T20:00:00.000Z", "America/Los_Angeles", 365, 12, 0, "12个月0天"],
+    ["2024-02-29", "2025-03-01T20:00:00.000Z", "America/Los_Angeles", 366, 12, 1, "12个月1天"],
+    ["2024-03-09", "2024-03-10T19:00:00.000Z", "America/Los_Angeles", 1, 0, 1, "0个月1天"],
+    ["2024-11-02", "2024-11-03T20:00:00.000Z", "America/Los_Angeles", 1, 0, 1, "0个月1天"],
+    ["2025-01-01", "2025-01-01T00:30:00.000Z", "Asia/Tokyo", 0, 0, 0, "0个月0天"],
+  ] as const;
+  for (const [birthDate, instant, timeZone, ageDays, completedMonths, remainingDays, display] of fixtures) {
+    const result = calculateExactAge(birthDate, instant, timeZone);
+    assert.equal(result.status, "known");
+    if (result.status !== "known") continue;
+    assert.deepEqual(
+      { ageDays: result.ageDays, completedMonths: result.completedMonths, remainingDays: result.remainingDays },
+      { ageDays, completedMonths, remainingDays },
+    );
+    assert.equal(formatExactAge(result), display);
+  }
+
+  assert.throws(
+    () => calculateExactAge("2025-01-01", "2025-01-01T00:30:00.000Z", "America/Los_Angeles"),
+    /future/i,
+  );
+  assert.throws(
+    () => calculateExactAge("2024-02-30", "2025-01-01T00:30:00.000Z", "Asia/Tokyo"),
+    /local date/i,
   );
 });

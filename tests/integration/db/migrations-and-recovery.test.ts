@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import test from "node:test";
 
+import { RuntimeClosingError } from "../../../src/application/bootstrap/appRuntime.ts";
 import { recoverAndOpen } from "../../../src/application/bootstrap/recoverAndOpen.ts";
 import { DataMutationCoordinator } from "../../../src/application/data/DataMutationCoordinator.ts";
 import { ExpoSqliteExclusiveTransactionAdapter, type ExpoTransactionDatabase } from "../../../src/infrastructure/db/exclusiveTransaction.ts";
@@ -27,6 +28,8 @@ import {
   type UserDatabaseConnection,
 } from "../../../src/infrastructure/db/initializeDatabase.ts";
 import { isCleanupFailure } from "../../../src/shared/errors/cleanupFailure.ts";
+
+const noServices = { create: () => Object.freeze({}) };
 
 function toSqliteParams(params: readonly unknown[]): SQLInputValue[] {
   return params.map((value) => {
@@ -413,8 +416,9 @@ test("startup runs the frozen recovery order and closes idempotently", async () 
     album: { async reconcile() { transcript.push("album"); } },
     recovery,
     clock: { now: () => "2026-07-16T00:00:00.000Z" },
+    services: { create() { transcript.push("services"); return Object.freeze({}); } },
   }, new AbortController().signal);
-  assert.deepEqual(transcript, ["restore", "open", "migration", "album", "transaction", "leases", "turn-proof", "turn-fail", "tasks", "validate"]);
+  assert.deepEqual(transcript, ["restore", "open", "migration", "album", "transaction", "leases", "turn-proof", "turn-fail", "tasks", "validate", "services"]);
   await runtime.close();
   await runtime.close();
   assert.equal(closeCount, 1);
@@ -425,6 +429,7 @@ test("runtime close synchronous failure is marked and invokes the handle exactly
   let closeCount = 0;
   const runtime = await recoverAndOpen({
     coordinator: new DataMutationCoordinator(), restore: { async recover() {} },
+    services: noServices,
     database: { async openConfigured() { return {
       transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
       async migrate() {},
@@ -452,6 +457,7 @@ test("poison startup with migration bypassed reaches ready through real album an
   persistenceTool("--action", "create-poison", "--database", path);
   const runtime = await recoverAndOpen({
     coordinator: new DataMutationCoordinator(), restore: { async recover() {} },
+    services: noServices,
     database: { async openConfigured() {
       const database = new RealDatabase(path);
       await configureUserDatabase(database);
@@ -522,6 +528,7 @@ test("startup failure closes before a later retry can reopen", async () => {
   let attempt = 0;
   const dependencies = () => ({
     coordinator: new DataMutationCoordinator(),
+    services: noServices,
     restore: { async recover() {} },
     database: { async openConfigured() {
       const current = ++attempt;
@@ -551,6 +558,7 @@ test("startup close failure is marked with startup then close errors", async () 
   let closeCount = 0;
   await assert.rejects(recoverAndOpen({
     coordinator: new DataMutationCoordinator(), restore: { async recover() {} },
+    services: noServices,
     database: { async openConfigured() { return {
       transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
       async migrate() { throw startupError; },
@@ -571,6 +579,7 @@ test("unmarked migration rollback aggregates remain retryable when database clea
   const rollbackAggregate = new AggregateError([new Error("migration"), new Error("rollback")], "rollback failed");
   await assert.rejects(recoverAndOpen({
     coordinator: new DataMutationCoordinator(), restore: { async recover() {} },
+    services: noServices,
     database: { async openConfigured() { return {
       transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
       async migrate() { throw rollbackAggregate; }, async close() {},
@@ -590,6 +599,7 @@ test("startup rejects a noncanonical clock before recovery SQL", async () => {
   let transactionStarted = false;
   await assert.rejects(recoverAndOpen({
     coordinator: new DataMutationCoordinator(), restore: { async recover() {} },
+    services: noServices,
     database: { async openConfigured() { return {
       transactions: { async runExclusive() { transactionStarted = true; throw new Error("unreachable"); } },
       async migrate() {}, async close() {},
@@ -599,6 +609,51 @@ test("startup rejects a noncanonical clock before recovery SQL", async () => {
     clock: { now: () => "2026-07-16T00:00:00Z" },
   }, new AbortController().signal), /canonical UTC instant/);
   assert.equal(transactionStarted, false);
+});
+
+test("ready runtime rejects new service calls after close begins and drains active calls before one close", async () => {
+  let releaseOperation!: () => void;
+  let operationEntered!: () => void;
+  const operationMayFinish = new Promise<void>((resolve) => { releaseOperation = resolve; });
+  const entered = new Promise<void>((resolve) => { operationEntered = resolve; });
+  let closeCount = 0;
+  const runtime = await recoverAndOpen({
+    coordinator: new DataMutationCoordinator(),
+    restore: { async recover() {} },
+    database: { async openConfigured() { return {
+      transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
+      async migrate() {},
+      async close() { closeCount += 1; },
+    }; } },
+    album: { async reconcile() {} },
+    recovery: {
+      async recoverExpiredLeases() {}, async assertInterruptedTurnsConsistent() {}, async failInterruptedTurns() {},
+      async expireStaleTasks() {}, async validateCoreInvariants() {},
+    },
+    clock: { now: fixedNow },
+    services: { create(_transactions, operations) { return Object.freeze({
+      async hold() {
+        return operations.run(async () => {
+          operationEntered();
+          await operationMayFinish;
+          return "finished";
+        });
+      },
+    }); } },
+  }, new AbortController().signal);
+
+  const active = runtime.services.hold();
+  await entered;
+  const firstClose = runtime.close();
+  const secondClose = runtime.close();
+  assert.equal(firstClose, secondClose);
+  await assert.rejects(runtime.services.hold(), RuntimeClosingError);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(closeCount, 0);
+  releaseOperation();
+  assert.equal(await active, "finished");
+  await firstClose;
+  assert.equal(closeCount, 1);
 });
 
 test("core invariants reject every remaining generating turn", async (context) => {

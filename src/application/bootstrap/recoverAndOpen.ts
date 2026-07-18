@@ -1,3 +1,8 @@
+import {
+  RuntimeOperationGate,
+  type AppRuntime,
+  type AppServicesFactory,
+} from "./appRuntime.ts";
 import type { DataMutationCoordinator } from "../data/DataMutationCoordinator.ts";
 import type { ExclusiveTransactionPort, QueryRunHandle } from "../data/ExclusiveTransactionPort.ts";
 import { cleanupFailure } from "../../shared/errors/cleanupFailure.ts";
@@ -32,17 +37,16 @@ export interface ClockPort {
   now(): string;
 }
 
-export interface AppRuntime {
-  close(): Promise<void>;
-}
+export type { AppRuntime } from "./appRuntime.ts";
 
-export type RecoverAndOpenDependencies = Readonly<{
+export type RecoverAndOpenDependencies<TServices> = Readonly<{
   coordinator: DataMutationCoordinator;
   restore: RestoreRecoveryPort;
   database: StartupDatabasePort;
   album: AlbumRecoveryPort;
   recovery: StartupRecoveryPort;
   clock: ClockPort;
+  services: AppServicesFactory<TServices>;
 }>;
 
 function abortError(): Error {
@@ -61,11 +65,16 @@ function assertCanonicalInstant(value: string): void {
   }
 }
 
-function idempotentRuntime(database: StartupDatabaseHandle): AppRuntime {
+function idempotentRuntime<TServices>(
+  database: StartupDatabaseHandle,
+  services: TServices,
+  operations: RuntimeOperationGate,
+): AppRuntime<TServices> {
   let closing: Promise<void> | undefined;
   return Object.freeze({
+    services,
     close(): Promise<void> {
-      closing ??= Promise.resolve().then(() => database.close()).catch((closeError: unknown) => {
+      closing ??= operations.close(() => database.close()).catch((closeError: unknown) => {
         throw cleanupFailure(
           [closeError],
           "Closing the application database failed",
@@ -76,10 +85,10 @@ function idempotentRuntime(database: StartupDatabaseHandle): AppRuntime {
   });
 }
 
-export async function recoverAndOpen(
-  dependencies: RecoverAndOpenDependencies,
+export async function recoverAndOpen<TServices>(
+  dependencies: RecoverAndOpenDependencies<TServices>,
   signal: AbortSignal,
-): Promise<AppRuntime> {
+): Promise<AppRuntime<TServices>> {
   let database: StartupDatabaseHandle | undefined;
   try {
     assertNotAborted(signal);
@@ -111,7 +120,10 @@ export async function recoverAndOpen(
       await dependencies.recovery.validateCoreInvariants(transaction, now);
       assertNotAborted(signal);
     });
-    return idempotentRuntime(database);
+    assertNotAborted(signal);
+    const operations = new RuntimeOperationGate();
+    const services = dependencies.services.create(database.transactions, operations);
+    return idempotentRuntime(database, services, operations);
   } catch (startupError) {
     if (!database) throw startupError;
     try {

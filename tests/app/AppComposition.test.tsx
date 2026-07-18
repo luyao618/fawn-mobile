@@ -28,7 +28,10 @@ jest.mock("../../src/navigation/RootNavigator", () => {
   };
 });
 
-const runtime = (close = jest.fn(async () => {})): AppRuntime => ({ close });
+const runtime = (close = jest.fn(async () => {})): AppRuntime => ({
+  services: {} as AppRuntime["services"],
+  close,
+});
 const successfulInstallFaults = async () => () => {};
 
 beforeEach(() => {

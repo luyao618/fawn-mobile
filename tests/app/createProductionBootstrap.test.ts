@@ -1,3 +1,4 @@
+import { RuntimeClosingError } from "../../src/application/bootstrap/appRuntime";
 import { cleanupFailure, isCleanupFailure } from "../../src/shared/errors/cleanupFailure";
 import { createProductionBootstrap } from "../../src/infrastructure/bootstrap/createProductionBootstrap";
 
@@ -17,7 +18,9 @@ function database(closeAsync: () => Promise<void>) {
     closeAsync,
     async withExclusiveTransactionAsync(operation: (transaction: unknown) => Promise<void>) {
       await operation({
-        async getAllAsync() { return [{ total: 0 }]; },
+        async getAllAsync(source: string) {
+          return source.includes("baby_profile") ? [] : [{ total: 0 }];
+        },
         async runAsync() { return { changes: 0, lastInsertRowId: 0 }; },
       });
     },
@@ -51,4 +54,22 @@ test("production bootstrap does not classify an arbitrary marked-looking aggrega
   Object.defineProperty(generic, "cleanupFailure", { value: "not-the-fixed-marker" });
   expect(isCleanupFailure(generic)).toBe(false);
   expect(isCleanupFailure(cleanupFailure([generic], "real cleanup"))).toBe(true);
+});
+
+test("production bootstrap exposes profile services only on its ready runtime and closes their lifetime", async () => {
+  const closeAsync = jest.fn(async () => {});
+  mockOpenConfiguredDatabase.mockResolvedValue(database(closeAsync));
+  const bootstrap = createProductionBootstrap();
+  const runtime = await bootstrap(new AbortController().signal);
+
+  await expect(runtime.services.babyProfile.load()).resolves.toEqual({
+    profile: null,
+    exactAge: expect.objectContaining({ status: "unknown", reason: "birth_date_missing" }),
+  });
+  const first = runtime.close();
+  const second = runtime.close();
+  expect(first).toBe(second);
+  await expect(runtime.services.babyProfile.load()).rejects.toBeInstanceOf(RuntimeClosingError);
+  await first;
+  expect(closeAsync).toHaveBeenCalledTimes(1);
 });

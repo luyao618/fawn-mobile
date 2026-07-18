@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { RuntimeOperationGate } from "../../../src/application/bootstrap/appRuntime.ts";
 import { DataMutationBusyError, DataMutationCoordinator } from "../../../src/application/data/DataMutationCoordinator.ts";
+import {
+  BabyProfileService,
+  type DeviceCalendarPort,
+} from "../../../src/application/profile/babyProfileService.ts";
 import {
   ModelSecretCoordinationMetadataError,
   ModelSettingsService,
@@ -13,6 +18,7 @@ import {
 import { MODEL_INPUT_LIMITS } from "../../../src/domain/model/config.ts";
 import { ExpoSqliteExclusiveTransactionAdapter } from "../../../src/infrastructure/db/exclusiveTransaction.ts";
 import { createLogicalSnapshot, serializeLogicalSnapshot } from "../../../src/infrastructure/db/logicalSnapshot.ts";
+import { BabyProfileRepository } from "../../../src/infrastructure/db/repositories/babyProfileRepository.ts";
 import { ModelConfigRepository } from "../../../src/infrastructure/db/repositories/modelConfigRepository.ts";
 import { RevisionedSecureStore, type SecureKeyValueStore } from "../../../src/infrastructure/secrets/revisionedSecureStore.ts";
 import { SQLiteTestDatabase } from "../../support/sqliteTestDatabase.ts";
@@ -588,4 +594,56 @@ test("rollback plus cleanup failure preserves both errors and later restart remo
   context.after(() => database.closeAsync());
   await service(database, controlled).save({ ...bearerConfig, displayName: "Recovered" }, { bearerToken: "recovered" }, timestamp);
   assert.deepEqual(Object.keys(controlled.persistent.entries()), ["fawn-mobile.model-secrets.v1.3"]);
+});
+
+test("IT-001/profile reopens the singleton with its local date unchanged and recomputes exact age", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "fawn-profile-reopen-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "user.db");
+  const calendar = (instant: string, timeZone: string): DeviceCalendarPort => ({
+    current: () => Object.freeze({ instant, timeZone }),
+  });
+  const profileService = (database: SQLiteTestDatabase, instant: string, timeZone: string) => new BabyProfileService(
+    new ExpoSqliteExclusiveTransactionAdapter(database),
+    new DataMutationCoordinator(),
+    new BabyProfileRepository(),
+    calendar(instant, timeZone),
+    new RuntimeOperationGate(),
+  );
+
+  let database = new SQLiteTestDatabase(path);
+  await database.migrate();
+  const saved = await profileService(database, "2024-02-29T12:00:00.000Z", "Asia/Shanghai").save({
+    name: "重启测试宝宝",
+    sex: "female",
+    birthDate: "2024-02-29",
+    birthWeightG: 3_200,
+    birthHeightCm: 50.5,
+    birthHeadCm: 34.2,
+    isPremature: true,
+    gestationalWeeks: 36,
+  }, null);
+  assert.equal(saved.profile.createdAt, "2024-02-29T12:00:00.000Z");
+  await database.closeAsync();
+
+  database = new SQLiteTestDatabase(path);
+  context.after(() => database.closeAsync());
+  await database.migrate();
+  const reopened = await profileService(
+    database,
+    "2025-02-28T20:00:00.000Z",
+    "America/Los_Angeles",
+  ).load();
+  assert(reopened.profile);
+  assert.equal(reopened.profile.birthDate, "2024-02-29");
+  assert.deepEqual(reopened.profile, saved.profile);
+  assert.deepEqual(reopened.exactAge.status === "known" ? {
+    ageDays: reopened.exactAge.ageDays,
+    completedMonths: reopened.exactAge.completedMonths,
+    remainingDays: reopened.exactAge.remainingDays,
+  } : null, { ageDays: 365, completedMonths: 12, remainingDays: 0 });
+  assert.equal((await database.getAllAsync<{ birth_date: string }>(
+    "SELECT birth_date FROM baby_profile WHERE singleton_id = ?",
+    1,
+  ))[0]!.birth_date, "2024-02-29");
 });
