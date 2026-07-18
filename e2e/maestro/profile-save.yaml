@@ -130,9 +130,11 @@ appId: com.luyao618.formobile
       text: "保存宝宝资料"
     direction: DOWN
 - tapOn: "保存宝宝资料"
-- extendedWaitUntil:
-    visible: "宝宝资料已保存"
-    timeout: 30000
+- scrollUntilVisible:
+    element:
+      text: "^宝宝资料已保存$"
+    direction: DOWN
+- assertVisible: "^宝宝资料已保存$"
 - scrollUntilVisible:
     element:
       text: "G031LeapBaby"

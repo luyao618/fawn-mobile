@@ -3215,6 +3215,34 @@ ${exactProfileKeyboardDismissal(label)}
   }
 }
 
+const exactProfileSaveVisibilitySequence = `- tapOn: "保存宝宝资料"
+- scrollUntilVisible:
+    element:
+      text: "^宝宝资料已保存$"
+    direction: DOWN
+- assertVisible: "^宝宝资料已保存$"
+- scrollUntilVisible:
+    element:
+      text: "G031LeapBaby"
+    direction: UP`;
+
+function assertProfileSaveVisibilityPolicy(flow: string): void {
+  assert.equal(
+    flow.split(exactProfileSaveVisibilitySequence).length - 1,
+    1,
+    "Profile save must scroll DOWN to the exact success message, assert it, then scroll UP to the saved name",
+  );
+  assert.equal(
+    (flow.match(/\^宝宝资料已保存\$/g) ?? []).length,
+    2,
+    "Profile save must use the exact anchored success message only for its scroll and visible assertion",
+  );
+  assert.doesNotMatch(flow, /\boptional\s*:/i, "Profile save visibility commands must remain mandatory");
+  assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile save visibility must not use coordinates");
+  assert.doesNotMatch(flow, /\bsleep\s*(?:\(|:|\d)/i, "Profile save visibility must not use sleeps");
+  assert.doesNotMatch(flow, /^- retry\s*:/m, "Profile save visibility must not use broad retries");
+}
+
 test("G031 native policy preserves Debug evidence before one-way offline Release profile proof", async () => {
   const [androidWorkflow, iosWorkflow, androidRunner, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, saveFlow, restartFlow] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
@@ -3271,6 +3299,7 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertProfileKeyboardDismissalPolicy(saveFlow);
   assertProfileNameToBirthDateTransition(saveFlow);
   assertProfileNumericInputTargeting(saveFlow);
+  assertProfileSaveVisibilityPolicy(saveFlow);
   assertProfileRestartFlowOrder(restartFlow);
   for (const flow of [saveFlow, restartFlow]) {
     for (const value of ["G031LeapBaby", "2024-02-29", "3200", "50.5", "34.2", "36", "${AGE_DISPLAY}"]) assert.match(flow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -3281,7 +3310,7 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assert.match(restartFlow, /assertNotVisible: "宝宝资料已保存"/);
 });
 
-test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, keyboard, and restart-order regressions", async () => {
+test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, keyboard, save visibility, and restart-order regressions", async () => {
   const [androidWorkflow, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, saveFlow, restartFlow] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
     readFile("scripts/e2e/run-profile-restart-android.sh", "utf8"),
@@ -3469,6 +3498,29 @@ pid=$(pidof_app)
     const unanchoredScrollMutation = saveFlow.replace(`      text: "${selector}"`, `      text: "${placeholder}"`);
     assert.notEqual(unanchoredScrollMutation, saveFlow, `${label} unanchored-scroll mutation must change the flow`);
     assert.throws(() => assertProfileNumericInputTargeting(unanchoredScrollMutation));
+  }
+
+  const exactSuccessScroll = `- scrollUntilVisible:
+    element:
+      text: "^宝宝资料已保存$"
+    direction: DOWN`;
+  const exactSuccessAssertion = '- assertVisible: "^宝宝资料已保存$"';
+  const saveVisibilityMutations = [
+    ["direct off-screen wait", saveFlow.replace(
+      `${exactSuccessScroll}\n${exactSuccessAssertion}`,
+      `- extendedWaitUntil:\n    visible: "^宝宝资料已保存$"\n    timeout: 30000`,
+    )],
+    ["missing success scroll", saveFlow.replace(`${exactSuccessScroll}\n`, "")],
+    ["ambiguous success message", saveFlow.replaceAll("^宝宝资料已保存$", "宝宝资料已保存")],
+    ["wrong success scroll direction", saveFlow.replace(exactSuccessScroll, exactSuccessScroll.replace("direction: DOWN", "direction: UP"))],
+    ["optional success assertion", saveFlow.replace(exactSuccessAssertion, '- assertVisible:\n    text: "^宝宝资料已保存$"\n    optional: true')],
+    ["coordinate fallback", saveFlow.replace('- tapOn: "保存宝宝资料"', '- tapOn: "保存宝宝资料"\n- tapOn:\n    point: "50%,90%"')],
+    ["sleep fallback", saveFlow.replace('- tapOn: "保存宝宝资料"', '- tapOn: "保存宝宝资料"\n- evalScript: "sleep(1000)"')],
+    ["broad retry fallback", saveFlow.replace('- tapOn: "保存宝宝资料"', '- tapOn: "保存宝宝资料"\n- retry: 2')],
+  ] as const;
+  for (const [label, mutation] of saveVisibilityMutations) {
+    assert.notEqual(mutation, saveFlow, `${label} mutation must change the flow`);
+    assert.throws(() => assertProfileSaveVisibilityPolicy(mutation), label);
   }
 
   for (const [label, flow] of [["save", saveFlow], ["restart", restartFlow]] as const) {
