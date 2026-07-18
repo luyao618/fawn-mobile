@@ -3075,6 +3075,38 @@ function assertProfileNameToBirthDateTransition(flow: string) {
   );
 }
 
+const exactProfileNumericInputs = [
+  { label: "出生体重（克）", placeholder: "100–10000", value: "3200" },
+  { label: "出生身长（厘米）", placeholder: "10–100", value: "50.5" },
+  { label: "出生头围（厘米）", placeholder: "10–80", value: "34.2" },
+  { label: "出生孕周（周）", placeholder: "20–45，可暂不填", value: "36" },
+] as const;
+
+function assertProfileNumericInputTargeting(flow: string) {
+  for (const { label, placeholder, value } of exactProfileNumericInputs) {
+    const exactInputSequence = `- scrollUntilVisible:
+    element:
+      text: "${placeholder}"
+    direction: DOWN
+- tapOn: "${placeholder}"
+- inputText: "${value}"
+- hideKeyboard
+- assertVisible: "${value}"`;
+    assert.equal(
+      flow.split(exactInputSequence).length - 1,
+      1,
+      `${label} must be scrolled into view and tapped through its exact input placeholder`,
+    );
+    assert.equal(
+      flow.split(placeholder).length - 1,
+      2,
+      `${label} placeholder must appear only in its scroll and tap selectors`,
+    );
+    assert.equal(flow.includes(`- tapOn: "${label}"`), false, `${label} must not be tapped through its label`);
+    assert.equal(flow.includes(`      text: "${label}"`), false, `${label} must not be used as the scroll target`);
+  }
+}
+
 test("G031 native policy preserves Debug evidence before one-way offline Release profile proof", async () => {
   const [androidWorkflow, iosWorkflow, androidRunner, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, saveFlow, restartFlow] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
@@ -3127,6 +3159,7 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertProfileBootstrapReadiness(iosProfile, "ios");
   assertIosDeviceCalendarPolicy(iosProfile, iosCalendarQuery, iosCalendarSource);
   assertProfileNameToBirthDateTransition(saveFlow);
+  assertProfileNumericInputTargeting(saveFlow);
   assertProfileRestartFlowOrder(restartFlow);
   for (const flow of [saveFlow, restartFlow]) {
     for (const value of ["G031LeapBaby", "2024-02-29", "3200", "50.5", "34.2", "36", "${AGE_DISPLAY}"]) assert.match(flow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -3253,6 +3286,16 @@ printf '%s\\n' survived-no-process
   for (const mutation of keyboardMutations) {
     assert.notEqual(mutation, saveFlow, "keyboard transition mutation must change the flow");
     assert.throws(() => assertProfileNameToBirthDateTransition(mutation));
+  }
+
+  for (const { label, placeholder } of exactProfileNumericInputs) {
+    const labelTapMutation = saveFlow.replace(`- tapOn: "${placeholder}"`, `- tapOn: "${label}"`);
+    assert.notEqual(labelTapMutation, saveFlow, `${label} label-tap mutation must change the flow`);
+    assert.throws(() => assertProfileNumericInputTargeting(labelTapMutation));
+
+    const labelScrollMutation = saveFlow.replace(`      text: "${placeholder}"`, `      text: "${label}"`);
+    assert.notEqual(labelScrollMutation, saveFlow, `${label} label-scroll mutation must change the flow`);
+    assert.throws(() => assertProfileNumericInputTargeting(labelScrollMutation));
   }
 
   const restartOrderMutation = restartFlow.replace('- tapOn: "我的"', '- assertVisible: "G031LeapBaby"\n- tapOn: "我的"');

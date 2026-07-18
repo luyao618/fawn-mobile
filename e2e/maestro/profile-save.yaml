@@ -21,25 +21,25 @@ appId: com.luyao618.formobile
     checked: true
 - scrollUntilVisible:
     element:
-      text: "出生体重（克）"
+      text: "100–10000"
     direction: DOWN
-- tapOn: "出生体重（克）"
+- tapOn: "100–10000"
 - inputText: "3200"
 - hideKeyboard
 - assertVisible: "3200"
 - scrollUntilVisible:
     element:
-      text: "出生身长（厘米）"
+      text: "10–100"
     direction: DOWN
-- tapOn: "出生身长（厘米）"
+- tapOn: "10–100"
 - inputText: "50.5"
 - hideKeyboard
 - assertVisible: "50.5"
 - scrollUntilVisible:
     element:
-      text: "出生头围（厘米）"
+      text: "10–80"
     direction: DOWN
-- tapOn: "出生头围（厘米）"
+- tapOn: "10–80"
 - inputText: "34.2"
 - hideKeyboard
 - assertVisible: "34.2"
@@ -53,9 +53,9 @@ appId: com.luyao618.formobile
     checked: true
 - scrollUntilVisible:
     element:
-      text: "出生孕周（周）"
+      text: "20–45，可暂不填"
     direction: DOWN
-- tapOn: "出生孕周（周）"
+- tapOn: "20–45，可暂不填"
 - inputText: "36"
 - hideKeyboard
 - assertVisible: "36"
