@@ -27,7 +27,7 @@ ensure_adb_root() {
   if root_output=$(adb -s "$serial" root 2>&1); then root_status=0; else root_status=$?; fi
   root_output=${root_output%$'\r'}
   case "$root_status:$root_output" in
-    '0:restarting adbd as root'|'0:adbd is already running as root'|'1:adb: unable to connect for root: closed') ;;
+    '0:'|'0:restarting adbd as root'|'0:adbd is already running as root'|'1:adb: unable to connect for root: closed') ;;
     *)
       printf 'Unexpected adb root result (status %s): %s\n' "$root_status" "$root_output" >&2
       [ "$root_status" -ne 0 ] && return "$root_status"

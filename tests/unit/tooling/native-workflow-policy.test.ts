@@ -2941,7 +2941,7 @@ const exactAndroidProfileRootHelper = `ensure_adb_root() {
   if root_output=$(adb -s "$serial" root 2>&1); then root_status=0; else root_status=$?; fi
   root_output=\${root_output%$'\\r'}
   case "$root_status:$root_output" in
-    '0:restarting adbd as root'|'0:adbd is already running as root'|'1:adb: unable to connect for root: closed') ;;
+    '0:'|'0:restarting adbd as root'|'0:adbd is already running as root'|'1:adb: unable to connect for root: closed') ;;
     *)
       printf 'Unexpected adb root result (status %s): %s\\n' "$root_status" "$root_output" >&2
       [ "$root_status" -ne 0 ] && return "$root_status"
@@ -3323,6 +3323,59 @@ ${exactProfileKeyboardDismissal(birthDate.label)}
   }
 }
 
+const exactProfileRadioSelections = [
+  { target: "性别女孩", source: "性别暂不填" },
+  { target: "早产", source: "足月" },
+] as const;
+
+type ProfileRadioSelection = {
+  readonly target: string;
+  readonly source: string;
+};
+
+function exactIosConditionalSecondProfileRadioTap({ target, source }: ProfileRadioSelection): string {
+  return `      - runFlow:
+          when:
+            visible:
+              text: "${source}"
+              checked: true
+          commands:
+            - tapOn: "${target}"`;
+}
+
+function exactProfileRadioSelection(selection: ProfileRadioSelection): string {
+  const { target } = selection;
+  return `- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn: "${target}"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "${target}"
+${exactIosConditionalSecondProfileRadioTap(selection)}
+- assertVisible:
+    text: "${target}"
+    checked: true`;
+}
+
+function assertProfileRadioSelectionPolicy(flow: string): void {
+  assert.doesNotMatch(flow, /retryTapIfNoChange|\b(?:optional|retry|sleep)\b/i, "Profile radio selection must not mask failures");
+  assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile radio selection must not use coordinates");
+  for (const selection of exactProfileRadioSelections) {
+    const { target, source } = selection;
+    assert.equal(
+      flow.split(exactProfileRadioSelection(selection)).length - 1,
+      1,
+      `${target} must use one exact Android tap and one exact iOS tap followed by one source-checked conditional second tap and a mandatory target assertion`,
+    );
+    assert.equal(flow.split(`- tapOn: "${target}"`).length - 1, 3, `${target} must be tapped exactly once on Android and at most twice on iOS`);
+    assert.equal(flow.split(`text: "${source}"`).length - 1, 1, `${source} must be the unique source-state condition for ${target}`);
+  }
+}
+
 function assertProfileNumericInputTargeting(flow: string) {
   for (const { label, placeholder, value } of exactProfileNumericInputs) {
     const selector = `^${placeholder}$`;
@@ -3434,6 +3487,7 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertProfileTabNavigation(restartFlow, exactProfileSourceStates.restart);
   assertProfileKeyboardDismissalPolicy(saveFlow);
   assertProfileNameToBirthDateTransition(saveFlow);
+  assertProfileRadioSelectionPolicy(saveFlow);
   assertProfileNumericInputTargeting(saveFlow);
   assertProfileSaveVisibilityPolicy(saveFlow);
   assertProfileRestartFlowOrder(restartFlow);
@@ -3458,6 +3512,7 @@ test("G031 Android root transition accepts only exact outcomes and proves root a
     "adb -s emulator-5554 shell id -u",
   ];
   for (const accepted of [
+    { label: "silent success", rootOutput: "", rootStatus: 0 },
     { label: "already root", rootOutput: "adbd is already running as root", rootStatus: 0 },
     { label: "normal restart", rootOutput: "restarting adbd as root", rootStatus: 0 },
     { label: "exact closed transition", rootOutput: "adb: unable to connect for root: closed", rootStatus: 1 },
@@ -3516,6 +3571,7 @@ test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, k
   ]);
 
   for (const mutation of [
+    androidProfile.replace("'0:'|'0:restarting adbd as root'", "0:*|'0:restarting adbd as root'"),
     androidProfile.replace("|'1:adb: unable to connect for root: closed'", "|'1:adb: unable to connect for root: '*"),
     androidProfile.replace('timeout 30s adb -s "$serial" wait-for-device', 'adb -s "$serial" wait-for-device'),
     androidProfile.replace('[ "$uid_status" -ne 0 ] || [ "$uid_output" != 0 ]', '[ "$uid_status" -ne 0 ]'),
@@ -3701,6 +3757,33 @@ pid=$(pidof_app)
     const unanchoredScrollMutation = saveFlow.replace(`      text: "${selector}"`, `      text: "${placeholder}"`);
     assert.notEqual(unanchoredScrollMutation, saveFlow, `${label} unanchored-scroll mutation must change the flow`);
     assert.throws(() => assertProfileNumericInputTargeting(unanchoredScrollMutation));
+  }
+
+  for (const [index, selection] of exactProfileRadioSelections.entries()) {
+    const otherSelection = exactProfileRadioSelections[1 - index]!;
+    const exactSelection = exactProfileRadioSelection(selection);
+    const conditionalSecondTap = exactIosConditionalSecondProfileRadioTap(selection);
+    const unconditionalSecondTap = `      - tapOn: "${selection.target}"`;
+    const radioMutations = [
+      ["missing conditional second tap", saveFlow.replace(`${conditionalSecondTap}\n`, "")],
+      ["extra conditional second tap", saveFlow.replace(conditionalSecondTap, `${conditionalSecondTap}\n${conditionalSecondTap}`)],
+      ["unconditional second tap", saveFlow.replace(conditionalSecondTap, unconditionalSecondTap)],
+      ["wrong source radio", saveFlow.replace(conditionalSecondTap, exactIosConditionalSecondProfileRadioTap({ ...selection, source: otherSelection.source }))],
+      ["wrong second-tap target", saveFlow.replace(conditionalSecondTap, exactIosConditionalSecondProfileRadioTap({ ...selection, target: otherSelection.target }))],
+      ["missing source checked state", saveFlow.replace(exactSelection, exactSelection.replace("              checked: true\n", ""))],
+      ["missing target checked state", saveFlow.replace(exactSelection, exactSelection.replace("    checked: true", ""))],
+      ["Android platform drift", saveFlow.replace(exactSelection, exactSelection.replace("platform: Android", "platform: iOS"))],
+      ["iOS platform drift", saveFlow.replace(exactSelection, exactSelection.replace("platform: iOS", "platform: Android"))],
+      ["retryTapIfNoChange", saveFlow.replace(exactSelection, exactSelection.replace(`      - tapOn: "${selection.target}"`, `      - tapOn: "${selection.target}"\n        retryTapIfNoChange: true`))],
+      ["optional tap", `${saveFlow}\n- tapOn:\n    text: "${selection.target}"\n    optional: true\n`],
+      ["coordinate tap", `${saveFlow}\n- tapOn:\n    point: "50%,50%"\n`],
+      ["sleep", `${saveFlow}\n- evalScript: "sleep(1000)"\n`],
+      ["broad retry", `${saveFlow}\n- retry: 2\n`],
+    ] as const;
+    for (const [label, mutation] of radioMutations) {
+      assert.notEqual(mutation, saveFlow, `${selection.target} ${label} mutation must change the flow`);
+      assert.throws(() => assertProfileRadioSelectionPolicy(mutation), `${selection.target} ${label}`);
+    }
   }
 
   const exactSuccessScroll = `- scrollUntilVisible:

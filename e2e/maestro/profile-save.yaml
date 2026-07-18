@@ -50,7 +50,23 @@ appId: com.luyao618.formobile
     commands:
       - tapOn: "出生日期"
 - assertVisible: "2024-02-29"
-- tapOn: "性别女孩"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn: "性别女孩"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "性别女孩"
+      - runFlow:
+          when:
+            visible:
+              text: "性别暂不填"
+              checked: true
+          commands:
+            - tapOn: "性别女孩"
 - assertVisible:
     text: "性别女孩"
     checked: true
@@ -109,7 +125,23 @@ appId: com.luyao618.formobile
     element:
       text: "早产"
     direction: DOWN
-- tapOn: "早产"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn: "早产"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "早产"
+      - runFlow:
+          when:
+            visible:
+              text: "足月"
+              checked: true
+          commands:
+            - tapOn: "早产"
 - assertVisible:
     text: "早产"
     checked: true
