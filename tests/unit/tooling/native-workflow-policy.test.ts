@@ -89,7 +89,7 @@ const exactChildPrimaryUploadPaths = {
   ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/ios-profile-restart.json\n.artifacts/persistence/ios/*.json\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "d0eec9c535122d6df1640fb574fa025e93d1fed354502a70bbf266704bad1e08";
+const exactAndroidRunnerSha256 = "52236399b43c99f85a9820351612e0228b835ad8f67c15eee23e9025b803fcb9";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -699,6 +699,22 @@ function assertExactMetroStartupPolicy(script: string, platform: NativePlatform)
   );
 }
 
+function assertMetroProcessGroupPolicy(script: string, platform: NativePlatform): void {
+  const lines = script.split(/\r\n|\n|\r/);
+  const launchIndex = lines.indexOf(exactHeadlessMetroCommands[platform]);
+  assert.ok(launchIndex > 0, `${platform} Metro launch is absent`);
+  assert.deepEqual(
+    lines.slice(launchIndex - 1, launchIndex + 3),
+    ["set -m", exactHeadlessMetroCommands[platform], "metro_pid=$!", "set +m"],
+    `${platform} Metro must start as a monitored Bash process group`,
+  );
+  assert.deepEqual(
+    lines.filter((line) => line.trim().startsWith("kill ")).map((line) => line.trim()),
+    ['kill -- "-$metro_pid" 2>/dev/null', 'kill -- "-$metro_pid"'],
+    `${platform} Metro teardown must signal the complete process group in cleanup and the offline transition`,
+  );
+}
+
 function assertExactReadinessCommand(script: string, platform: NativePlatform): void {
   const readinessLines = script.split("\n").filter((line) => line.includes(readinessFlow));
   assert.deepEqual(
@@ -843,7 +859,7 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
     "    fi",
     "  fi",
     '  if [ -n "$metro_pid" ]; then',
-    '    kill "$metro_pid" 2>/dev/null',
+    '    kill -- "-$metro_pid" 2>/dev/null',
     '    wait "$metro_pid" 2>/dev/null',
     "  fi",
     '  if [ -f "$metro_log" ]; then',
@@ -920,7 +936,7 @@ function assertIosFailureDiagnosticsPolicy(script: string, workflow: Workflow): 
     exactIosFailureLogCommand,
     "  fi",
     '  if [ -n "$metro_pid" ]; then',
-    '    kill "$metro_pid" 2>/dev/null',
+    '    kill -- "-$metro_pid" 2>/dev/null',
     '    wait "$metro_pid" 2>/dev/null',
     "  fi",
     "  cat /tmp/metro.log",
@@ -969,6 +985,7 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assert.match(runner, /^#!\/usr\/bin\/env bash\nset -euo pipefail\n/);
   assertExactAndroidRunnerSha256(runner);
   assertExactMetroStartupPolicy(runner, "Android");
+  assertMetroProcessGroupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
   assertExactAndroidUrlHandoff(runner);
   assertExactAndroidPackageServicePolicy(runner);
@@ -1508,7 +1525,7 @@ exit ${status}
     const success = await runCleanup(0);
     assert.equal(success.status, 0, success.stderr);
     assert.equal(success.stdout, "metro-sentinel\n");
-    assert.match(await readFile(adbLog, "utf8"), /^kill 424242$/m);
+    assert.match(await readFile(adbLog, "utf8"), /^kill -- -424242$/m);
     assert.match(await readFile(adbLog, "utf8"), /^wait 424242$/m);
     for (const path of exactAndroidFailureDiagnosticPaths) {
       await assert.rejects(readFile(join(root, path)), `${path} must remain absent after success`);
@@ -1583,7 +1600,7 @@ exit ${status}
       "ls -la /data/anr; cat /data/anr/*",
       "pidof -s com.luyao618.formobile",
       "logcat -d --pid=1234",
-      "kill 424242",
+      "kill -- -424242",
       "wait 424242",
     );
 
@@ -1647,6 +1664,7 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
   const smokeRun = iosSteps[smokeIndex].run;
   assert.ok(typeof smokeRun === "string", "iOS device smoke must have an enabled run script");
   assertExactMetroStartupPolicy(smokeRun, "iOS");
+  assertMetroProcessGroupPolicy(smokeRun, "iOS");
   assertExactReadinessCommand(smokeRun, "iOS");
   assertExactIosUrlHandoff(smokeRun);
   assertIosFailureDiagnosticsPolicy(smokeRun, parsedWorkflow);
@@ -1738,6 +1756,22 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
       () => assertExactHeadlessMetroLaunch(withoutHeadless, platform),
       /exact loopback-only fail-closed headless command/,
     );
+
+    const processGroupMutations = [
+      script.replace("set -m\n", ""),
+      script.replaceAll('kill -- "-$metro_pid"', 'kill "$metro_pid"'),
+      script.replace(
+        `set -m\n${exactHeadlessMetroCommands[platform]}\nmetro_pid=$!\nset +m`,
+        `set +m\n${exactHeadlessMetroCommands[platform]}\nmetro_pid=$!`,
+      ),
+    ];
+    for (const mutation of processGroupMutations) {
+      assert.notEqual(mutation, script);
+      assert.throws(
+        () => assertMetroProcessGroupPolicy(mutation, platform),
+        /monitored Bash process group|signal the complete process group/,
+      );
+    }
 
     const localhostStatusProbes = script.replaceAll(
       "http://127.0.0.1:8081/status",
@@ -2178,6 +2212,39 @@ printf 'next-line-ran'`], { encoding: "utf8" });
     () => assertIosFailureDiagnosticsPolicy(extraIosDiagnostic, iosWorkflow),
     /executable simctl io\/spawn command inventory must exactly match/,
   );
+});
+
+test("Metro monitor-mode teardown terminates a wrapper and its child on host Bash", () => {
+  const result = spawnSync("bash", ["-c", `set -euo pipefail
+directory=$(mktemp -d)
+child_file="$directory/child"
+cleanup_harness() {
+  set +e
+  [ -z "\${metro_pid:-}" ] || kill -- "-$metro_pid" 2>/dev/null
+  rm -rf "$directory"
+}
+trap cleanup_harness EXIT
+set -m
+bash -c 'sleep 30 & echo $! > "$1"; wait' _ "$child_file" &
+metro_pid=$!
+set +m
+for _ in $(seq 1 100); do [ -s "$child_file" ] && break; sleep 0.01; done
+child_pid=$(cat "$child_file")
+test "$(ps -o pgid= -p "$metro_pid" | tr -d ' ')" = "$metro_pid"
+test "$(ps -o pgid= -p "$child_pid" | tr -d ' ')" = "$metro_pid"
+kill -- "-$metro_pid"
+set +e
+wait "$metro_pid"
+metro_status=$?
+set -e
+test "$metro_status" -eq 143
+for _ in $(seq 1 100); do ! kill -0 "$child_pid" 2>/dev/null && break; sleep 0.01; done
+! kill -0 "$child_pid" 2>/dev/null
+metro_pid=
+printf '%s\n' group-teardown-pass
+`], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "group-teardown-pass\n");
 });
 
 test("native workflows enforce the parsed Intel runner, exact SHA boundaries, and frozen tool preflight", async () => {
@@ -2644,6 +2711,11 @@ test("static evidence is recorded only after all gates and requires explicit has
 
 
 const exactIosPersistenceStopHelper = 'stop() { xcrun simctl terminate "$udid" "$app_id"; }';
+const exactIosPersistencePushHelper = `push_db() {
+  test ! -s "$local_db-wal"
+  sqlite3 "$device_db" ".restore '$local_db'"
+  sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);"
+}`;
 
 function assertIosPersistenceTerminatePolicy(wrapper: string): string {
   const terminateLines = wrapper
@@ -2657,13 +2729,27 @@ function assertIosPersistenceTerminatePolicy(wrapper: string): string {
   return terminateLines[0];
 }
 
+function assertIosPersistencePushPolicy(wrapper: string): void {
+  const start = wrapper.indexOf("push_db() {");
+  const end = wrapper.indexOf("\n}", start);
+  assert.ok(start >= 0 && end > start, "iOS persistence push helper is absent");
+  assert.equal(
+    wrapper.slice(start, end + 2),
+    exactIosPersistencePushHelper,
+    "iOS persistence push must restore through SQLite and checkpoint without deleting live sidecars",
+  );
+}
+
 function assertPersistenceWrapper(wrapper: string, platform: "android" | "ios") {
   assert.match(wrapper, /set -euo pipefail/);
   assert.match(wrapper, /-wal/);
   assert.match(wrapper, /-shm/);
   assert.match(wrapper, /recovered-noop\.json/);
   assert.match(wrapper, /bootstrap-retry\.yaml/);
-  if (platform === "ios") assertIosPersistenceTerminatePolicy(wrapper);
+  if (platform === "ios") {
+    assertIosPersistenceTerminatePolicy(wrapper);
+    assertIosPersistencePushPolicy(wrapper);
+  }
   ordered(
     wrapper,
     'node tools/persistence-evidence.mjs --action corrupt-hash --database "$local_db"',
@@ -2760,6 +2846,45 @@ printf '%s\\n' evidence-collected
       `${label} must be rejected`,
     );
   }
+});
+
+test("iOS persistence replacement uses SQLite restore and rejects live sidecar deletion", async () => {
+  const wrapper = await readFile("scripts/e2e/run-persistence-ios.sh", "utf8");
+  assertIosPersistencePushPolicy(wrapper);
+  for (const [label, mutation] of [
+    ["raw overwrite", wrapper.replace(exactIosPersistencePushHelper, 'push_db() { cp "$local_db" "$device_db"; }')],
+    ["sidecar deletion", wrapper.replace("  sqlite3 \"$device_db\" \"PRAGMA wal_checkpoint(TRUNCATE);\"", '  rm -f "$device_db-wal" "$device_db-shm"')],
+    ["missing checkpoint", wrapper.replace('  sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);"\n', "")],
+  ] as const) {
+    assert.notEqual(mutation, wrapper, `${label} fixture must change the iOS persistence wrapper`);
+    assert.throws(
+      () => assertIosPersistencePushPolicy(mutation),
+      /push helper is absent|restore through SQLite and checkpoint/,
+      `${label} must be rejected`,
+    );
+  }
+
+  const result = spawnSync("bash", ["-c", `set -euo pipefail
+directory=$(mktemp -d)
+trap 'rm -rf "$directory"' EXIT
+local_db="$directory/local.db"
+device_db="$directory/device.db"
+: > "$local_db"
+sqlite3() { printf '<%s>\\n' "$@"; }
+${exactIosPersistencePushHelper}
+push_db
+`], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const calls = result.stdout.trimEnd().split("\n");
+  assert.equal(calls.length, 4);
+  assert.match(calls[0]!, /^<.*\/device\.db>$/);
+  const devicePath = calls[0]!.slice(1, -1);
+  assert.deepEqual(calls, [
+    `<${devicePath}>`,
+    `<.restore '${devicePath.replace("device.db", "local.db")}'>`,
+    `<${devicePath}>`,
+    "<PRAGMA wal_checkpoint(TRUNCATE);>",
+  ]);
 });
 
 test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only uploads", async () => {
@@ -2920,14 +3045,14 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assert.equal((iosWorkflow.match(/-configuration Release/g) ?? []).length, 1, "iOS Release must build exactly once");
   ordered(androidRunner,
     "bash scripts/e2e/run-persistence-android.sh",
-    'kill "$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    'kill -- "-$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
     'adb -s "$emulator_serial" reverse --remove tcp:8081',
     "curl --silent --fail http://127.0.0.1:8081/status",
     "bash scripts/e2e/run-profile-restart-android.sh",
   );
   ordered(iosWorkflow,
     "bash scripts/e2e/run-persistence-ios.sh",
-    'kill "$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    'kill -- "-$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
     "curl --silent --fail http://127.0.0.1:8081/status",
     "bash scripts/e2e/run-profile-restart-ios.sh",
   );

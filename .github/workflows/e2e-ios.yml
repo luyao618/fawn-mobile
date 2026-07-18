@@ -102,8 +102,10 @@ jobs:
           test -x "$release_app_path/ForMobile"
           test -s "$release_app_path/main.jsbundle"
           xcrun simctl install "$simulator_udid" "$app_path"
+          set -m
           CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &
           metro_pid=$!
+          set +m
           cleanup() {
             status=$?
             trap - EXIT
@@ -113,7 +115,7 @@ jobs:
               xcrun simctl spawn "$simulator_udid" log show --style compact --last 15m --predicate 'process == "ForMobile" OR process == "SpringBoard"' > .artifacts/launch/simulator/ios-simulator-app.log 2>&1
             fi
             if [ -n "$metro_pid" ]; then
-              kill "$metro_pid" 2>/dev/null
+              kill -- "-$metro_pid" 2>/dev/null
               wait "$metro_pid" 2>/dev/null
             fi
             cat /tmp/metro.log
@@ -132,7 +134,7 @@ jobs:
           maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-smoke e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log
           mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log
           bash scripts/e2e/run-persistence-ios.sh "$simulator_udid" "${{ inputs.expected_sha }}"
-          kill "$metro_pid"
+          kill -- "-$metro_pid"
           set +e
           wait "$metro_pid"
           metro_status=$?
