@@ -650,7 +650,7 @@ const exactSmokeFlow = `appId: com.luyao618.formobile
 - tapOn: "相册"
 - assertVisible: "还没有照片"
 - tapOn: "我的"
-- assertVisible: "本机设置尚未启用"
+- assertVisible: "宝宝资料"
 - tapOn: "管家"
 - assertVisible: "照护空间尚未设置"
 `;
