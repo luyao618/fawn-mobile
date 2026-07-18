@@ -1,5 +1,5 @@
 import { useFocusEffect } from "@react-navigation/native";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import type { OptionalBabyProfileSnapshot } from "../../application/profile/babyProfileService";
@@ -24,40 +24,84 @@ export function StewardScreen() {
   const service = useBabyProfileService();
   const [snapshot, setSnapshot] = useState<OptionalBabyProfileSnapshot | null>(null);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
-  const loadGeneration = useRef(0);
-  const focusLoadInFlight = useRef(false);
-  const load = useCallback((showLoading: boolean) => {
-    if (!showLoading && focusLoadInFlight.current) return;
-    const generation = loadGeneration.current + 1;
-    loadGeneration.current = generation;
-    if (showLoading) {
-      focusLoadInFlight.current = true;
-      setSnapshot(null);
-      setLoadState("loading");
-    }
-    void service.load().then((loaded) => {
-      if (loadGeneration.current !== generation) return;
-      if (showLoading) focusLoadInFlight.current = false;
+  const requestGeneration = useRef(0);
+  const appliedGeneration = useRef(0);
+  const ageRefreshFailureGeneration = useRef(0);
+  const focusSession = useRef(0);
+  const replaceLoadInFlight = useRef<Promise<void> | null>(null);
+  const hasCommittedSnapshot = useRef(false);
+  const mountedRef = useRef(true);
+  const [ageRefreshFailed, setAgeRefreshFailed] = useState(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const load = useCallback((): Promise<void> => {
+    const generation = requestGeneration.current + 1;
+    requestGeneration.current = generation;
+    const session = focusSession.current;
+    setLoadState("loading");
+    let operation!: Promise<void>;
+    operation = service.load().then((loaded) => {
+      if (!mountedRef.current || focusSession.current !== session || generation < appliedGeneration.current) return;
+      appliedGeneration.current = generation;
       setSnapshot(loaded);
+      hasCommittedSnapshot.current = true;
+      const newerAgeRefreshFailed = generation < ageRefreshFailureGeneration.current;
+      if (!newerAgeRefreshFailed) ageRefreshFailureGeneration.current = 0;
+      setAgeRefreshFailed(newerAgeRefreshFailed);
       setLoadState("ready");
     }).catch(() => {
-      if (loadGeneration.current !== generation) return;
-      if (showLoading) focusLoadInFlight.current = false;
-      if (!showLoading) return;
+      if (!mountedRef.current || focusSession.current !== session || generation < appliedGeneration.current) return;
       setSnapshot(null);
+      hasCommittedSnapshot.current = false;
       setLoadState("error");
+    }).finally(() => {
+      if (replaceLoadInFlight.current === operation) replaceLoadInFlight.current = null;
     });
+    replaceLoadInFlight.current = operation;
+    return operation;
   }, [service]);
 
   useFocusEffect(useCallback(() => {
-    load(true);
+    focusSession.current += 1;
+    void load();
     return () => {
-      loadGeneration.current += 1;
-      focusLoadInFlight.current = false;
+      focusSession.current += 1;
+      replaceLoadInFlight.current = null;
     };
   }, [load]));
 
-  const refreshCommitted = useCallback(() => load(false), [load]);
+  const refreshCommitted = useCallback(async (): Promise<void> => {
+    const generation = requestGeneration.current + 1;
+    requestGeneration.current = generation;
+    const session = focusSession.current;
+    const replaceOperation = replaceLoadInFlight.current;
+    let loaded: OptionalBabyProfileSnapshot;
+    try {
+      loaded = await service.load();
+    } catch (error) {
+      if (mountedRef.current && focusSession.current === session && generation >= appliedGeneration.current) {
+        ageRefreshFailureGeneration.current = generation;
+        if (hasCommittedSnapshot.current) setAgeRefreshFailed(true);
+      }
+      throw error;
+    }
+    if (replaceOperation) await replaceOperation;
+    if (!mountedRef.current || focusSession.current !== session) return;
+    if (!hasCommittedSnapshot.current) {
+      ageRefreshFailureGeneration.current = generation;
+      throw new Error("A committed profile snapshot is required for an age refresh.");
+    }
+    if (generation < appliedGeneration.current) return;
+    appliedGeneration.current = generation;
+    setSnapshot(loaded);
+    ageRefreshFailureGeneration.current = 0;
+    setAgeRefreshFailed(false);
+    setLoadState("ready");
+  }, [service]);
   useActiveLocalDayRefresh(refreshCommitted);
 
   const profileStatus = loadState === "error" ? "读取失败" : loadState === "loading" ? "读取中" : snapshot?.profile ? "已保存" : "未设置";
@@ -65,12 +109,14 @@ export function StewardScreen() {
     ? "暂不可用"
     : loadState === "loading"
       ? "读取中"
-      : formatExactAge(snapshot?.exactAge ?? {
-        status: "unknown",
-        reason: "birth_date_missing",
-        localDate: "",
-        timeZone: "",
-      }) ?? "出生日期待填";
+      : ageRefreshFailed
+        ? "暂不可用"
+        : formatExactAge(snapshot?.exactAge ?? {
+          status: "unknown",
+          reason: "birth_date_missing",
+          localDate: "",
+          timeZone: "",
+        }) ?? "出生日期待填";
   return (
     <AppFrame localOnly title="管家">
       <EmptyState

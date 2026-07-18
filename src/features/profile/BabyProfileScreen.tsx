@@ -1,5 +1,5 @@
 import { useFocusEffect } from "@react-navigation/native";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Pressable,
   StyleSheet,
@@ -105,6 +105,7 @@ function LabeledInput({
   placeholder,
   keyboardType = "default",
   error,
+  disabled = false,
 }: {
   label: string;
   value: string;
@@ -112,20 +113,23 @@ function LabeledInput({
   placeholder?: string;
   keyboardType?: "default" | "numeric" | "decimal-pad";
   error?: string;
+  disabled?: boolean;
 }) {
   return (
     <View style={styles.field}>
       <Text allowFontScaling style={styles.label}>{label}</Text>
       <TextInput
         accessibilityLabel={label}
+        accessibilityState={{ disabled }}
         allowFontScaling
         autoCapitalize="none"
         autoCorrect={false}
+        editable={!disabled}
         keyboardType={keyboardType}
         onChangeText={onChangeText}
         placeholder={placeholder}
         placeholderTextColor={colors.textSecondary}
-        style={[styles.input, error ? styles.inputError : null]}
+        style={[styles.input, error ? styles.inputError : null, disabled ? styles.disabled : null]}
         value={value}
       />
       <FieldError message={error} />
@@ -139,12 +143,14 @@ function RadioGroup<T extends string | boolean | null>({
   selected,
   onSelect,
   error,
+  disabled = false,
 }: {
   label: string;
   options: readonly Readonly<{ value: T; label: string; accessibilityLabel: string }>[];
   selected: T;
   onSelect: (value: T) => void;
   error?: string;
+  disabled?: boolean;
 }) {
   return (
     <View style={styles.field}>
@@ -156,14 +162,16 @@ function RadioGroup<T extends string | boolean | null>({
             <Pressable
               accessibilityLabel={option.accessibilityLabel}
               accessibilityRole="radio"
-              accessibilityState={{ checked }}
+              accessibilityState={{ checked, disabled }}
+              disabled={disabled}
               key={option.accessibilityLabel}
               onPress={() => onSelect(option.value)}
               style={({ pressed }) => [
                 styles.radio,
                 checked ? styles.radioSelected : null,
                 error ? styles.radioError : null,
-                pressed ? styles.pressed : null,
+                pressed && !disabled ? styles.pressed : null,
+                disabled ? styles.disabled : null,
               ]}
             >
               <Text allowFontScaling style={[styles.radioText, checked ? styles.radioTextSelected : null]}>
@@ -178,62 +186,112 @@ function RadioGroup<T extends string | boolean | null>({
   );
 }
 
-type ProfileLoadMode = "replaceDraft" | "refreshCommitted";
-
 export function BabyProfileScreen() {
   const service = useBabyProfileService();
   const [snapshot, setSnapshot] = useState<OptionalBabyProfileSnapshot | null>(null);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
-  const loadGeneration = useRef(0);
-  const replaceLoadInFlight = useRef(false);
+  const requestGeneration = useRef(0);
+  const appliedGeneration = useRef(0);
+  const replacementBarrierGeneration = useRef(0);
+  const ageRefreshFailureGeneration = useRef(0);
+  const focusSession = useRef(0);
+  const replaceLoadInFlight = useRef<Promise<void> | null>(null);
   const hasCommittedSnapshot = useRef(false);
+  const mountedRef = useRef(true);
   const savingRef = useRef(false);
   const [saving, setSaving] = useState(false);
+  const [ageRefreshFailed, setAgeRefreshFailed] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [errors, setErrors] = useState<Partial<Record<BabyProfileField, string>>>({});
 
-  const load = useCallback((mode: ProfileLoadMode) => {
-    if (mode === "refreshCommitted" && replaceLoadInFlight.current) return;
-    const generation = loadGeneration.current + 1;
-    loadGeneration.current = generation;
-    const replaceDraft = mode === "replaceDraft" || !hasCommittedSnapshot.current;
-    if (mode === "replaceDraft") {
-      replaceLoadInFlight.current = true;
-      setLoadState("loading");
-    }
-    void service.load().then((loaded) => {
-      if (loadGeneration.current !== generation) return;
-      if (mode === "replaceDraft") replaceLoadInFlight.current = false;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const load = useCallback((): Promise<void> => {
+    const generation = requestGeneration.current + 1;
+    requestGeneration.current = generation;
+    const session = focusSession.current;
+    setLoadState("loading");
+    let operation!: Promise<void>;
+    operation = service.load().then((loaded) => {
+      if (
+        !mountedRef.current
+        || focusSession.current !== session
+        || generation < appliedGeneration.current
+        || generation < replacementBarrierGeneration.current
+      ) return;
+      appliedGeneration.current = generation;
       setSnapshot(loaded);
-      if (replaceDraft) {
-        setDraft(draftFromProfile(loaded.profile));
-        setErrors({});
-        setSaveMessage(null);
-      }
+      setDraft(draftFromProfile(loaded.profile));
+      setErrors({});
+      setSaveMessage(null);
       hasCommittedSnapshot.current = true;
+      const newerAgeRefreshFailed = generation < ageRefreshFailureGeneration.current;
+      if (!newerAgeRefreshFailed) ageRefreshFailureGeneration.current = 0;
+      setAgeRefreshFailed(newerAgeRefreshFailed);
       setLoadState("ready");
     }).catch(() => {
-      if (loadGeneration.current !== generation) return;
-      if (mode === "replaceDraft") replaceLoadInFlight.current = false;
-      if (mode === "replaceDraft" || !hasCommittedSnapshot.current) {
-        setLoadState("error");
-      }
+      if (
+        !mountedRef.current
+        || focusSession.current !== session
+        || generation < appliedGeneration.current
+        || generation < replacementBarrierGeneration.current
+      ) return;
+      setLoadState("error");
+    }).finally(() => {
+      if (replaceLoadInFlight.current === operation) replaceLoadInFlight.current = null;
     });
+    replaceLoadInFlight.current = operation;
+    return operation;
   }, [service]);
 
   useFocusEffect(useCallback(() => {
-    load("replaceDraft");
+    focusSession.current += 1;
+    void load();
     return () => {
-      loadGeneration.current += 1;
-      replaceLoadInFlight.current = false;
+      focusSession.current += 1;
+      replaceLoadInFlight.current = null;
     };
   }, [load]));
 
-  const refreshCommitted = useCallback(() => load("refreshCommitted"), [load]);
+  const refreshCommitted = useCallback(async (): Promise<void> => {
+    const generation = requestGeneration.current + 1;
+    requestGeneration.current = generation;
+    const session = focusSession.current;
+    const replaceOperation = replaceLoadInFlight.current;
+    let loaded: OptionalBabyProfileSnapshot;
+    try {
+      loaded = await service.load();
+    } catch (error) {
+      if (mountedRef.current && focusSession.current === session && generation >= appliedGeneration.current) {
+        ageRefreshFailureGeneration.current = generation;
+        if (hasCommittedSnapshot.current) setAgeRefreshFailed(true);
+      }
+      throw error;
+    }
+    if (replaceOperation) await replaceOperation;
+    if (!mountedRef.current || focusSession.current !== session) return;
+    if (!hasCommittedSnapshot.current) {
+      ageRefreshFailureGeneration.current = generation;
+      throw new Error("A committed profile snapshot is required for an age refresh.");
+    }
+    if (generation < appliedGeneration.current) return;
+    appliedGeneration.current = generation;
+    setSnapshot((current) => current === null ? current : Object.freeze({
+      profile: current.profile,
+      exactAge: loaded.exactAge,
+    }));
+    ageRefreshFailureGeneration.current = 0;
+    setAgeRefreshFailed(false);
+    setLoadState("ready");
+  }, [service]);
   useActiveLocalDayRefresh(refreshCommitted);
 
   const updateDraft = <K extends keyof Draft>(field: K, value: Draft[K]) => {
+    if (savingRef.current) return;
     setDraft((current) => Object.freeze({ ...current, [field]: value }));
     setErrors((current) => ({ ...current, [field]: undefined }));
     setSaveMessage(null);
@@ -251,14 +309,21 @@ export function BabyProfileScreen() {
     setSaving(true);
     setErrors({});
     setSaveMessage(null);
-    loadGeneration.current += 1;
+    requestGeneration.current += 1;
+    replacementBarrierGeneration.current = requestGeneration.current;
     void service.save(inputFromDraft(draft, isPremature), snapshot?.profile?.updatedAt ?? null).then((saved: BabyProfileSnapshot) => {
-      loadGeneration.current += 1;
+      if (!mountedRef.current) return;
+      requestGeneration.current += 1;
+      appliedGeneration.current = requestGeneration.current;
       setSnapshot(saved);
       setDraft(draftFromProfile(saved.profile));
       hasCommittedSnapshot.current = true;
+      ageRefreshFailureGeneration.current = 0;
+      setAgeRefreshFailed(false);
+      setLoadState("ready");
       setSaveMessage("宝宝资料已保存");
     }).catch((error: unknown) => {
+      if (!mountedRef.current) return;
       if (error instanceof BabyProfileValidationError) {
         setErrors({ [error.field]: validationMessages[error.field] });
         setSaveMessage("请检查标出的资料后再保存。");
@@ -269,11 +334,11 @@ export function BabyProfileScreen() {
       }
     }).finally(() => {
       savingRef.current = false;
-      setSaving(false);
+      if (mountedRef.current) setSaving(false);
     });
   }, [draft, service, snapshot?.profile?.updatedAt]);
 
-  const age = snapshot ? formatExactAge(snapshot.exactAge) : null;
+  const age = !ageRefreshFailed && snapshot ? formatExactAge(snapshot.exactAge) : null;
   return (
     <AppFrame localOnly title="我的">
       <View style={styles.headingGroup}>
@@ -289,7 +354,7 @@ export function BabyProfileScreen() {
           <InlineNotice>暂时无法读取宝宝资料。本机数据没有更改。</InlineNotice>
           <Pressable
             accessibilityRole="button"
-            onPress={() => load("replaceDraft")}
+            onPress={() => { void load(); }}
             style={({ pressed }) => [styles.secondaryButton, pressed ? styles.pressed : null]}
           >
             <Text allowFontScaling style={styles.secondaryButtonText}>重新读取宝宝资料</Text>
@@ -301,11 +366,12 @@ export function BabyProfileScreen() {
         <>
           <View style={styles.summary}>
             <Text allowFontScaling style={styles.summaryName}>{snapshot?.profile?.name ?? "宝宝档案"}</Text>
-            <Text allowFontScaling style={styles.summaryAge}>{age ?? "出生日期待填"}</Text>
+            <Text allowFontScaling style={styles.summaryAge}>{ageRefreshFailed ? "年龄暂不可用" : age ?? "出生日期待填"}</Text>
           </View>
 
           <View style={styles.form}>
             <LabeledInput
+              disabled={saving}
               error={errors.name}
               label="宝宝姓名"
               onChangeText={(value) => updateDraft("name", value)}
@@ -313,6 +379,7 @@ export function BabyProfileScreen() {
               value={draft.name}
             />
             <LabeledInput
+              disabled={saving}
               error={errors.birthDate}
               label="出生日期"
               onChangeText={(value) => updateDraft("birthDate", value)}
@@ -320,6 +387,7 @@ export function BabyProfileScreen() {
               value={draft.birthDate}
             />
             <RadioGroup
+              disabled={saving}
               label="性别"
               onSelect={(value) => updateDraft("sex", value)}
               options={[
@@ -331,6 +399,7 @@ export function BabyProfileScreen() {
             />
             <View style={styles.measurements}>
               <LabeledInput
+                disabled={saving}
                 error={errors.birthWeightG}
                 keyboardType="numeric"
                 label="出生体重（克）"
@@ -339,6 +408,7 @@ export function BabyProfileScreen() {
                 value={draft.birthWeightG}
               />
               <LabeledInput
+                disabled={saving}
                 error={errors.birthHeightCm}
                 keyboardType="decimal-pad"
                 label="出生身长（厘米）"
@@ -347,6 +417,7 @@ export function BabyProfileScreen() {
                 value={draft.birthHeightCm}
               />
               <LabeledInput
+                disabled={saving}
                 error={errors.birthHeadCm}
                 keyboardType="decimal-pad"
                 label="出生头围（厘米）"
@@ -356,6 +427,7 @@ export function BabyProfileScreen() {
               />
             </View>
             <RadioGroup
+              disabled={saving}
               error={errors.isPremature}
               label="出生状态"
               onSelect={(value) => updateDraft("isPremature", value)}
@@ -366,6 +438,7 @@ export function BabyProfileScreen() {
               selected={draft.isPremature}
             />
             <LabeledInput
+              disabled={saving}
               error={errors.gestationalWeeks}
               keyboardType="numeric"
               label="出生孕周（周）"

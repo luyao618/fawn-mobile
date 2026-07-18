@@ -48,6 +48,16 @@ function emitAppState(state: AppStateStatus) {
   for (const listener of appStateListeners) listener(state);
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
 const emptySnapshot: OptionalBabyProfileSnapshot = Object.freeze({
   profile: null,
   exactAge: Object.freeze({
@@ -222,10 +232,49 @@ test("我的 saves canonical field values only after the service commits", async
   }, null);
   expect(screen.getByText("正在保存…")).toBeTruthy();
   expect(screen.queryByText("宝宝资料已保存")).toBeNull();
+  for (const label of ["宝宝姓名", "出生日期", "出生体重（克）", "出生身长（厘米）", "出生头围（厘米）", "出生孕周（周）"]) {
+    const input = screen.getByLabelText(label);
+    expect(input.props.editable).toBe(false);
+    expect(input.props.accessibilityState.disabled).toBe(true);
+  }
+  for (const label of ["性别暂不填", "性别男孩", "性别女孩", "足月", "早产"]) {
+    const control = screen.getByRole("radio", { name: label });
+    expect(control.props.accessibilityState.disabled).toBe(true);
+  }
+  fireEvent.changeText(screen.getByLabelText("宝宝姓名"), "保存中输入");
+  fireEvent.press(screen.getByRole("radio", { name: "性别男孩" }));
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe(" 测试宝宝 ");
+  expect(screen.getByRole("radio", { name: "性别女孩" }).props.accessibilityState.checked).toBe(true);
 
   await act(async () => resolveSave(savedSnapshot));
   expect(screen.getByText("宝宝资料已保存")).toBeTruthy();
   expect(screen.getByText("28个月19天")).toBeTruthy();
+});
+
+test("我的 lets an in-flight save finish without updating state after unmount", async () => {
+  const pending = deferred<BabyProfileSnapshot>();
+  let operationFinished = false;
+  const saveOperation = pending.promise.then((result) => {
+    operationFinished = true;
+    return result;
+  });
+  const save = jest.fn(() => saveOperation);
+  const consoleError = jest.spyOn(console, "error").mockImplementation(() => undefined);
+  const view = renderProfile(service({ save }));
+  await waitFor(() => expect(screen.getByLabelText("宝宝姓名")).toBeTruthy());
+  fireEvent.press(screen.getByRole("radio", { name: "足月" }));
+  fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+  expect(save).toHaveBeenCalledTimes(1);
+
+  view.unmount();
+  expect(appStateListeners.size).toBe(0);
+  await act(async () => {
+    pending.resolve(savedSnapshot);
+    await saveOperation;
+  });
+
+  expect(operationFinished).toBe(true);
+  expect(consoleError).not.toHaveBeenCalled();
 });
 
 test("我的 reports field-specific validation errors without claiming a save", async () => {
@@ -256,6 +305,8 @@ test("我的 fails closed on load errors and provides a local retry", async () =
 });
 
 test("我的 refreshes committed age on resume without replacing an unsaved name", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
   const refreshedSnapshot: BabyProfileSnapshot = Object.freeze({
     profile: savedSnapshot.profile,
     exactAge: Object.freeze({
@@ -281,12 +332,141 @@ test("我的 refreshes committed age on resume without replacing an unsaved name
   expect(await screen.findByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
 
   act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
     emitAppState("background");
     emitAppState("active");
   });
 
   await waitFor(() => expect(screen.getByText("28个月20天")).toBeTruthy());
   expect(load).toHaveBeenCalledTimes(2);
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("未保存姓名");
+  expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
+  expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
+  view.unmount();
+  expect(appStateListeners.size).toBe(0);
+});
+
+test("我的 calendar refresh preserves the draft profile token so a stale draft still conflicts", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
+  const concurrentSnapshot: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedSnapshot.profile,
+      name: "并发更新姓名",
+      birthDate: "2024-03-01",
+      updatedAt: "2026-07-19T01:00:00.000Z",
+    }),
+    exactAge: Object.freeze({
+      status: "known",
+      localDate: "2026-07-19",
+      timeZone: "Asia/Shanghai",
+      ageDays: 870,
+      completedMonths: 28,
+      remainingDays: 18,
+    }),
+  });
+  const load = jest.fn()
+    .mockResolvedValueOnce(savedSnapshot)
+    .mockResolvedValueOnce(concurrentSnapshot);
+  const conflict = new Error("private concurrent profile detail");
+  conflict.name = "RepositoryConflictError";
+  const save = jest.fn(async () => { throw conflict; });
+  const view = renderProfile(service({ load, save }));
+  await act(async () => { await Promise.resolve(); });
+  expect(screen.getByDisplayValue("测试宝宝")).toBeTruthy();
+  fireEvent.changeText(screen.getByLabelText("宝宝姓名"), "基于旧资料的草稿");
+
+  act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    emitAppState("background");
+    emitAppState("active");
+  });
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(screen.getByText("28个月18天")).toBeTruthy();
+  expect(screen.getByText("测试宝宝")).toBeTruthy();
+  expect(screen.queryByText("并发更新姓名")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("基于旧资料的草稿");
+
+  fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+  expect(save).toHaveBeenCalledWith({
+    name: "基于旧资料的草稿",
+    sex: "female",
+    birthDate: "2024-02-29",
+    birthWeightG: 3_200,
+    birthHeightCm: 50.5,
+    birthHeadCm: 34.2,
+    isPremature: true,
+    gestationalWeeks: 36,
+  }, "2026-07-18T01:00:00.000Z");
+  expect(await screen.findByText("宝宝资料已在其他位置更新，请重新读取后再保存。")).toBeTruthy();
+  expect(screen.queryByText("private concurrent profile detail")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("基于旧资料的草稿");
+  view.unmount();
+});
+
+test("我的 preserves the form while failed age refresh retries on the next active transition", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
+  const refreshedSnapshot: BabyProfileSnapshot = Object.freeze({
+    profile: savedSnapshot.profile,
+    exactAge: Object.freeze({
+      status: "known",
+      localDate: "2026-07-19",
+      timeZone: "Asia/Shanghai",
+      ageDays: 871,
+      completedMonths: 28,
+      remainingDays: 20,
+    }),
+  });
+  const load = jest.fn()
+    .mockResolvedValueOnce(savedSnapshot)
+    .mockRejectedValueOnce(new Error("private refresh detail"))
+    .mockResolvedValueOnce(refreshedSnapshot);
+  const save = jest.fn(async () => {
+    throw new BabyProfileValidationError("birthDate", "private validation detail");
+  });
+  const view = renderProfile(service({ load, save }));
+  await act(async () => { await Promise.resolve(); });
+  fireEvent.changeText(screen.getByLabelText("宝宝姓名"), "未保存姓名");
+  fireEvent.changeText(screen.getByLabelText("出生日期"), "2024-02-30");
+  await act(async () => {
+    fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+    await Promise.resolve();
+  });
+  expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
+
+  act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    emitAppState("background");
+    emitAppState("active");
+  });
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月19天")).toBeNull();
+  expect(screen.queryByText("private refresh detail")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("未保存姓名");
+  expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
+  expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
+
+  act(() => {
+    emitAppState("background");
+    emitAppState("active");
+  });
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(load).toHaveBeenCalledTimes(3);
   expect(screen.getByLabelText("宝宝姓名").props.value).toBe("未保存姓名");
   expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
   expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();

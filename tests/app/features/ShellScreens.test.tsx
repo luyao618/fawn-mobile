@@ -2,7 +2,10 @@ import { act, render, screen, waitFor } from "@testing-library/react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { AppState, type AppStateStatus, StyleSheet, Text } from "react-native";
 
-import type { BabyProfileServicePort } from "../../../src/application/profile/babyProfileService";
+import type {
+  BabyProfileServicePort,
+  OptionalBabyProfileSnapshot,
+} from "../../../src/application/profile/babyProfileService";
 import { BabyProfileServiceProvider } from "../../../src/features/profile/BabyProfileServiceContext";
 import { StewardScreen } from "../../../src/features/shell/ShellScreens";
 
@@ -36,6 +39,20 @@ afterEach(() => {
   jest.useRealTimers();
   jest.restoreAllMocks();
 });
+
+function emitAppState(state: AppStateStatus) {
+  for (const listener of appStateListeners) listener(state);
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
 
 function profileService(load: BabyProfileServicePort["load"]): BabyProfileServicePort {
   return { load, async save() { throw new Error("not used"); } };
@@ -90,9 +107,9 @@ test("管家 fails closed instead of presenting corrupt profile data as missing"
   expect(screen.queryByText("corrupt row")).toBeNull();
 });
 
-test("管家 refreshes at the local-day boundary and reschedules one timer", async () => {
+test("管家 resamples the active clock without polling and cleans up its single timer and listener", async () => {
   jest.useFakeTimers();
-  jest.setSystemTime(new Date(2026, 6, 18, 23, 59, 59, 900));
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
   const profile = {
     name: "测试宝宝", sex: "female" as const, birthDate: "2024-02-29", birthWeightG: null,
     birthHeightCm: null, birthHeadCm: null, isPremature: false, gestationalWeeks: null,
@@ -120,9 +137,19 @@ test("管家 refreshes at the local-day boundary and reschedules one timer", asy
   expect(load).toHaveBeenCalledTimes(1);
   const focusedTimerCount = jest.getTimerCount();
   expect(focusedTimerCount).toBeGreaterThanOrEqual(1);
+  expect(appStateListeners.size).toBe(1);
+  expect(AppState.addEventListener).toHaveBeenCalledTimes(1);
 
   await act(async () => {
-    jest.advanceTimersByTime(100);
+    jest.advanceTimersByTime(5 * 60_000);
+    await Promise.resolve();
+  });
+  expect(load).toHaveBeenCalledTimes(1);
+  expect(jest.getTimerCount()).toBe(focusedTimerCount);
+
+  await act(async () => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    jest.advanceTimersByTime(60_000);
     await Promise.resolve();
   });
   expect(screen.getByText("28个月20天")).toBeTruthy();
@@ -133,7 +160,170 @@ test("管家 refreshes at the local-day boundary and reschedules one timer", asy
   expect(jest.getTimerCount()).toBe(focusedTimerCount - 1);
   expect(appStateListeners.size).toBe(0);
   jest.clearAllTimers();
-  expect(jest.getTimerCount()).toBe(0);
+});
+
+test("管家 preserves a calendar refresh raised during an older focus load", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
+  const profile = {
+    name: "测试宝宝", sex: "female" as const, birthDate: "2024-02-29", birthWeightG: null,
+    birthHeightCm: null, birthHeadCm: null, isPremature: false, gestationalWeeks: null,
+    createdAt: "2025-02-28T20:00:00.000Z", updatedAt: "2025-02-28T20:00:00.000Z",
+  };
+  const older = deferred<OptionalBabyProfileSnapshot>();
+  const postEvent = deferred<OptionalBabyProfileSnapshot>();
+  const load = jest.fn()
+    .mockReturnValueOnce(older.promise)
+    .mockReturnValueOnce(postEvent.promise);
+  const view = renderSteward(profileService(load));
+  expect(load).toHaveBeenCalledTimes(1);
+
+  act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    emitAppState("background");
+    emitAppState("active");
+  });
+  await act(async () => { await Promise.resolve(); });
+  expect(load).toHaveBeenCalledTimes(2);
+
+  await act(async () => {
+    postEvent.resolve({
+      profile,
+      exactAge: {
+        status: "known", localDate: "2026-07-19", timeZone: "Asia/Shanghai",
+        ageDays: 871, completedMonths: 28, remainingDays: 20,
+      },
+    });
+    await Promise.resolve();
+  });
+  expect(screen.queryByText("28个月20天")).toBeNull();
+
+  await act(async () => {
+    older.resolve({
+      profile: null,
+      exactAge: {
+        status: "unknown", reason: "birth_date_missing", localDate: "2026-07-18", timeZone: "Asia/Shanghai",
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(screen.getByText("已保存")).toBeTruthy();
+  expect(load).toHaveBeenCalledTimes(2);
+  view.unmount();
+});
+
+test("管家 keeps age unavailable when an older focus load resolves after a failed calendar refresh", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
+  const profile = {
+    name: "测试宝宝", sex: "female" as const, birthDate: "2024-02-29", birthWeightG: null,
+    birthHeightCm: null, birthHeadCm: null, isPremature: false, gestationalWeeks: null,
+    createdAt: "2025-02-28T20:00:00.000Z", updatedAt: "2025-02-28T20:00:00.000Z",
+  };
+  const older = deferred<OptionalBabyProfileSnapshot>();
+  const load = jest.fn()
+    .mockReturnValueOnce(older.promise)
+    .mockRejectedValueOnce(new Error("private refresh detail"))
+    .mockResolvedValueOnce({
+      profile,
+      exactAge: {
+        status: "known", localDate: "2026-07-19", timeZone: "Asia/Shanghai",
+        ageDays: 871, completedMonths: 28, remainingDays: 20,
+      },
+    });
+  const view = renderSteward(profileService(load));
+
+  act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    emitAppState("background");
+    emitAppState("active");
+  });
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(load).toHaveBeenCalledTimes(2);
+
+  await act(async () => {
+    older.resolve({
+      profile,
+      exactAge: {
+        status: "known", localDate: "2026-07-18", timeZone: "Asia/Shanghai",
+        ageDays: 870, completedMonths: 28, remainingDays: 19,
+      },
+    });
+    await Promise.resolve();
+  });
+  expect(screen.getByText("暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月19天")).toBeNull();
+  expect(screen.queryByText("private refresh detail")).toBeNull();
+
+  await act(async () => {
+    jest.advanceTimersByTime(60_000);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(load).toHaveBeenCalledTimes(3);
+  view.unmount();
+  jest.clearAllTimers();
+});
+
+test("管家 marks age unavailable after refresh failure and retries on the bounded clock check", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
+  const profile = {
+    name: "测试宝宝", sex: "female" as const, birthDate: "2024-02-29", birthWeightG: null,
+    birthHeightCm: null, birthHeadCm: null, isPremature: false, gestationalWeeks: null,
+    createdAt: "2025-02-28T20:00:00.000Z", updatedAt: "2025-02-28T20:00:00.000Z",
+  };
+  const load = jest.fn()
+    .mockResolvedValueOnce({
+      profile,
+      exactAge: {
+        status: "known", localDate: "2026-07-18", timeZone: "Asia/Shanghai",
+        ageDays: 870, completedMonths: 28, remainingDays: 19,
+      },
+    })
+    .mockRejectedValueOnce(new Error("private refresh detail"))
+    .mockResolvedValueOnce({
+      profile,
+      exactAge: {
+        status: "known", localDate: "2026-07-19", timeZone: "Asia/Shanghai",
+        ageDays: 871, completedMonths: 28, remainingDays: 20,
+      },
+    });
+  const view = renderSteward(profileService(load));
+  await act(async () => { await Promise.resolve(); });
+  expect(screen.getByText("28个月19天")).toBeTruthy();
+
+  await act(async () => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    jest.advanceTimersByTime(60_000);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(screen.getByText("暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月19天")).toBeNull();
+  expect(screen.queryByText("private refresh detail")).toBeNull();
+  expect(load).toHaveBeenCalledTimes(2);
+
+  await act(async () => {
+    jest.advanceTimersByTime(60_000);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(load).toHaveBeenCalledTimes(3);
+  const focusedTimerCount = jest.getTimerCount();
+  expect(focusedTimerCount).toBeGreaterThanOrEqual(1);
+
+  view.unmount();
+  expect(jest.getTimerCount()).toBe(focusedTimerCount - 1);
+  expect(appStateListeners.size).toBe(0);
+  jest.clearAllTimers();
 });
 
 test("shell text keeps native scaling and omits clipping-prone fixed line heights", async () => {
