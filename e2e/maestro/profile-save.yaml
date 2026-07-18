@@ -9,7 +9,12 @@ appId: com.luyao618.formobile
     commands:
       - tapOn:
           id: "tab-MeTab"
-          retryTapIfNoChange: true
+      - runFlow:
+          when:
+            visible: "照护空间尚未设置"
+          commands:
+            - tapOn:
+                id: "tab-MeTab"
 - runFlow:
     when:
       platform: Android

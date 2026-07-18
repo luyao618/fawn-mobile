@@ -22,8 +22,32 @@ cleanup() {
 }
 trap cleanup EXIT
 
-adb -s "$serial" root >/dev/null
-adb -s "$serial" wait-for-device
+ensure_adb_root() {
+  local root_output root_status wait_output wait_status uid_output uid_status
+  if root_output=$(adb -s "$serial" root 2>&1); then root_status=0; else root_status=$?; fi
+  root_output=${root_output%$'\r'}
+  case "$root_status:$root_output" in
+    '0:restarting adbd as root'|'0:adbd is already running as root'|'1:adb: unable to connect for root: closed') ;;
+    *)
+      printf 'Unexpected adb root result (status %s): %s\n' "$root_status" "$root_output" >&2
+      [ "$root_status" -ne 0 ] && return "$root_status"
+      return 1
+      ;;
+  esac
+  if wait_output=$(timeout 30s adb -s "$serial" wait-for-device 2>&1); then wait_status=0; else wait_status=$?; fi
+  if [ "$wait_status" -ne 0 ]; then
+    printf 'adb root wait failed (status %s): %s\n' "$wait_status" "$wait_output" >&2
+    return "$wait_status"
+  fi
+  if uid_output=$(adb -s "$serial" shell id -u 2>&1); then uid_status=0; else uid_status=$?; fi
+  uid_output=${uid_output%$'\r'}
+  if [ "$uid_status" -ne 0 ] || [ "$uid_output" != 0 ]; then
+    printf 'adb root postcondition failed (status %s): %s\n' "$uid_status" "$uid_output" >&2
+    [ "$uid_status" -ne 0 ] && return "$uid_status"
+    return 1
+  fi
+}
+ensure_adb_root
 wait_for_package_service() {
   for _ in $(seq 1 60); do adb -s "$serial" shell service check package 2>/dev/null | tr -d '\r' | grep -Fxq 'Service package: found' && break; sleep 2; done
   adb -s "$serial" shell service check package 2>/dev/null | tr -d '\r' | grep -Fxq 'Service package: found'

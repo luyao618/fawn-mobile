@@ -9,7 +9,12 @@ appId: com.luyao618.formobile
     commands:
       - tapOn:
           id: "tab-MeTab"
-          retryTapIfNoChange: true
+      - runFlow:
+          when:
+            visible: "宝宝资料已保存在本机"
+          commands:
+            - tapOn:
+                id: "tab-MeTab"
 - runFlow:
     when:
       platform: Android
