@@ -1,10 +1,11 @@
 import { useFocusEffect } from "@react-navigation/native";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import type { OptionalBabyProfileSnapshot } from "../../application/profile/babyProfileService";
 import { formatExactAge } from "../../domain/baby/age";
 import { useBabyProfileService } from "../profile/BabyProfileServiceContext";
+import { useActiveLocalDayRefresh } from "../profile/useActiveLocalDayRefresh";
 import { colors, radius, spacing } from "../../shared/theme/tokens";
 import { AppFrame } from "../../shared/ui/AppFrame";
 import { EmptyState } from "../../shared/ui/EmptyState";
@@ -23,22 +24,41 @@ export function StewardScreen() {
   const service = useBabyProfileService();
   const [snapshot, setSnapshot] = useState<OptionalBabyProfileSnapshot | null>(null);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
-  useFocusEffect(useCallback(() => {
-    let active = true;
-    setSnapshot(null);
-    setLoadState("loading");
+  const loadGeneration = useRef(0);
+  const focusLoadInFlight = useRef(false);
+  const load = useCallback((showLoading: boolean) => {
+    if (!showLoading && focusLoadInFlight.current) return;
+    const generation = loadGeneration.current + 1;
+    loadGeneration.current = generation;
+    if (showLoading) {
+      focusLoadInFlight.current = true;
+      setSnapshot(null);
+      setLoadState("loading");
+    }
     void service.load().then((loaded) => {
-      if (!active) return;
+      if (loadGeneration.current !== generation) return;
+      if (showLoading) focusLoadInFlight.current = false;
       setSnapshot(loaded);
       setLoadState("ready");
     }).catch(() => {
-      if (active) {
-        setSnapshot(null);
-        setLoadState("error");
-      }
+      if (loadGeneration.current !== generation) return;
+      if (showLoading) focusLoadInFlight.current = false;
+      if (!showLoading) return;
+      setSnapshot(null);
+      setLoadState("error");
     });
-    return () => { active = false; };
-  }, [service]));
+  }, [service]);
+
+  useFocusEffect(useCallback(() => {
+    load(true);
+    return () => {
+      loadGeneration.current += 1;
+      focusLoadInFlight.current = false;
+    };
+  }, [load]));
+
+  const refreshCommitted = useCallback(() => load(false), [load]);
+  useActiveLocalDayRefresh(refreshCommitted);
 
   const profileStatus = loadState === "error" ? "读取失败" : loadState === "loading" ? "读取中" : snapshot?.profile ? "已保存" : "未设置";
   const ageStatus = loadState === "error"

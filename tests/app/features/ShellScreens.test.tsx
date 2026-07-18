@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from "@testing-library/react-native";
+import { act, render, screen, waitFor } from "@testing-library/react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
-import { StyleSheet, Text } from "react-native";
+import { AppState, type AppStateStatus, StyleSheet, Text } from "react-native";
 
 import type { BabyProfileServicePort } from "../../../src/application/profile/babyProfileService";
 import { BabyProfileServiceProvider } from "../../../src/features/profile/BabyProfileServiceContext";
@@ -13,6 +13,28 @@ jest.mock("@react-navigation/native", () => {
     ...actual,
     useFocusEffect: (effect: () => void | (() => void)) => React.useEffect(effect, [effect]),
   };
+});
+
+type AppStateListener = (state: AppStateStatus) => void;
+
+let appStateListeners = new Set<AppStateListener>();
+const defaultAppState = AppState.currentState;
+
+beforeEach(() => {
+  appStateListeners = new Set<AppStateListener>();
+  AppState.currentState = "active";
+  jest.spyOn(AppState, "addEventListener").mockImplementation((type, listener) => {
+    if (type === "change") appStateListeners.add(listener as AppStateListener);
+    return {
+      remove: () => { appStateListeners.delete(listener as AppStateListener); },
+    };
+  });
+});
+
+afterEach(() => {
+  AppState.currentState = defaultAppState;
+  jest.useRealTimers();
+  jest.restoreAllMocks();
 });
 
 function profileService(load: BabyProfileServicePort["load"]): BabyProfileServicePort {
@@ -66,6 +88,52 @@ test("管家 fails closed instead of presenting corrupt profile data as missing"
   expect(await screen.findByText("读取失败")).toBeTruthy();
   expect(screen.getByText("暂不可用")).toBeTruthy();
   expect(screen.queryByText("corrupt row")).toBeNull();
+});
+
+test("管家 refreshes at the local-day boundary and reschedules one timer", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 23, 59, 59, 900));
+  const profile = {
+    name: "测试宝宝", sex: "female" as const, birthDate: "2024-02-29", birthWeightG: null,
+    birthHeightCm: null, birthHeadCm: null, isPremature: false, gestationalWeeks: null,
+    createdAt: "2025-02-28T20:00:00.000Z", updatedAt: "2025-02-28T20:00:00.000Z",
+  };
+  const load = jest.fn()
+    .mockResolvedValueOnce({
+      profile,
+      exactAge: {
+        status: "known", localDate: "2026-07-18", timeZone: "Asia/Shanghai",
+        ageDays: 870, completedMonths: 28, remainingDays: 19,
+      },
+    })
+    .mockResolvedValueOnce({
+      profile,
+      exactAge: {
+        status: "known", localDate: "2026-07-19", timeZone: "Asia/Shanghai",
+        ageDays: 871, completedMonths: 28, remainingDays: 20,
+      },
+    });
+  const view = renderSteward(profileService(load));
+
+  await act(async () => { await Promise.resolve(); });
+  expect(screen.getByText("28个月19天")).toBeTruthy();
+  expect(load).toHaveBeenCalledTimes(1);
+  const focusedTimerCount = jest.getTimerCount();
+  expect(focusedTimerCount).toBeGreaterThanOrEqual(1);
+
+  await act(async () => {
+    jest.advanceTimersByTime(100);
+    await Promise.resolve();
+  });
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(load).toHaveBeenCalledTimes(2);
+  expect(jest.getTimerCount()).toBe(focusedTimerCount);
+
+  view.unmount();
+  expect(jest.getTimerCount()).toBe(focusedTimerCount - 1);
+  expect(appStateListeners.size).toBe(0);
+  jest.clearAllTimers();
+  expect(jest.getTimerCount()).toBe(0);
 });
 
 test("shell text keeps native scaling and omits clipping-prone fixed line heights", async () => {

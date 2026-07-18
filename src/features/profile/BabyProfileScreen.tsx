@@ -24,6 +24,7 @@ import { colors, radius, spacing } from "../../shared/theme/tokens";
 import { AppFrame } from "../../shared/ui/AppFrame";
 import { InlineNotice } from "../../shared/ui/InlineNotice";
 import { useBabyProfileService } from "./BabyProfileServiceContext";
+import { useActiveLocalDayRefresh } from "./useActiveLocalDayRefresh";
 
 type Draft = Readonly<{
   name: string;
@@ -32,7 +33,7 @@ type Draft = Readonly<{
   birthWeightG: string;
   birthHeightCm: string;
   birthHeadCm: string;
-  isPremature: boolean;
+  isPremature: boolean | null;
   gestationalWeeks: string;
 }>;
 
@@ -43,7 +44,7 @@ const emptyDraft: Draft = Object.freeze({
   birthWeightG: "",
   birthHeightCm: "",
   birthHeadCm: "",
-  isPremature: false,
+  isPremature: null,
   gestationalWeeks: "",
 });
 
@@ -79,7 +80,7 @@ function nullableNumber(value: string): number | null {
   return Number(value);
 }
 
-function inputFromDraft(draft: Draft): BabyProfileInput {
+function inputFromDraft(draft: Draft, isPremature: boolean): BabyProfileInput {
   return Object.freeze({
     name: draft.name,
     sex: draft.sex,
@@ -87,14 +88,14 @@ function inputFromDraft(draft: Draft): BabyProfileInput {
     birthWeightG: nullableNumber(draft.birthWeightG),
     birthHeightCm: nullableNumber(draft.birthHeightCm),
     birthHeadCm: nullableNumber(draft.birthHeadCm),
-    isPremature: draft.isPremature,
+    isPremature,
     gestationalWeeks: nullableNumber(draft.gestationalWeeks),
   });
 }
 
 function FieldError({ message }: { message?: string }) {
   if (!message) return null;
-  return <Text accessibilityLiveRegion="assertive" allowFontScaling style={styles.error}>{message}</Text>;
+  return <Text accessibilityLiveRegion="assertive" accessibilityRole="alert" allowFontScaling style={styles.error}>{message}</Text>;
 }
 
 function LabeledInput({
@@ -137,11 +138,13 @@ function RadioGroup<T extends string | boolean | null>({
   options,
   selected,
   onSelect,
+  error,
 }: {
   label: string;
   options: readonly Readonly<{ value: T; label: string; accessibilityLabel: string }>[];
   selected: T;
   onSelect: (value: T) => void;
+  error?: string;
 }) {
   return (
     <View style={styles.field}>
@@ -159,6 +162,7 @@ function RadioGroup<T extends string | boolean | null>({
               style={({ pressed }) => [
                 styles.radio,
                 checked ? styles.radioSelected : null,
+                error ? styles.radioError : null,
                 pressed ? styles.pressed : null,
               ]}
             >
@@ -169,9 +173,12 @@ function RadioGroup<T extends string | boolean | null>({
           );
         })}
       </View>
+      <FieldError message={error} />
     </View>
   );
 }
+
+type ProfileLoadMode = "replaceDraft" | "refreshCommitted";
 
 export function BabyProfileScreen() {
   const service = useBabyProfileService();
@@ -179,30 +186,52 @@ export function BabyProfileScreen() {
   const [draft, setDraft] = useState<Draft>(emptyDraft);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
   const loadGeneration = useRef(0);
+  const replaceLoadInFlight = useRef(false);
+  const hasCommittedSnapshot = useRef(false);
+  const savingRef = useRef(false);
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [errors, setErrors] = useState<Partial<Record<BabyProfileField, string>>>({});
 
-  const load = useCallback(() => {
+  const load = useCallback((mode: ProfileLoadMode) => {
+    if (mode === "refreshCommitted" && replaceLoadInFlight.current) return;
     const generation = loadGeneration.current + 1;
     loadGeneration.current = generation;
-    setLoadState("loading");
+    const replaceDraft = mode === "replaceDraft" || !hasCommittedSnapshot.current;
+    if (mode === "replaceDraft") {
+      replaceLoadInFlight.current = true;
+      setLoadState("loading");
+    }
     void service.load().then((loaded) => {
       if (loadGeneration.current !== generation) return;
+      if (mode === "replaceDraft") replaceLoadInFlight.current = false;
       setSnapshot(loaded);
-      setDraft(draftFromProfile(loaded.profile));
-      setErrors({});
-      setSaveMessage(null);
+      if (replaceDraft) {
+        setDraft(draftFromProfile(loaded.profile));
+        setErrors({});
+        setSaveMessage(null);
+      }
+      hasCommittedSnapshot.current = true;
       setLoadState("ready");
     }).catch(() => {
-      if (loadGeneration.current === generation) setLoadState("error");
+      if (loadGeneration.current !== generation) return;
+      if (mode === "replaceDraft") replaceLoadInFlight.current = false;
+      if (mode === "replaceDraft" || !hasCommittedSnapshot.current) {
+        setLoadState("error");
+      }
     });
   }, [service]);
 
   useFocusEffect(useCallback(() => {
-    load();
-    return () => { loadGeneration.current += 1; };
+    load("replaceDraft");
+    return () => {
+      loadGeneration.current += 1;
+      replaceLoadInFlight.current = false;
+    };
   }, [load]));
+
+  const refreshCommitted = useCallback(() => load("refreshCommitted"), [load]);
+  useActiveLocalDayRefresh(refreshCommitted);
 
   const updateDraft = <K extends keyof Draft>(field: K, value: Draft[K]) => {
     setDraft((current) => Object.freeze({ ...current, [field]: value }));
@@ -211,13 +240,23 @@ export function BabyProfileScreen() {
   };
 
   const save = useCallback(() => {
-    if (saving) return;
+    if (savingRef.current) return;
+    if (draft.isPremature === null) {
+      setErrors({ isPremature: validationMessages.isPremature });
+      setSaveMessage("请检查标出的资料后再保存。");
+      return;
+    }
+    const isPremature = draft.isPremature;
+    savingRef.current = true;
     setSaving(true);
     setErrors({});
     setSaveMessage(null);
-    void service.save(inputFromDraft(draft), snapshot?.profile?.updatedAt ?? null).then((saved: BabyProfileSnapshot) => {
+    loadGeneration.current += 1;
+    void service.save(inputFromDraft(draft, isPremature), snapshot?.profile?.updatedAt ?? null).then((saved: BabyProfileSnapshot) => {
+      loadGeneration.current += 1;
       setSnapshot(saved);
       setDraft(draftFromProfile(saved.profile));
+      hasCommittedSnapshot.current = true;
       setSaveMessage("宝宝资料已保存");
     }).catch((error: unknown) => {
       if (error instanceof BabyProfileValidationError) {
@@ -228,15 +267,18 @@ export function BabyProfileScreen() {
       } else {
         setSaveMessage("保存失败，本机资料没有更改。");
       }
-    }).finally(() => setSaving(false));
-  }, [draft, saving, service, snapshot?.profile?.updatedAt]);
+    }).finally(() => {
+      savingRef.current = false;
+      setSaving(false);
+    });
+  }, [draft, service, snapshot?.profile?.updatedAt]);
 
   const age = snapshot ? formatExactAge(snapshot.exactAge) : null;
   return (
     <AppFrame localOnly title="我的">
       <View style={styles.headingGroup}>
         <Text accessibilityRole="header" allowFontScaling style={styles.sectionTitle}>宝宝资料</Text>
-        <Text allowFontScaling style={styles.description}>资料只保存在本机；每一项都可以暂不填写。</Text>
+        <Text allowFontScaling style={styles.description}>资料只保存在本机；其他项目可以暂不填写，出生状态需选择足月或早产。</Text>
       </View>
 
       {loadState === "loading" ? (
@@ -247,7 +289,7 @@ export function BabyProfileScreen() {
           <InlineNotice>暂时无法读取宝宝资料。本机数据没有更改。</InlineNotice>
           <Pressable
             accessibilityRole="button"
-            onPress={load}
+            onPress={() => load("replaceDraft")}
             style={({ pressed }) => [styles.secondaryButton, pressed ? styles.pressed : null]}
           >
             <Text allowFontScaling style={styles.secondaryButtonText}>重新读取宝宝资料</Text>
@@ -314,6 +356,7 @@ export function BabyProfileScreen() {
               />
             </View>
             <RadioGroup
+              error={errors.isPremature}
               label="出生状态"
               onSelect={(value) => updateDraft("isPremature", value)}
               options={[
@@ -385,6 +428,7 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.xs,
   },
   radioGroup: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm },
+  radioError: { borderColor: colors.danger },
   radioSelected: { backgroundColor: colors.brandSoft, borderColor: colors.brand },
   radioText: { color: colors.textPrimary, fontSize: 16 },
   radioTextSelected: { color: colors.brandStrong, fontWeight: "600" },
