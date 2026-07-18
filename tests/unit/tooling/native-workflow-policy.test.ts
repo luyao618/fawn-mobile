@@ -2942,6 +2942,44 @@ const exactAndroidProfilePidofHelper = `pidof_app() {
   printf '%s' "\${pid//$'\\r'/}"
 }`;
 
+const exactIosDeviceCalendarSource = `import Foundation
+
+@main
+struct IOSDeviceCalendar {
+  static func main() {
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = .current
+    formatter.dateFormat = "yyyy-MM-dd"
+    print("\\(formatter.string(from: Date()))\\t\\(TimeZone.current.identifier)")
+  }
+}
+`;
+
+function assertIosDeviceCalendarPolicy(profile: string, query: string, source: string) {
+  assert.equal(source, exactIosDeviceCalendarSource, "iOS calendar probe must use device-local Foundation date and time zone");
+  assert.doesNotMatch(profile, /simctl spawn[^\n]*\bdate\b/);
+  assert.doesNotMatch(query, /simctl spawn[^\n]*\bdate\b/);
+  assert.match(query, /simulator_arch=\$\(uname -m\)\ncase "\$simulator_arch" in\n  arm64\|x86_64\)/);
+  assert.match(query, /-target "\$\{simulator_arch\}-apple-ios13\.0-simulator"/);
+  assert.match(query, /xcrun simctl spawn "\$udid" "\$probe"/);
+  assert.match(query, /\[0-9\]\[0-9\]\[0-9\]\[0-9\]-\[0-9\]\[0-9\]-\[0-9\]\[0-9\]\) ;;/);
+  assert.match(query, /Simulator calendar probe returned multiple lines/);
+  assert.equal((profile.match(/device_calendar\)/g) ?? []).length, 3, "All iOS profile calendar reads must use the probe");
+  ordered(
+    profile,
+    "save_pid=$(launch)",
+    "read -r before_save_date time_zone < <(device_calendar)",
+    "profile-save.yaml",
+    "read -r after_save_date _ < <(device_calendar)",
+    'terminate "$save_pid"',
+    "relaunch_pid=$(launch)",
+    "read -r after_relaunch_date _ < <(device_calendar)",
+    "profile-restart.yaml",
+  );
+}
+
 function assertProfileBootstrapReadiness(script: string, platform: "android" | "ios") {
   const readiness = exactProfileReadinessCommands[platform];
   assert.deepEqual(
@@ -3038,16 +3076,18 @@ function assertProfileNameToBirthDateTransition(flow: string) {
 }
 
 test("G031 native policy preserves Debug evidence before one-way offline Release profile proof", async () => {
-  const [androidWorkflow, iosWorkflow, androidRunner, androidProfile, iosProfile, saveFlow, restartFlow] = await Promise.all([
+  const [androidWorkflow, iosWorkflow, androidRunner, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, saveFlow, restartFlow] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
     readFile(".github/workflows/e2e-ios.yml", "utf8"),
     readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
     readFile("scripts/e2e/run-profile-restart-android.sh", "utf8"),
     readFile("scripts/e2e/run-profile-restart-ios.sh", "utf8"),
+    readFile("scripts/e2e/query-ios-device-calendar.sh", "utf8"),
+    readFile("scripts/e2e/ios-device-calendar.swift", "utf8"),
     readFile("e2e/maestro/profile-save.yaml", "utf8"),
     readFile("e2e/maestro/profile-restart.yaml", "utf8"),
   ]);
-  for (const script of ["scripts/e2e/run-android-emulator.sh", "scripts/e2e/run-profile-restart-android.sh", "scripts/e2e/run-profile-restart-ios.sh"]) {
+  for (const script of ["scripts/e2e/run-android-emulator.sh", "scripts/e2e/run-profile-restart-android.sh", "scripts/e2e/run-profile-restart-ios.sh", "scripts/e2e/query-ios-device-calendar.sh"]) {
     assert.equal(spawnSync("bash", ["-n", script]).status, 0, `${script} must be valid Bash`);
   }
   assert.equal((androidWorkflow.match(/:app:assembleRelease/g) ?? []).length, 1, "Android Release must build exactly once");
@@ -3085,6 +3125,7 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertNonPipelinedApkInspection(androidWorkflow, androidProfile);
   assertProfileBootstrapReadiness(androidProfile, "android");
   assertProfileBootstrapReadiness(iosProfile, "ios");
+  assertIosDeviceCalendarPolicy(iosProfile, iosCalendarQuery, iosCalendarSource);
   assertProfileNameToBirthDateTransition(saveFlow);
   assertProfileRestartFlowOrder(restartFlow);
   for (const flow of [saveFlow, restartFlow]) {
@@ -3097,10 +3138,12 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
 });
 
 test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, keyboard, and restart-order regressions", async () => {
-  const [androidWorkflow, androidProfile, iosProfile, saveFlow, restartFlow] = await Promise.all([
+  const [androidWorkflow, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, saveFlow, restartFlow] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
     readFile("scripts/e2e/run-profile-restart-android.sh", "utf8"),
     readFile("scripts/e2e/run-profile-restart-ios.sh", "utf8"),
+    readFile("scripts/e2e/query-ios-device-calendar.sh", "utf8"),
+    readFile("scripts/e2e/ios-device-calendar.swift", "utf8"),
     readFile("e2e/maestro/profile-save.yaml", "utf8"),
     readFile("e2e/maestro/profile-restart.yaml", "utf8"),
   ]);
@@ -3121,6 +3164,55 @@ test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, k
     assert.notEqual(mutation, script, `${platform} bootstrap mutation must change the wrapper`);
     assert.throws(() => assertProfileBootstrapReadiness(mutation, platform));
   }
+
+  for (const [label, profile, query, source] of [
+    ["bare date", iosProfile.replace("bash scripts/e2e/query-ios-device-calendar.sh \"$udid\"", 'xcrun simctl spawn "$udid" date +%Y-%m-%d'), iosCalendarQuery, iosCalendarSource],
+    ["host target", iosProfile, iosCalendarQuery.replace('-target "${simulator_arch}-apple-ios13.0-simulator"', '-target "arm64-apple-macos15.0"'), iosCalendarSource],
+    ["missing multiline guard", iosProfile, iosCalendarQuery.replace('case "$output" in *$\'\\n\'*) echo "Simulator calendar probe returned multiple lines" >&2; exit 1 ;; esac\n', ""), iosCalendarSource],
+    ["host time zone", iosProfile, iosCalendarQuery, iosCalendarSource.replace("TimeZone.current.identifier", "ProcessInfo.processInfo.environment[\"TZ\"] ?? \"UTC\"")],
+  ] as const) {
+    assert.throws(() => assertIosDeviceCalendarPolicy(profile, query, source), label);
+  }
+
+  const calendarHarness = async (output: string, architecture = "arm64") => {
+    const root = await mkdtemp(join(tmpdir(), "g031-ios-calendar-"));
+    const bin = join(root, "bin");
+    const log = join(root, "calls.log");
+    await mkdir(bin);
+    await writeFile(join(bin, "uname"), `#!/usr/bin/env bash\nprintf '%s\\n' ${JSON.stringify(architecture)}\n`);
+    await writeFile(join(bin, "xcrun"), `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = "--sdk" ]; then
+  probe=; previous=
+  for argument in "$@"; do [ "$previous" != "-o" ] || probe=$argument; previous=$argument; done
+  : > "$probe"
+  exit 0
+fi
+printf '%b' ${JSON.stringify(output)}
+`);
+    await chmod(join(bin, "uname"), 0o755);
+    await chmod(join(bin, "xcrun"), 0o755);
+    const result = spawnSync("bash", ["scripts/e2e/query-ios-device-calendar.sh", "simulator-udid"], {
+      cwd: resolve("."),
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, TMPDIR: root },
+    });
+    const calls = await readFile(log, "utf8").catch(() => "");
+    await rm(root, { recursive: true, force: true });
+    return { ...result, calls };
+  };
+  const validCalendar = await calendarHarness("2026-07-18\\tAsia/Shanghai\\r\\n");
+  assert.equal(validCalendar.status, 0, validCalendar.stderr);
+  assert.equal(validCalendar.stdout, "2026-07-18\tAsia/Shanghai\n");
+  assert.match(validCalendar.calls, /--sdk iphonesimulator swiftc -parse-as-library -target arm64-apple-ios13\.0-simulator/);
+  assert.match(validCalendar.calls, /simctl spawn simulator-udid .*\/device-calendar/);
+  for (const hostile of [
+    await calendarHarness("2026-7-18\\tAsia/Shanghai\\n"),
+    await calendarHarness("2026-07-18\\tAsia/Shanghai\\textra\\n"),
+    await calendarHarness("2026-07-18\\tAsia/Shanghai\\n2026-07-19\\tUTC\\n"),
+    await calendarHarness("2026-07-18\\t\\n"),
+    await calendarHarness("2026-07-18\\tUTC\\n", "riscv64"),
+  ]) assert.notEqual(hostile.status, 0, `hostile calendar output survived: ${hostile.stdout}`);
 
   const pidPipelineMutation = androidProfile.replace(
     exactAndroidProfilePidofHelper,

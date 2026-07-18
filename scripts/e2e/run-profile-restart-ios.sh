@@ -48,7 +48,7 @@ pull_db() {
   test -s "$destination"
   for suffix in -wal -shm; do [ ! -f "$device_db$suffix" ] || cp "$device_db$suffix" "$destination$suffix"; done
 }
-device_date() { xcrun simctl spawn "$udid" date +%Y-%m-%d | tr -d '\r'; }
+device_calendar() { bash scripts/e2e/query-ios-device-calendar.sh "$udid"; }
 installed_hashes() {
   installed_app=$(xcrun simctl get_app_container "$udid" "$app_id" app)
   test -x "$installed_app/ForMobile"
@@ -67,13 +67,12 @@ node tools/persistence-evidence.mjs --action profile-snapshot --database "$artif
 test "$(node -p "require('./$artifacts/pre-save.json').babyProfileCount")" = 0
 
 save_pid=$(launch)
-before_save_date=$(device_date)
-time_zone=$(xcrun simctl spawn "$udid" date +%Z | tr -d '\r')
+read -r before_save_date time_zone < <(device_calendar)
 node tools/persistence-evidence.mjs --action age-oracle --local-date "$before_save_date" --output "$artifacts/age.json"
 age_display=$(node -p "require('./$artifacts/age.json').display")
 read -r executable_before_sha bundle_before_sha plist_before_sha < <(installed_hashes)
 maestro --device "$udid" test -e AGE_DISPLAY="$age_display" --debug-output .artifacts/launch/maestro/ios-profile-save e2e/maestro/profile-save.yaml 2>&1 | tee .artifacts/test-results/ios-profile-save.log
-after_save_date=$(device_date)
+read -r after_save_date _ < <(device_calendar)
 terminate "$save_pid"
 kill -0 "$save_pid" 2>/dev/null && exit 1
 pull_db "$artifacts/post-save.db"
@@ -81,7 +80,7 @@ node tools/persistence-evidence.mjs --action profile-snapshot --database "$artif
 
 relaunch_pid=$(launch)
 test "$relaunch_pid" != "$save_pid"
-after_relaunch_date=$(device_date)
+read -r after_relaunch_date _ < <(device_calendar)
 read -r executable_after_sha bundle_after_sha plist_after_sha < <(installed_hashes)
 test "$executable_after_sha" = "$executable_before_sha"
 test "$bundle_after_sha" = "$bundle_before_sha"
