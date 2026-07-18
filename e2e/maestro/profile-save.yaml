@@ -7,11 +7,11 @@ appId: com.luyao618.formobile
 - extendedWaitUntil:
     visible: "宝宝资料"
     timeout: 120000
-- tapOn: "宝宝姓名"
+- tapOn: "^可暂不填$"
 - inputText: "G031LeapBaby"
 - assertVisible: "G031LeapBaby"
 - hideKeyboard
-- tapOn: "出生日期"
+- tapOn: "^例如 2024-02-29$"
 - inputText: "2024-02-29"
 - hideKeyboard
 - assertVisible: "2024-02-29"
@@ -21,25 +21,25 @@ appId: com.luyao618.formobile
     checked: true
 - scrollUntilVisible:
     element:
-      text: "100–10000"
+      text: "^100–10000$"
     direction: DOWN
-- tapOn: "100–10000"
+- tapOn: "^100–10000$"
 - inputText: "3200"
 - hideKeyboard
 - assertVisible: "3200"
 - scrollUntilVisible:
     element:
-      text: "10–100"
+      text: "^10–100$"
     direction: DOWN
-- tapOn: "10–100"
+- tapOn: "^10–100$"
 - inputText: "50.5"
 - hideKeyboard
 - assertVisible: "50.5"
 - scrollUntilVisible:
     element:
-      text: "10–80"
+      text: "^10–80$"
     direction: DOWN
-- tapOn: "10–80"
+- tapOn: "^10–80$"
 - inputText: "34.2"
 - hideKeyboard
 - assertVisible: "34.2"
@@ -53,9 +53,9 @@ appId: com.luyao618.formobile
     checked: true
 - scrollUntilVisible:
     element:
-      text: "20–45，可暂不填"
+      text: "^20–45，可暂不填$"
     direction: DOWN
-- tapOn: "20–45，可暂不填"
+- tapOn: "^20–45，可暂不填$"
 - inputText: "36"
 - hideKeyboard
 - assertVisible: "36"

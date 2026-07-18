@@ -3066,13 +3066,34 @@ function assertProfileRestartFlowOrder(flow: string) {
   );
 }
 
+const exactProfileTextInputs = [
+  { label: "宝宝姓名", placeholder: "可暂不填", value: "G031LeapBaby" },
+  { label: "出生日期", placeholder: "例如 2024-02-29", value: "2024-02-29" },
+] as const;
+
 function assertProfileNameToBirthDateTransition(flow: string) {
-  const transition = '- inputText: "G031LeapBaby"\n- assertVisible: "G031LeapBaby"\n- hideKeyboard\n- tapOn: "出生日期"';
+  const [name, birthDate] = exactProfileTextInputs;
+  const nameSelector = `^${name.placeholder}$`;
+  const birthDateSelector = `^${birthDate.placeholder}$`;
+  const transition = `- tapOn: "${nameSelector}"
+- inputText: "${name.value}"
+- assertVisible: "${name.value}"
+- hideKeyboard
+- tapOn: "${birthDateSelector}"
+- inputText: "${birthDate.value}"
+- hideKeyboard
+- assertVisible: "${birthDate.value}"`;
   assert.equal(
     flow.split(transition).length - 1,
     1,
-    "Profile save must dismiss the name keyboard before targeting the Android-occluded birth date field",
+    "Profile save must target exact text-input placeholders and dismiss the name keyboard before birth date entry",
   );
+  for (const { label, placeholder } of exactProfileTextInputs) {
+    const selector = `^${placeholder}$`;
+    assert.equal(flow.split(`- tapOn: "${selector}"`).length - 1, 1, `${label} exact placeholder must be tapped once`);
+    assert.equal(flow.includes(`- tapOn: "${placeholder}"`), false, `${label} placeholder selector must stay anchored`);
+    assert.equal(flow.includes(`- tapOn: "${label}"`), false, `${label} must not be tapped through its label`);
+  }
 }
 
 const exactProfileNumericInputs = [
@@ -3084,24 +3105,27 @@ const exactProfileNumericInputs = [
 
 function assertProfileNumericInputTargeting(flow: string) {
   for (const { label, placeholder, value } of exactProfileNumericInputs) {
+    const selector = `^${placeholder}$`;
     const exactInputSequence = `- scrollUntilVisible:
     element:
-      text: "${placeholder}"
+      text: "${selector}"
     direction: DOWN
-- tapOn: "${placeholder}"
+- tapOn: "${selector}"
 - inputText: "${value}"
 - hideKeyboard
 - assertVisible: "${value}"`;
     assert.equal(
       flow.split(exactInputSequence).length - 1,
       1,
-      `${label} must be scrolled into view and tapped through its exact input placeholder`,
+      `${label} must be scrolled into view and tapped through its anchored exact input placeholder`,
     );
     assert.equal(
-      flow.split(placeholder).length - 1,
+      flow.split(selector).length - 1,
       2,
-      `${label} placeholder must appear only in its scroll and tap selectors`,
+      `${label} anchored placeholder must appear only in its scroll and tap selectors`,
     );
+    assert.equal(flow.includes(`- tapOn: "${placeholder}"`), false, `${label} tap selector must stay anchored`);
+    assert.equal(flow.includes(`      text: "${placeholder}"`), false, `${label} scroll selector must stay anchored`);
     assert.equal(flow.includes(`- tapOn: "${label}"`), false, `${label} must not be tapped through its label`);
     assert.equal(flow.includes(`      text: "${label}"`), false, `${label} must not be used as the scroll target`);
   }
@@ -3280,7 +3304,7 @@ printf '%s\\n' survived-no-process
 
   const keyboardMutations = [
     saveFlow.replace('- assertVisible: "G031LeapBaby"\n- hideKeyboard', '- assertVisible: "G031LeapBaby"'),
-    saveFlow.replace('- hideKeyboard\n- tapOn: "出生日期"', '- tapOn: "出生日期"\n- hideKeyboard'),
+    saveFlow.replace('- hideKeyboard\n- tapOn: "^例如 2024-02-29$"', '- tapOn: "^例如 2024-02-29$"\n- hideKeyboard'),
     saveFlow.replace('- assertVisible: "G031LeapBaby"\n- hideKeyboard', '- hideKeyboard\n- assertVisible: "G031LeapBaby"'),
   ];
   for (const mutation of keyboardMutations) {
@@ -3288,14 +3312,34 @@ printf '%s\\n' survived-no-process
     assert.throws(() => assertProfileNameToBirthDateTransition(mutation));
   }
 
+  for (const { label, placeholder } of exactProfileTextInputs) {
+    const selector = `^${placeholder}$`;
+    const labelTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${label}"`);
+    assert.notEqual(labelTapMutation, saveFlow, `${label} label-tap mutation must change the flow`);
+    assert.throws(() => assertProfileNameToBirthDateTransition(labelTapMutation));
+
+    const unanchoredTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${placeholder}"`);
+    assert.notEqual(unanchoredTapMutation, saveFlow, `${label} unanchored-tap mutation must change the flow`);
+    assert.throws(() => assertProfileNameToBirthDateTransition(unanchoredTapMutation));
+  }
+
   for (const { label, placeholder } of exactProfileNumericInputs) {
-    const labelTapMutation = saveFlow.replace(`- tapOn: "${placeholder}"`, `- tapOn: "${label}"`);
+    const selector = `^${placeholder}$`;
+    const labelTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${label}"`);
     assert.notEqual(labelTapMutation, saveFlow, `${label} label-tap mutation must change the flow`);
     assert.throws(() => assertProfileNumericInputTargeting(labelTapMutation));
 
-    const labelScrollMutation = saveFlow.replace(`      text: "${placeholder}"`, `      text: "${label}"`);
+    const labelScrollMutation = saveFlow.replace(`      text: "${selector}"`, `      text: "${label}"`);
     assert.notEqual(labelScrollMutation, saveFlow, `${label} label-scroll mutation must change the flow`);
     assert.throws(() => assertProfileNumericInputTargeting(labelScrollMutation));
+
+    const unanchoredTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${placeholder}"`);
+    assert.notEqual(unanchoredTapMutation, saveFlow, `${label} unanchored-tap mutation must change the flow`);
+    assert.throws(() => assertProfileNumericInputTargeting(unanchoredTapMutation));
+
+    const unanchoredScrollMutation = saveFlow.replace(`      text: "${selector}"`, `      text: "${placeholder}"`);
+    assert.notEqual(unanchoredScrollMutation, saveFlow, `${label} unanchored-scroll mutation must change the flow`);
+    assert.throws(() => assertProfileNumericInputTargeting(unanchoredScrollMutation));
   }
 
   const restartOrderMutation = restartFlow.replace('- tapOn: "我的"', '- assertVisible: "G031LeapBaby"\n- tapOn: "我的"');
