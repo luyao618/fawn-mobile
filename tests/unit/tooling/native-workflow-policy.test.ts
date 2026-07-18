@@ -3028,6 +3028,15 @@ function assertProfileRestartFlowOrder(flow: string) {
   );
 }
 
+function assertProfileNameToBirthDateTransition(flow: string) {
+  const transition = '- inputText: "G031LeapBaby"\n- assertVisible: "G031LeapBaby"\n- hideKeyboard\n- tapOn: "出生日期"';
+  assert.equal(
+    flow.split(transition).length - 1,
+    1,
+    "Profile save must dismiss the name keyboard before targeting the Android-occluded birth date field",
+  );
+}
+
 test("G031 native policy preserves Debug evidence before one-way offline Release profile proof", async () => {
   const [androidWorkflow, iosWorkflow, androidRunner, androidProfile, iosProfile, saveFlow, restartFlow] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
@@ -3076,6 +3085,7 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertNonPipelinedApkInspection(androidWorkflow, androidProfile);
   assertProfileBootstrapReadiness(androidProfile, "android");
   assertProfileBootstrapReadiness(iosProfile, "ios");
+  assertProfileNameToBirthDateTransition(saveFlow);
   assertProfileRestartFlowOrder(restartFlow);
   for (const flow of [saveFlow, restartFlow]) {
     for (const value of ["G031LeapBaby", "2024-02-29", "3200", "50.5", "34.2", "36", "${AGE_DISPLAY}"]) assert.match(flow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -3086,11 +3096,12 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assert.match(restartFlow, /assertNotVisible: "宝宝资料已保存"/);
 });
 
-test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, and restart-order regressions", async () => {
-  const [androidWorkflow, androidProfile, iosProfile, restartFlow] = await Promise.all([
+test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, keyboard, and restart-order regressions", async () => {
+  const [androidWorkflow, androidProfile, iosProfile, saveFlow, restartFlow] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
     readFile("scripts/e2e/run-profile-restart-android.sh", "utf8"),
     readFile("scripts/e2e/run-profile-restart-ios.sh", "utf8"),
+    readFile("e2e/maestro/profile-save.yaml", "utf8"),
     readFile("e2e/maestro/profile-restart.yaml", "utf8"),
   ]);
 
@@ -3141,6 +3152,16 @@ printf '%s\\n' survived-no-process
   assert.notEqual(profilePipelineMutation, androidProfile);
   assert.throws(() => assertNonPipelinedApkInspection(workflowPipelineMutation, androidProfile));
   assert.throws(() => assertNonPipelinedApkInspection(androidWorkflow, profilePipelineMutation));
+
+  const keyboardMutations = [
+    saveFlow.replace('- assertVisible: "G031LeapBaby"\n- hideKeyboard', '- assertVisible: "G031LeapBaby"'),
+    saveFlow.replace('- hideKeyboard\n- tapOn: "出生日期"', '- tapOn: "出生日期"\n- hideKeyboard'),
+    saveFlow.replace('- assertVisible: "G031LeapBaby"\n- hideKeyboard', '- hideKeyboard\n- assertVisible: "G031LeapBaby"'),
+  ];
+  for (const mutation of keyboardMutations) {
+    assert.notEqual(mutation, saveFlow, "keyboard transition mutation must change the flow");
+    assert.throws(() => assertProfileNameToBirthDateTransition(mutation));
+  }
 
   const restartOrderMutation = restartFlow.replace('- tapOn: "我的"', '- assertVisible: "G031LeapBaby"\n- tapOn: "我的"');
   assert.notEqual(restartOrderMutation, restartFlow);
