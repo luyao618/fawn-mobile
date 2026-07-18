@@ -23,13 +23,16 @@ jest.mock("../../src/navigation/RootNavigator", () => {
   const { Text: MockText } = jest.requireActual("react-native");
   return {
     RootNavigator: ({ bootstrap }: { bootstrap: Bootstrap }) => (
-      <MockBootstrapHost bootstrap={bootstrap}><MockText>navigator-ready</MockText></MockBootstrapHost>
+      <MockBootstrapHost bootstrap={bootstrap}>{() => <MockText>navigator-ready</MockText>}</MockBootstrapHost>
     ),
   };
 });
 
-const runtime = (close = jest.fn(async () => {})): AppRuntime => ({
-  services: {} as AppRuntime["services"],
+const runtime = (
+  close = jest.fn(async () => {}),
+  services = {} as AppRuntime["services"],
+): AppRuntime => ({
+  services,
   close,
 });
 const successfulInstallFaults = async () => () => {};
@@ -97,6 +100,18 @@ test("bootstrap gates navigation and retries locally without exposing failure de
   fetchMock.mockRestore();
 });
 
+test("BootstrapHost invokes its render child only with services from the ready runtime", async () => {
+  const services = { marker: "ready-services" } as unknown as AppRuntime["services"];
+  let resolve!: (value: AppRuntime) => void;
+  const pending = new Promise<AppRuntime>((done) => { resolve = done; });
+  const renderReady = jest.fn((received: AppRuntime["services"]) => <Text>{(received as unknown as { marker: string }).marker}</Text>);
+  render(<BootstrapHost bootstrap={() => pending}>{renderReady}</BootstrapHost>);
+  expect(renderReady).not.toHaveBeenCalled();
+  await act(async () => resolve(runtime(jest.fn(async () => {}), services)));
+  expect(screen.getByText("ready-services")).toBeTruthy();
+  expect(renderReady).toHaveBeenCalledWith(services);
+});
+
 test("unmarked rollback AggregateError remains retryable", async () => {
   mockBootstrap
     .mockRejectedValueOnce(new AggregateError([new Error("migration"), new Error("rollback")], "private rollback details"))
@@ -158,10 +173,10 @@ test("replacement waits for pending close and preserves a marked rejection witho
   const close = jest.fn(() => new Promise<void>((_resolve, reject) => { rejectClose = reject; }));
   const first = jest.fn(async () => runtime(close));
   const replacement = jest.fn(async () => runtime());
-  const view = render(<BootstrapHost bootstrap={first}><Text>first-ready</Text></BootstrapHost>);
+  const view = render(<BootstrapHost bootstrap={first}>{() => <Text>first-ready</Text>}</BootstrapHost>);
   await flushStartup();
   expect(screen.getByText("first-ready")).toBeTruthy();
-  view.rerender(<BootstrapHost bootstrap={replacement}><Text>replacement-ready</Text></BootstrapHost>);
+  view.rerender(<BootstrapHost bootstrap={replacement}>{() => <Text>replacement-ready</Text>}</BootstrapHost>);
   await flushStartup();
   expect(close).toHaveBeenCalledTimes(1);
   await act(async () => rejectClose(cleanupFailure([new Error("private close")], "private cleanup")));
@@ -174,7 +189,7 @@ test("unmount during a pending close does not duplicate or leave its rejection u
   let rejectClose!: (error: unknown) => void;
   const close = jest.fn(() => new Promise<void>((_resolve, reject) => { rejectClose = reject; }));
   const bootstrap = jest.fn(async () => runtime(close));
-  const view = render(<BootstrapHost bootstrap={bootstrap}><Text>ready</Text></BootstrapHost>);
+  const view = render(<BootstrapHost bootstrap={bootstrap}>{() => <Text>ready</Text>}</BootstrapHost>);
   await flushStartup();
   view.unmount();
   await flushStartup();

@@ -1,24 +1,40 @@
-import { type PropsWithChildren, useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
+import type { AppRuntime, AppServices } from "../../application/bootstrap/appRuntime";
 import { BootstrapError } from "../../shared/ui/BootstrapError";
 import { BootstrapPreparing } from "../../shared/ui/BootstrapPreparing";
 import { isCleanupFailure } from "../../shared/errors/cleanupFailure";
 
-export type BootstrapRuntime = { close(): Promise<void> };
-export type Bootstrap = (signal: AbortSignal) => Promise<BootstrapRuntime>;
+export type BootstrapRuntime<TServices = AppServices> = AppRuntime<TServices>;
+export type Bootstrap<TServices = AppServices> = (signal: AbortSignal) => Promise<BootstrapRuntime<TServices>>;
 
 type BootstrapPhase = "pending" | "ready" | "retryable-error" | "cleanup-blocked";
+type SettledBootstrap<TServices> = Readonly<{
+  attempt: number;
+  bootstrap: Bootstrap<TServices>;
+  phase: Exclude<BootstrapPhase, "pending">;
+  runtime?: BootstrapRuntime<TServices>;
+}>;
 
-export function BootstrapHost({ bootstrap, children }: PropsWithChildren<{ bootstrap: Bootstrap }>) {
+export function BootstrapHost<TServices>({
+  bootstrap,
+  children,
+}: {
+  bootstrap: Bootstrap<TServices>;
+  children: (services: TServices) => ReactNode;
+}) {
   const [attempt, setAttempt] = useState(0);
-  const [phase, setPhase] = useState<BootstrapPhase>("pending");
+  const [settled, setSettled] = useState<SettledBootstrap<TServices> | null>(null);
   const cleanupChain = useRef(Promise.resolve());
+  const retrying = useRef(false);
+  const current = settled?.attempt === attempt && settled.bootstrap === bootstrap ? settled : null;
+  const phase: BootstrapPhase = current?.phase ?? "pending";
 
   useEffect(() => {
     let active = true;
-    let runtime: BootstrapRuntime | undefined;
+    let runtime: BootstrapRuntime<TServices> | undefined;
     let closing: Promise<void> | undefined;
-    const closeRuntime = (openedRuntime: BootstrapRuntime): Promise<void> => {
+    const closeRuntime = (openedRuntime: BootstrapRuntime<TServices>): Promise<void> => {
       closing ??= Promise.resolve().then(() => openedRuntime.close());
       return closing;
     };
@@ -30,9 +46,17 @@ export function BootstrapHost({ bootstrap, children }: PropsWithChildren<{ boots
         return;
       }
       runtime = openedRuntime;
-      setPhase("ready");
+      retrying.current = false;
+      setSettled({ attempt, bootstrap, phase: "ready", runtime: openedRuntime });
     }).catch((error: unknown) => {
-      if (active) setPhase(isCleanupFailure(error) ? "cleanup-blocked" : "retryable-error");
+      if (active) {
+        retrying.current = false;
+        setSettled({
+          attempt,
+          bootstrap,
+          phase: isCleanupFailure(error) ? "cleanup-blocked" : "retryable-error",
+        });
+      }
     });
     return () => {
       active = false;
@@ -49,12 +73,10 @@ export function BootstrapHost({ bootstrap, children }: PropsWithChildren<{ boots
   }, [attempt, bootstrap]);
 
   const retry = useCallback(() => {
-    setPhase((current) => {
-      if (current !== "retryable-error") return current;
-      setAttempt((value) => value + 1);
-      return "pending";
-    });
-  }, []);
+    if (retrying.current || phase !== "retryable-error") return;
+    retrying.current = true;
+    setAttempt((value) => value + 1);
+  }, [phase]);
 
   if (phase === "cleanup-blocked") {
     return (
@@ -73,6 +95,6 @@ export function BootstrapHost({ bootstrap, children }: PropsWithChildren<{ boots
       />
     );
   }
-  if (phase !== "ready") return <BootstrapPreparing />;
-  return children;
+  if (phase !== "ready" || !current?.runtime) return <BootstrapPreparing />;
+  return children(current.runtime.services);
 }
