@@ -200,7 +200,9 @@ export function BabyProfileScreen() {
   const hasCommittedSnapshot = useRef(false);
   const mountedRef = useRef(true);
   const savingRef = useRef(false);
+  const ageRefreshesInFlight = useRef(0);
   const refreshDeferredBySave = useRef(false);
+  const preserveDraftAfterFailedSave = useRef(false);
   const [saving, setSaving] = useState(false);
   const [ageRefreshFailed, setAgeRefreshFailed] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
@@ -249,57 +251,68 @@ export function BabyProfileScreen() {
     return operation;
   }, [service]);
 
-  const deferRefreshUntilSaveSettles = useCallback((): never => {
+  const markRefreshDeferred = useCallback(() => {
     refreshDeferredBySave.current = true;
     ageRefreshFailureGeneration.current = Math.max(
       ageRefreshFailureGeneration.current,
       requestGeneration.current + 1,
     );
     if (mountedRef.current && hasCommittedSnapshot.current) setAgeRefreshFailed(true);
-    throw new Error("Age refresh deferred until profile save settles.");
   }, []);
 
+  const deferRefreshUntilSaveSettles = useCallback((): never => {
+    markRefreshDeferred();
+    throw new Error("Age refresh deferred until profile save settles.");
+  }, [markRefreshDeferred]);
+
   const refreshCommitted = useCallback(async (): Promise<void> => {
-    if (savingRef.current) deferRefreshUntilSaveSettles();
-    refreshDeferredBySave.current = false;
-    const generation = requestGeneration.current + 1;
-    requestGeneration.current = generation;
-    const session = focusSession.current;
-    const replaceOperation = replaceLoadInFlight.current;
-    let loaded: OptionalBabyProfileSnapshot;
+    ageRefreshesInFlight.current += 1;
     try {
-      loaded = await service.load();
-    } catch (error) {
       if (savingRef.current) deferRefreshUntilSaveSettles();
-      if (mountedRef.current && focusSession.current === session && generation >= appliedGeneration.current) {
-        ageRefreshFailureGeneration.current = generation;
-        if (hasCommittedSnapshot.current) setAgeRefreshFailed(true);
+      const generation = requestGeneration.current + 1;
+      requestGeneration.current = generation;
+      const session = focusSession.current;
+      const replaceOperation = replaceLoadInFlight.current;
+      let loaded: OptionalBabyProfileSnapshot;
+      try {
+        loaded = await service.load();
+      } catch (error) {
+        if (savingRef.current) deferRefreshUntilSaveSettles();
+        if (mountedRef.current && focusSession.current === session && generation >= appliedGeneration.current) {
+          ageRefreshFailureGeneration.current = generation;
+          if (hasCommittedSnapshot.current) setAgeRefreshFailed(true);
+        }
+        throw error;
       }
-      throw error;
+      if (savingRef.current) deferRefreshUntilSaveSettles();
+      if (replaceOperation) await replaceOperation;
+      if (!mountedRef.current || focusSession.current !== session) return;
+      if (!hasCommittedSnapshot.current) {
+        ageRefreshFailureGeneration.current = generation;
+        throw new Error("A committed profile snapshot is required for an age refresh.");
+      }
+      if (generation < appliedGeneration.current) return;
+      appliedGeneration.current = generation;
+      setSnapshot((current) => current === null ? current : Object.freeze({
+        profile: current.profile,
+        exactAge: loaded.exactAge,
+      }));
+      refreshDeferredBySave.current = false;
+      ageRefreshFailureGeneration.current = 0;
+      setAgeRefreshFailed(false);
+      setLoadState("ready");
+    } finally {
+      ageRefreshesInFlight.current -= 1;
     }
-    if (savingRef.current) deferRefreshUntilSaveSettles();
-    if (replaceOperation) await replaceOperation;
-    if (!mountedRef.current || focusSession.current !== session) return;
-    if (!hasCommittedSnapshot.current) {
-      ageRefreshFailureGeneration.current = generation;
-      throw new Error("A committed profile snapshot is required for an age refresh.");
-    }
-    if (generation < appliedGeneration.current) return;
-    appliedGeneration.current = generation;
-    setSnapshot((current) => current === null ? current : Object.freeze({
-      profile: current.profile,
-      exactAge: loaded.exactAge,
-    }));
-    ageRefreshFailureGeneration.current = 0;
-    setAgeRefreshFailed(false);
-    setLoadState("ready");
   }, [deferRefreshUntilSaveSettles, service]);
   const requestAgeRefresh = useActiveLocalDayRefresh(refreshCommitted);
 
   useFocusEffect(useCallback(() => {
     focusSession.current += 1;
     if (savingRef.current) {
-      refreshDeferredBySave.current = true;
+      markRefreshDeferred();
+    } else if (preserveDraftAfterFailedSave.current || refreshDeferredBySave.current) {
+      requestAgeRefresh();
     } else {
       void load();
     }
@@ -307,7 +320,7 @@ export function BabyProfileScreen() {
       focusSession.current += 1;
       replaceLoadInFlight.current = null;
     };
-  }, [load]));
+  }, [load, markRefreshDeferred, requestAgeRefresh]));
 
   const updateDraft = <K extends keyof Draft>(field: K, value: Draft[K]) => {
     if (savingRef.current) return;
@@ -319,12 +332,14 @@ export function BabyProfileScreen() {
   const save = useCallback(() => {
     if (savingRef.current) return;
     if (draft.isPremature === null) {
+      preserveDraftAfterFailedSave.current = true;
       setErrors({ isPremature: validationMessages.isPremature });
       setSaveMessage("请检查标出的资料后再保存。");
       return;
     }
     const isPremature = draft.isPremature;
     savingRef.current = true;
+    if (ageRefreshesInFlight.current > 0) markRefreshDeferred();
     setSaving(true);
     setErrors({});
     setSaveMessage(null);
@@ -332,6 +347,7 @@ export function BabyProfileScreen() {
     replacementBarrierGeneration.current = requestGeneration.current;
     void service.save(inputFromDraft(draft, isPremature), snapshot?.profile?.updatedAt ?? null).then((saved: BabyProfileSnapshot) => {
       if (!mountedRef.current) return;
+      preserveDraftAfterFailedSave.current = false;
       const refreshPending = refreshDeferredBySave.current;
       requestGeneration.current += 1;
       appliedGeneration.current = requestGeneration.current;
@@ -346,6 +362,7 @@ export function BabyProfileScreen() {
       setSaveMessage("宝宝资料已保存");
     }).catch((error: unknown) => {
       if (!mountedRef.current) return;
+      preserveDraftAfterFailedSave.current = true;
       if (error instanceof BabyProfileValidationError) {
         setErrors({ [error.field]: validationMessages[error.field] });
         setSaveMessage("请检查标出的资料后再保存。");
@@ -360,7 +377,7 @@ export function BabyProfileScreen() {
       setSaving(false);
       if (refreshDeferredBySave.current) requestAgeRefresh();
     });
-  }, [draft, requestAgeRefresh, service, snapshot?.profile?.updatedAt]);
+  }, [draft, markRefreshDeferred, requestAgeRefresh, service, snapshot?.profile?.updatedAt]);
 
   const age = !ageRefreshFailed && snapshot ? formatExactAge(snapshot.exactAge) : null;
   return (

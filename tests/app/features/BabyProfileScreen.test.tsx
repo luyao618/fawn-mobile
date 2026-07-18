@@ -13,12 +13,39 @@ import {
 } from "../../../src/features/profile/BabyProfileServiceContext";
 import { BabyProfileScreen } from "../../../src/features/profile/BabyProfileScreen";
 
+type FocusEffect = () => void | (() => void);
+type FocusRegistration = {
+  effect: FocusEffect;
+  cleanup: (() => void) | undefined;
+};
+type FocusHarness = {
+  focused: boolean;
+  registrations: Set<FocusRegistration>;
+};
+
 jest.mock("@react-navigation/native", () => {
   const actual = jest.requireActual("@react-navigation/native");
   const React = jest.requireActual("react");
+  const harness: FocusHarness = {
+    focused: true,
+    registrations: new Set<FocusRegistration>(),
+  };
+  (globalThis as typeof globalThis & { __babyProfileFocusHarness: FocusHarness }).__babyProfileFocusHarness = harness;
   return {
     ...actual,
-    useFocusEffect: (effect: () => void | (() => void)) => React.useEffect(effect, [effect]),
+    useFocusEffect: (effect: FocusEffect) => React.useEffect(() => {
+      const registration: FocusRegistration = { cleanup: undefined, effect };
+      harness.registrations.add(registration);
+      if (harness.focused) {
+        const cleanup = effect();
+        registration.cleanup = typeof cleanup === "function" ? cleanup : undefined;
+      }
+      return () => {
+        registration.cleanup?.();
+        registration.cleanup = undefined;
+        harness.registrations.delete(registration);
+      };
+    }, [effect]),
   };
 });
 
@@ -27,7 +54,30 @@ type AppStateListener = (state: AppStateStatus) => void;
 let appStateListeners = new Set<AppStateListener>();
 const defaultAppState = AppState.currentState;
 
+function focusHarness(): FocusHarness {
+  return (globalThis as typeof globalThis & { __babyProfileFocusHarness: FocusHarness }).__babyProfileFocusHarness;
+}
+
+function setProfileFocused(focused: boolean) {
+  const harness = focusHarness();
+  if (harness.focused === focused) return;
+  harness.focused = focused;
+  for (const registration of [...harness.registrations]) {
+    if (focused) {
+      const cleanup = registration.effect();
+      registration.cleanup = typeof cleanup === "function" ? cleanup : undefined;
+    } else {
+      registration.cleanup?.();
+      registration.cleanup = undefined;
+    }
+  }
+}
+
 beforeEach(() => {
+  const harness = focusHarness();
+  for (const registration of harness.registrations) registration.cleanup?.();
+  harness.registrations.clear();
+  harness.focused = true;
   appStateListeners = new Set<AppStateListener>();
   AppState.currentState = "active";
   jest.spyOn(AppState, "addEventListener").mockImplementation((type, listener) => {
@@ -323,7 +373,7 @@ test("我的 defers a boundary refresh until save settles without publishing the
   view.unmount();
 });
 
-test("我的 skips a replacement refocus load during save and preserves the rejected draft", async () => {
+test("我的 preserves a save rejected while blurred and refocuses with only an age refresh", async () => {
   const pendingSave = deferred<BabyProfileSnapshot>();
   const refreshedSnapshot: BabyProfileSnapshot = Object.freeze({
     profile: Object.freeze({
@@ -351,9 +401,8 @@ test("我的 skips a replacement refocus load during save and preserves the reje
   fireEvent.changeText(screen.getByLabelText("出生日期"), "2024-02-30");
   fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
 
-  view.rerender(profileTree({ ...profileService }));
-  await act(async () => { await Promise.resolve(); });
-
+  act(() => setProfileFocused(false));
+  expect(appStateListeners.size).toBe(0);
   expect(load).toHaveBeenCalledTimes(1);
   expect(screen.getByLabelText("宝宝姓名").props.value).toBe("提交中的草稿");
   expect(screen.getByText("正在保存…")).toBeTruthy();
@@ -364,6 +413,12 @@ test("我的 skips a replacement refocus load during save and preserves the reje
     await Promise.resolve();
   });
 
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("提交中的草稿");
+  expect(screen.getByLabelText("出生日期").props.value).toBe("2024-02-30");
+  expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
+  expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
+
+  act(() => setProfileFocused(true));
   await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
   expect(screen.getByText("28个月20天")).toBeTruthy();
   expect(screen.getByText("测试宝宝")).toBeTruthy();
@@ -373,6 +428,179 @@ test("我的 skips a replacement refocus load during save and preserves the reje
   expect(screen.getByText("请输入有效的 YYYY-MM-DD，且不能晚于今天。")).toBeTruthy();
   expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
   expect(screen.queryByText("private validation detail")).toBeNull();
+  expect(appStateListeners.size).toBe(1);
+  view.unmount();
+});
+
+test("我的 hides age when a blurred calendar boundary refocuses during save and refreshes after settlement", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
+  const pendingSave = deferred<BabyProfileSnapshot>();
+  const pendingRefresh = deferred<OptionalBabyProfileSnapshot>();
+  const savedBeforeRefresh: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedSnapshot.profile,
+      name: "跨日保存草稿",
+      updatedAt: "2026-07-19T03:00:00.000Z",
+    }),
+    exactAge: savedSnapshot.exactAge,
+  });
+  const refreshedSnapshot: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedBeforeRefresh.profile,
+      name: "不应替换保存结果",
+    }),
+    exactAge: Object.freeze({
+      status: "known",
+      localDate: "2026-07-19",
+      timeZone: "Asia/Shanghai",
+      ageDays: 871,
+      completedMonths: 28,
+      remainingDays: 20,
+    }),
+  });
+  const load = jest.fn()
+    .mockResolvedValueOnce(savedSnapshot)
+    .mockReturnValueOnce(pendingRefresh.promise);
+  const save = jest.fn(() => pendingSave.promise);
+  const view = renderProfile(service({ load, save }));
+  expect(await screen.findByText("28个月19天")).toBeTruthy();
+  fireEvent.changeText(screen.getByLabelText("宝宝姓名"), "跨日保存草稿");
+  fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+
+  act(() => setProfileFocused(false));
+  act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    setProfileFocused(true);
+  });
+
+  expect(load).toHaveBeenCalledTimes(1);
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月19天")).toBeNull();
+
+  await act(async () => {
+    pendingSave.resolve(savedBeforeRefresh);
+    await pendingSave.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(load).toHaveBeenCalledTimes(2);
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月19天")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("跨日保存草稿");
+  expect(screen.getByText("宝宝资料已保存")).toBeTruthy();
+
+  await act(async () => {
+    pendingRefresh.resolve(refreshedSnapshot);
+    await pendingRefresh.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(screen.getByText("跨日保存草稿")).toBeTruthy();
+  expect(screen.queryByText("不应替换保存结果")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("跨日保存草稿");
+  view.unmount();
+});
+
+test("我的 reruns a refresh that started before a save so the older completion cannot end stale", async () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date(2026, 6, 18, 12, 0, 0));
+  const olderRefresh = deferred<OptionalBabyProfileSnapshot>();
+  const pendingSave = deferred<BabyProfileSnapshot>();
+  const freshRerun = deferred<OptionalBabyProfileSnapshot>();
+  const savedDuringRefresh: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedSnapshot.profile,
+      name: "逆序保存草稿",
+      updatedAt: "2026-07-19T04:00:00.000Z",
+    }),
+    exactAge: savedSnapshot.exactAge,
+  });
+  const olderSnapshot: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedSnapshot.profile,
+      name: "较旧刷新资料",
+    }),
+    exactAge: Object.freeze({
+      status: "known",
+      localDate: "2026-07-19",
+      timeZone: "Asia/Shanghai",
+      ageDays: 870,
+      completedMonths: 28,
+      remainingDays: 18,
+    }),
+  });
+  const freshSnapshot: BabyProfileSnapshot = Object.freeze({
+    profile: Object.freeze({
+      ...savedDuringRefresh.profile,
+      name: "不应替换保存草稿",
+    }),
+    exactAge: Object.freeze({
+      status: "known",
+      localDate: "2026-07-19",
+      timeZone: "Asia/Shanghai",
+      ageDays: 871,
+      completedMonths: 28,
+      remainingDays: 20,
+    }),
+  });
+  const load = jest.fn()
+    .mockResolvedValueOnce(savedSnapshot)
+    .mockReturnValueOnce(olderRefresh.promise)
+    .mockReturnValueOnce(freshRerun.promise);
+  const save = jest.fn(() => pendingSave.promise);
+  const view = renderProfile(service({ load, save }));
+  expect(await screen.findByText("28个月19天")).toBeTruthy();
+
+  act(() => {
+    jest.setSystemTime(new Date(2026, 6, 19, 12, 0, 0));
+    emitAppState("background");
+    emitAppState("active");
+  });
+  await act(async () => { await Promise.resolve(); });
+  expect(load).toHaveBeenCalledTimes(2);
+
+  fireEvent.changeText(screen.getByLabelText("宝宝姓名"), "逆序保存草稿");
+  fireEvent.press(screen.getByRole("button", { name: "保存宝宝资料" }));
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+
+  await act(async () => {
+    pendingSave.resolve(savedDuringRefresh);
+    await pendingSave.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(load).toHaveBeenCalledTimes(2);
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月19天")).toBeNull();
+
+  await act(async () => {
+    olderRefresh.resolve(olderSnapshot);
+    await olderRefresh.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(load).toHaveBeenCalledTimes(3);
+  expect(screen.getByText("年龄暂不可用")).toBeTruthy();
+  expect(screen.queryByText("28个月18天")).toBeNull();
+
+  await act(async () => {
+    freshRerun.resolve(freshSnapshot);
+    await freshRerun.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(load).toHaveBeenCalledTimes(3);
+  expect(screen.getByText("28个月20天")).toBeTruthy();
+  expect(screen.getByText("逆序保存草稿")).toBeTruthy();
+  expect(screen.queryByText("不应替换保存草稿")).toBeNull();
+  expect(screen.getByLabelText("宝宝姓名").props.value).toBe("逆序保存草稿");
   view.unmount();
 });
 
