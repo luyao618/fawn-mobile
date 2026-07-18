@@ -85,11 +85,11 @@ const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
 const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/android/production/**/*.js\n.artifacts/fault-bundles/android/production/metadata.json\n.artifacts/fault-bundles/android/e2e/**/*.js\n.artifacts/fault-bundles/android/e2e/metadata.json\n.artifacts/fault-bundles/ios/production/**/*.js\n.artifacts/fault-bundles/ios/production/metadata.json\n.artifacts/fault-bundles/ios/e2e/**/*.js\n.artifacts/fault-bundles/ios/e2e/metadata.json\n";
 const exactChildPrimaryUploadPaths = {
-  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n.artifacts/android-persistence.json\n.artifacts/persistence/android/*.json\n",
-  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/persistence/ios/*.json\n",
+  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n.artifacts/android-persistence.json\n.artifacts/android-profile-restart.json\n.artifacts/persistence/android/*.json\n",
+  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/ios-profile-restart.json\n.artifacts/persistence/ios/*.json\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "bfdb3d0495949c188658078f7e80fe7f0b11747866ffd0acc95b0320e3db3549";
+const exactAndroidRunnerSha256 = "d0eec9c535122d6df1640fb574fa025e93d1fed354502a70bbf266704bad1e08";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -161,6 +161,7 @@ const exactChildCollectorRuns = {
   --scheme-report-production .artifacts/schemes/android-production.json \
   --scheme-report-e2e .artifacts/schemes/android-e2e.json \
   --persistence-report .artifacts/android-persistence.json \
+  --profile-restart-report .artifacts/android-profile-restart.json \
   --output .artifacts/android-e2e.json` + "\n",
   ios: String.raw`node tools/collect-ci-evidence.mjs \
   --expected-sha "${expectedShaInput}" --platform ios --flavor e2e \
@@ -170,6 +171,7 @@ const exactChildCollectorRuns = {
   --scheme-report-production .artifacts/schemes/ios-production.json \
   --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
   --persistence-report .artifacts/ios-persistence.json \
+  --profile-restart-report .artifacts/ios-profile-restart.json \
   --output .artifacts/ios-e2e.json` + "\n",
 } as const;
 
@@ -541,8 +543,12 @@ const exactMetroStatusLines = [
   "for attempt in $(seq 1 60); do curl --silent --fail http://127.0.0.1:8081/status >/dev/null && break; sleep 2; done",
   "curl --silent --fail http://127.0.0.1:8081/status",
 ] as const;
+const exactMetroNegativeProbeLines: Record<NativePlatform, string> = {
+  Android: "  if curl --silent --fail http://127.0.0.1:8081/status >/dev/null; then",
+  iOS: "if curl --silent --fail http://127.0.0.1:8081/status >/dev/null; then",
+};
 const exactDevClientUrlAssignment = `dev_client_url='${encodedDevClientUrl}'`;
-const exactAndroidBuildCommand = "(cd android && ./gradlew :app:assembleDebug -PreactNativeArchitectures=x86_64 --no-daemon)";
+const exactAndroidBuildCommand = "(cd android && ./gradlew :app:assembleDebug :app:assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon)";
 const exactAndroidInstallCommand = '  install_output=$(adb -s "$emulator_serial" install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk 2>&1)';
 const exactAndroidPackageServiceLines = [
   "  for attempt in $(seq 1 60); do adb -s \"$emulator_serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found' && break; sleep 2; done",
@@ -668,8 +674,8 @@ function assertExactMetroStatusProbes(script: string, platform: NativePlatform):
   const statusLines = script.split(/\r\n|\n|\r/).filter((line) => line.includes("/status"));
   assert.deepEqual(
     statusLines,
-    exactMetroStatusLines,
-    `${platform} Metro status probes must remain exactly the bounded retry loop and final IPv4 probe in order`,
+    [...exactMetroStatusLines, exactMetroNegativeProbeLines[platform]],
+    `${platform} Metro status probes must remain exactly the bounded retry loop, final IPv4 probe, and offline negative probe in order`,
   );
 }
 
@@ -913,15 +919,20 @@ function assertIosFailureDiagnosticsPolicy(script: string, workflow: Workflow): 
     exactIosFailureScreenshotCommand,
     exactIosFailureLogCommand,
     "  fi",
-    '  kill "$metro_pid" 2>/dev/null',
+    '  if [ -n "$metro_pid" ]; then',
+    '    kill "$metro_pid" 2>/dev/null',
+    '    wait "$metro_pid" 2>/dev/null',
+    "  fi",
     "  cat /tmp/metro.log",
     '  exit "$status"',
     "}",
     "trap cleanup EXIT",
   ];
-  const cleanupIndexes = cleanupLines.map((line) => lines.indexOf(line));
-  assert.ok(
-    cleanupIndexes.every((index, position) => index >= 0 && (position === 0 || index > cleanupIndexes[position - 1])),
+  const cleanupStart = lines.indexOf("cleanup() {");
+  const cleanupEnd = lines.indexOf("trap cleanup EXIT", cleanupStart + 1);
+  assert.deepEqual(
+    lines.slice(cleanupStart, cleanupEnd + 1),
+    cleanupLines,
     "iOS cleanup must preserve exact status-preserving diagnostic and teardown order",
   );
   const steps = requiredSteps(requiredJob(workflow, "ios"), "ios");
@@ -1735,7 +1746,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.notEqual(localhostStatusProbes, script);
     assert.throws(
       () => assertExactMetroStatusProbes(localhostStatusProbes, platform),
-      /exactly the bounded retry loop and final IPv4 probe in order/,
+      /exactly the bounded retry loop, final IPv4 probe, and offline negative probe in order/,
     );
 
     const withoutFinalStatusProbe = script
@@ -1745,7 +1756,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.notEqual(withoutFinalStatusProbe, script);
     assert.throws(
       () => assertExactMetroStatusProbes(withoutFinalStatusProbe, platform),
-      /exactly the bounded retry loop and final IPv4 probe in order/,
+      /exactly the bounded retry loop, final IPv4 probe, and offline negative probe in order/,
     );
 
     const withoutApprovedStatusLines = script
@@ -2790,4 +2801,223 @@ test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only
     assert.doesNotMatch(workflow, /\.artifacts\/persistence\/.*\.db/);
     assert.match(workflow, new RegExp(`--persistence-report \\.artifacts/${platform}-persistence\\.json`));
   }
+});
+
+const exactProfileReadinessCommands = {
+  android: 'maestro --device "$serial" test --debug-output .artifacts/launch/maestro/android-profile-pre-save-readiness e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/test-results/android-profile-pre-save-readiness.log',
+  ios: 'maestro --device "$udid" test --debug-output .artifacts/launch/maestro/ios-profile-pre-save-readiness e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/test-results/ios-profile-pre-save-readiness.log',
+} as const;
+
+const exactAndroidProfilePidofHelper = `pidof_app() {
+  set +e
+  pid=$(adb -s "$serial" shell pidof -s "$app_id" 2>/dev/null)
+  pid_status=$?
+  set -e
+  [ "$pid_status" -eq 0 ] || [ "$pid_status" -eq 1 ] || return "$pid_status"
+  printf '%s' "\${pid//$'\\r'/}"
+}`;
+
+function assertProfileBootstrapReadiness(script: string, platform: "android" | "ios") {
+  const readiness = exactProfileReadinessCommands[platform];
+  assert.deepEqual(
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes("profile-pre-save-readiness")),
+    [readiness],
+    `${platform} profile bootstrap readiness must run exactly once`,
+  );
+  ordered(
+    script,
+    "pre_save_pid=$(launch)",
+    readiness,
+    'terminate "$pre_save_pid"',
+    'pull_db "$artifacts/pre-save.db"',
+    'profile-snapshot --database "$artifacts/pre-save.db"',
+  );
+}
+
+function assertAndroidProfilePackageReadiness(script: string) {
+  const lines = script.split(/\r\n|\n|\r/);
+  assert.deepEqual(
+    lines.filter((line) => line.includes("service check package")),
+    [
+      "  for _ in $(seq 1 60); do adb -s \"$serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found' && break; sleep 2; done",
+      "  adb -s \"$serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found'",
+    ],
+    "Release install package-service readiness must be bounded and fail closed",
+  );
+  assert.deepEqual(
+    lines.filter((line) => line.trim() === "wait_for_package_service"),
+    ["wait_for_package_service", "    wait_for_package_service"],
+    "Release install must wait after adb root and again before its sole transient retry",
+  );
+  ordered(
+    script,
+    'adb -s "$serial" root',
+    'adb -s "$serial" wait-for-device',
+    "wait_for_package_service\nadb",
+    'uninstall "$app_id"',
+    "if ! install_apk; then",
+    "    wait_for_package_service",
+    "    install_apk",
+  );
+}
+
+function assertAndroidProfilePidofPolicy(script: string) {
+  assert.equal(
+    script.split(exactAndroidProfilePidofHelper).length - 1,
+    1,
+    "Android profile PID lookup must use the exact status-aware helper once",
+  );
+  assert.deepEqual(
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes("shell pidof")),
+    ['  pid=$(adb -s "$serial" shell pidof -s "$app_id" 2>/dev/null)'],
+    "Android profile PID lookup must not use a pipefail-sensitive pipeline",
+  );
+  assert.equal((script.match(/\$\(pidof_app\)/g) ?? []).length, 3, "All Android profile PID probes must use the helper");
+}
+
+function assertNonPipelinedApkInspection(androidWorkflow: string, androidProfile: string) {
+  assert.doesNotMatch(androidWorkflow, /unzip[^\n]*\|/);
+  assert.doesNotMatch(androidProfile, /unzip[^\n]*\|/);
+  ordered(
+    androidWorkflow,
+    "unzip -Z1 android/app/build/outputs/apk/release/app-release.apk > /tmp/g031-release-apk.entries",
+    "grep -Eq '^assets/(index\\.android\\.bundle|index\\.bundle)$' /tmp/g031-release-apk.entries",
+  );
+  ordered(
+    androidProfile,
+    'apk_entries=$(unzip -Z1 "$release_apk")',
+    "grep -Eq '^assets/(index\\.android\\.bundle|index\\.bundle)$' <<< \"$apk_entries\"",
+  );
+}
+
+function assertProfileRestartFlowOrder(flow: string) {
+  assert.equal((flow.match(/G031LeapBaby/g) ?? []).length, 1, "Restart must require the synthetic name exactly once");
+  ordered(
+    flow,
+    'visible: "宝宝资料已保存在本机"',
+    '- tapOn: "我的"',
+    'visible: "宝宝资料"',
+    'assertNotVisible: "宝宝资料已保存"',
+    'assertVisible: "G031LeapBaby"',
+    'assertVisible: "${AGE_DISPLAY}"',
+  );
+}
+
+test("G031 native policy preserves Debug evidence before one-way offline Release profile proof", async () => {
+  const [androidWorkflow, iosWorkflow, androidRunner, androidProfile, iosProfile, saveFlow, restartFlow] = await Promise.all([
+    readFile(".github/workflows/e2e-android.yml", "utf8"),
+    readFile(".github/workflows/e2e-ios.yml", "utf8"),
+    readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
+    readFile("scripts/e2e/run-profile-restart-android.sh", "utf8"),
+    readFile("scripts/e2e/run-profile-restart-ios.sh", "utf8"),
+    readFile("e2e/maestro/profile-save.yaml", "utf8"),
+    readFile("e2e/maestro/profile-restart.yaml", "utf8"),
+  ]);
+  for (const script of ["scripts/e2e/run-android-emulator.sh", "scripts/e2e/run-profile-restart-android.sh", "scripts/e2e/run-profile-restart-ios.sh"]) {
+    assert.equal(spawnSync("bash", ["-n", script]).status, 0, `${script} must be valid Bash`);
+  }
+  assert.equal((androidWorkflow.match(/:app:assembleRelease/g) ?? []).length, 1, "Android Release must build exactly once");
+  assert.equal((iosWorkflow.match(/-configuration Release/g) ?? []).length, 1, "iOS Release must build exactly once");
+  ordered(androidRunner,
+    "bash scripts/e2e/run-persistence-android.sh",
+    'kill "$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    'adb -s "$emulator_serial" reverse --remove tcp:8081',
+    "curl --silent --fail http://127.0.0.1:8081/status",
+    "bash scripts/e2e/run-profile-restart-android.sh",
+  );
+  ordered(iosWorkflow,
+    "bash scripts/e2e/run-persistence-ios.sh",
+    'kill "$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    "curl --silent --fail http://127.0.0.1:8081/status",
+    "bash scripts/e2e/run-profile-restart-ios.sh",
+  );
+  for (const [platform, script] of [["android", androidProfile], ["ios", iosProfile]] as const) {
+    assert.match(script, /profile-snapshot/);
+    assert.match(script, /age-oracle/);
+    assert.match(script, /profile-report/);
+    assert.match(script, /profile-save\.yaml/);
+    assert.match(script, /profile-restart\.yaml/);
+    assert.doesNotMatch(script, /run-persistence|seed-recovery|push_db|openurl|android\.intent\.action\.VIEW|expo start/);
+    assert.match(script, new RegExp(`\\.artifacts/${platform}-profile-restart\\.json`));
+  }
+  assert.equal((androidProfile.match(/shell am start -a android\.intent\.action\.MAIN -c android\.intent\.category\.LAUNCHER/g) ?? []).length, 1);
+  assert.equal((androidProfile.match(/ install --no-streaming /g) ?? []).length, 1);
+  assert.equal((androidProfile.match(/ uninstall /g) ?? []).length, 1);
+  assert.equal((iosProfile.match(/xcrun simctl launch /g) ?? []).length, 1);
+  assert.equal((iosProfile.match(/xcrun simctl install /g) ?? []).length, 1);
+  assert.equal((iosProfile.match(/xcrun simctl uninstall /g) ?? []).length, 1);
+  assertAndroidProfilePackageReadiness(androidProfile);
+  assertAndroidProfilePidofPolicy(androidProfile);
+  assertNonPipelinedApkInspection(androidWorkflow, androidProfile);
+  assertProfileBootstrapReadiness(androidProfile, "android");
+  assertProfileBootstrapReadiness(iosProfile, "ios");
+  assertProfileRestartFlowOrder(restartFlow);
+  for (const flow of [saveFlow, restartFlow]) {
+    for (const value of ["G031LeapBaby", "2024-02-29", "3200", "50.5", "34.2", "36", "${AGE_DISPLAY}"]) assert.match(flow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(flow, /性别女孩/);
+    assert.match(flow, /早产/);
+  }
+  assert.match(saveFlow, /宝宝资料已保存/);
+  assert.match(restartFlow, /assertNotVisible: "宝宝资料已保存"/);
+});
+
+test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, and restart-order regressions", async () => {
+  const [androidWorkflow, androidProfile, iosProfile, restartFlow] = await Promise.all([
+    readFile(".github/workflows/e2e-android.yml", "utf8"),
+    readFile("scripts/e2e/run-profile-restart-android.sh", "utf8"),
+    readFile("scripts/e2e/run-profile-restart-ios.sh", "utf8"),
+    readFile("e2e/maestro/profile-restart.yaml", "utf8"),
+  ]);
+
+  const packageMutations = [
+    androidProfile.replace("wait_for_package_service\nadb", "adb"),
+    androidProfile.replace('adb -s "$serial" uninstall "$app_id" >/dev/null\nif ! install_apk; then', 'if ! install_apk; then\nadb -s "$serial" uninstall "$app_id" >/dev/null'),
+    androidProfile.replace("    wait_for_package_service\n    install_apk", "    install_apk"),
+  ];
+  for (const mutation of packageMutations) {
+    assert.notEqual(mutation, androidProfile, "package readiness mutation must change the wrapper");
+    assert.throws(() => assertAndroidProfilePackageReadiness(mutation));
+  }
+
+  for (const [platform, script] of [["android", androidProfile], ["ios", iosProfile]] as const) {
+    const readiness = exactProfileReadinessCommands[platform];
+    const mutation = script.replace(`${readiness}\nterminate "$pre_save_pid"`, `terminate "$pre_save_pid"\n${readiness}`);
+    assert.notEqual(mutation, script, `${platform} bootstrap mutation must change the wrapper`);
+    assert.throws(() => assertProfileBootstrapReadiness(mutation, platform));
+  }
+
+  const pidPipelineMutation = androidProfile.replace(
+    exactAndroidProfilePidofHelper,
+    'pidof_app() { adb -s "$serial" shell pidof -s "$app_id" 2>/dev/null | tr -d \'\\r\'; }',
+  );
+  assert.notEqual(pidPipelineMutation, androidProfile);
+  assert.throws(() => assertAndroidProfilePidofPolicy(pidPipelineMutation));
+
+  const pidHarness = spawnSync("bash", ["-c", `set -euo pipefail
+adb() { return 1; }
+serial=emulator-5554
+app_id=com.luyao618.formobile
+${exactAndroidProfilePidofHelper}
+test -z "$(pidof_app)"
+printf '%s\\n' survived-no-process
+`], { encoding: "utf8" });
+  assert.equal(pidHarness.status, 0, pidHarness.stderr);
+  assert.equal(pidHarness.stdout, "survived-no-process\n");
+
+  const workflowPipelineMutation = androidWorkflow.replace(
+    "unzip -Z1 android/app/build/outputs/apk/release/app-release.apk > /tmp/g031-release-apk.entries\n          grep -Eq '^assets/(index\\.android\\.bundle|index\\.bundle)$' /tmp/g031-release-apk.entries",
+    "unzip -l android/app/build/outputs/apk/release/app-release.apk | grep -Eq 'assets/(index\\.android\\.bundle|index\\.bundle)'",
+  );
+  const profilePipelineMutation = androidProfile.replace(
+    'apk_entries=$(unzip -Z1 "$release_apk")\ngrep -Eq \'^assets/(index\\.android\\.bundle|index\\.bundle)$\' <<< "$apk_entries"',
+    'unzip -l "$release_apk" | grep -Eq \'assets/(index\\.android\\.bundle|index\\.bundle)\'',
+  );
+  assert.notEqual(workflowPipelineMutation, androidWorkflow);
+  assert.notEqual(profilePipelineMutation, androidProfile);
+  assert.throws(() => assertNonPipelinedApkInspection(workflowPipelineMutation, androidProfile));
+  assert.throws(() => assertNonPipelinedApkInspection(androidWorkflow, profilePipelineMutation));
+
+  const restartOrderMutation = restartFlow.replace('- tapOn: "我的"', '- assertVisible: "G031LeapBaby"\n- tapOn: "我的"');
+  assert.notEqual(restartOrderMutation, restartFlow);
+  assert.throws(() => assertProfileRestartFlowOrder(restartOrderMutation));
 });

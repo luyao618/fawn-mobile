@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +12,19 @@ import { validateFaultBundleProof } from "./check-fault-bundles.mjs";
 import { inspectNativeScheme, NATIVE_EVIDENCE_PATHS } from "./check-native-schemes.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+export const CI_EVIDENCE_SCHEMA_VERSION = 5;
+const PROFILE_VALUE_SHA256 = "6bfb59d6996bf798923420d4ffb334430f3b1c6cd0c87988d29e353c06a7f6db";
+const PROFILE_VALUES = Object.freeze({
+  birthDate: "2024-02-29",
+  birthHeadCm: 34.2,
+  birthHeightCm: 50.5,
+  birthWeightG: 3200,
+  gestationalWeeks: 36,
+  isPremature: true,
+  name: "G031LeapBaby",
+  sex: "female",
+});
+const PROFILE_REPORT_KEYS = ["schemaVersion", "reportType", "platform", "flavor", "checkedOutSha", "expectedSha", "testId", "fixture", "calendar", "ageOracle", "binary", "database", "lifecycle", "privacy", "migration", "evidence", "status", "skipped"];
 
 export const CLEAN_REPOSITORY_STATUS_ARGS = ["status", "--porcelain=v1", "--untracked-files=all"];
 
@@ -30,6 +45,82 @@ async function sha256(path) {
 
 function hashJson(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function exactKeys(value, keys, label) {
+  assert(value && typeof value === "object" && !Array.isArray(value), `${label} is malformed`);
+  assert.deepEqual(Object.keys(value).sort(), [...keys].sort(), `${label} keys are invalid`);
+}
+
+function parseOracleDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value ?? "");
+  assert(match, "Profile device local date must use YYYY-MM-DD");
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const time = Date.UTC(year, month - 1, day);
+  const date = new Date(time);
+  assert(date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day, "Profile device local date is invalid");
+  return { year, month, day, time, iso: value };
+}
+
+function oracleDaysInMonth(year, month) {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function oracleAddMonths(date, count) {
+  const monthIndex = date.year * 12 + date.month - 1 + count;
+  const year = Math.floor(monthIndex / 12);
+  const month = monthIndex - year * 12 + 1;
+  const day = Math.min(date.day, oracleDaysInMonth(year, month));
+  return parseOracleDate(`${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`);
+}
+
+function independentAgeOracle(localDate) {
+  const birth = parseOracleDate(PROFILE_VALUES.birthDate);
+  const today = parseOracleDate(localDate);
+  assert(today.time >= birth.time, "Profile local date predates the fixture");
+  let completedMonths = (today.year - birth.year) * 12 + today.month - birth.month;
+  let anchor = oracleAddMonths(birth, completedMonths);
+  if (anchor.time > today.time) {
+    completedMonths -= 1;
+    anchor = oracleAddMonths(birth, completedMonths);
+  }
+  const dayMilliseconds = 86_400_000;
+  const remainingDays = (today.time - anchor.time) / dayMilliseconds;
+  return {
+    algorithm: "independent-gregorian-v1",
+    birthDate: PROFILE_VALUES.birthDate,
+    localDate: today.iso,
+    ageDays: (today.time - birth.time) / dayMilliseconds,
+    completedMonths,
+    remainingDays,
+    display: `${completedMonths}个月${remainingDays}天`,
+  };
+}
+
+export function collectProfilePrivacyProof(root = repoRoot) {
+  const listed = spawnSync("git", ["ls-files", "-z", "App*", "index*", "src/**", "app.config.*"], { cwd: root, encoding: "buffer" });
+  assert.equal(listed.status, 0, "Unable to enumerate tracked profile runtime sources");
+  const files = listed.stdout.toString("utf8").split("\0").filter(Boolean).sort();
+  const digest = createHash("sha256");
+  const requestPrimitiveMatches = [];
+  const primitive = /\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\b|\bEventSource\b|\baxios\b|\b(?:http|https)\s*\.\s*(?:request|get)\s*\(|\b(?:ky|superagent|got)\s*\(/gi;
+  for (const file of files) {
+    const bytes = readFileSync(resolve(root, file));
+    digest.update(file).update("\0").update(bytes).update("\0");
+    bytes.toString("utf8").split(/\r?\n/).forEach((line, index) => {
+      for (const match of line.matchAll(primitive)) requestPrimitiveMatches.push(`${file}:${index + 1}:${match[0]}`);
+    });
+  }
+  return {
+    claim: "structural-absence-of-product-request-path",
+    trackedSourceCount: files.length,
+    trackedSourceSha256: digest.digest("hex"),
+    requestPrimitiveMatches,
+    modelConfigCount: 0,
+    modelCapabilitiesCount: 0,
+  };
 }
 
 function validateCommonReport(report, reportType, platform, flavor, expectedSha) {
@@ -58,6 +149,12 @@ export function validateTestResultInput(status, path, bytes) {
 
 export function collectFaultBundleEvidence(proof, bundles) {
   return { proof, bundles };
+}
+
+export function collectProfileRestartEvidence(path, reportSha256) {
+  assert(path, "Profile restart report path is absent");
+  assert.match(reportSha256, /^[0-9a-f]{64}$/, "Profile restart report SHA is invalid");
+  return { path, sha256: reportSha256 };
 }
 
 export async function validateNativeReports({ platform, expectedSha, configReports, schemeReports, root = repoRoot }) {
@@ -173,6 +270,132 @@ export function validatePersistenceReport(report, platform, expectedSha, expecte
   return { migrationSha256: report.migrationSha256, scenarios: expectedScenarios };
 }
 
+export async function validateProfileRestartReport(report, platform, expectedSha, root = repoRoot) {
+  exactKeys(report, PROFILE_REPORT_KEYS, "Profile restart report");
+  assert.equal(report.schemaVersion, 1, "Profile restart report schema is invalid");
+  assert.equal(report.reportType, "baby-profile-offline-restart", "Profile restart report type is invalid");
+  assert.equal(report.platform, platform, "Profile restart platform disagrees");
+  assert.equal(report.flavor, "e2e-release", "Profile restart flavor is invalid");
+  assert.equal(report.checkedOutSha, expectedSha, "Profile restart checked-out SHA disagrees");
+  assert.equal(report.expectedSha, expectedSha, "Profile restart expected SHA disagrees");
+  assert.equal(report.testId, "E2E-001/profile", "Profile restart test ownership is invalid");
+  assert.deepEqual(report.fixture, {
+    id: "synthetic-leap-day-v1",
+    values: PROFILE_VALUES,
+    valueSha256: PROFILE_VALUE_SHA256,
+  }, "Profile restart fixture is invalid");
+
+  exactKeys(report.calendar, ["source", "beforeSave", "afterSave", "afterRelaunch", "timeZone", "stable"], "Profile calendar");
+  assert.equal(report.calendar.source, "device-local-date", "Profile calendar source is invalid");
+  assert.equal(typeof report.calendar.timeZone, "string");
+  assert(report.calendar.timeZone.length > 0, "Profile device time zone is absent");
+  assert.equal(report.calendar.stable, true, "Profile local date did not remain stable");
+  assert.equal(report.calendar.beforeSave, report.calendar.afterSave, "Profile local date changed after save");
+  assert.equal(report.calendar.beforeSave, report.calendar.afterRelaunch, "Profile local date changed after relaunch");
+  assert.deepEqual(report.ageOracle, independentAgeOracle(report.calendar.beforeSave), "Profile independent age oracle is invalid");
+
+  exactKeys(report.database, ["preSave", "postSave", "postRelaunch"], "Profile database");
+  const emptySnapshot = { babyProfileCount: 0, modelConfigCount: 0, modelCapabilitiesCount: 0, row: null, valueSha256: null, rowSha256: null };
+  assert.deepEqual(report.database?.preSave, emptySnapshot, "Profile pre-save database was not empty and private");
+  const rowKeys = ["singleton_id", "name", "sex", "birth_date", "birth_weight_g", "birth_height_cm", "birth_head_cm", "is_premature", "gestational_weeks", "created_at", "updated_at"];
+  const expectedInputRow = {
+    singleton_id: 1,
+    name: PROFILE_VALUES.name,
+    sex: PROFILE_VALUES.sex,
+    birth_date: PROFILE_VALUES.birthDate,
+    birth_weight_g: PROFILE_VALUES.birthWeightG,
+    birth_height_cm: PROFILE_VALUES.birthHeightCm,
+    birth_head_cm: PROFILE_VALUES.birthHeadCm,
+    is_premature: 1,
+    gestational_weeks: PROFILE_VALUES.gestationalWeeks,
+  };
+  for (const [name, snapshot] of [["post-save", report.database?.postSave], ["post-relaunch", report.database?.postRelaunch]]) {
+    exactKeys(snapshot, ["babyProfileCount", "modelConfigCount", "modelCapabilitiesCount", "row", "valueSha256", "rowSha256"], `Profile ${name} snapshot`);
+    assert.equal(snapshot.babyProfileCount, 1, `Profile ${name} row count is invalid`);
+    assert.equal(snapshot.modelConfigCount, 0, `Profile ${name} model_config count is invalid`);
+    assert.equal(snapshot.modelCapabilitiesCount, 0, `Profile ${name} model_capabilities count is invalid`);
+    exactKeys(snapshot.row, rowKeys, `Profile ${name} row`);
+    for (const [key, value] of Object.entries(expectedInputRow)) assert.equal(snapshot.row[key], value, `Profile ${name} ${key} is invalid`);
+    assert.match(snapshot.row.created_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, `Profile ${name} created_at is invalid`);
+    assert.match(snapshot.row.updated_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, `Profile ${name} updated_at is invalid`);
+    const canonicalValues = {
+      birthDate: snapshot.row.birth_date,
+      birthHeadCm: snapshot.row.birth_head_cm,
+      birthHeightCm: snapshot.row.birth_height_cm,
+      birthWeightG: snapshot.row.birth_weight_g,
+      gestationalWeeks: snapshot.row.gestational_weeks,
+      isPremature: snapshot.row.is_premature === 1,
+      name: snapshot.row.name,
+      sex: snapshot.row.sex,
+    };
+    assert.equal(hashJson(canonicalValues), PROFILE_VALUE_SHA256, `Profile ${name} canonical values are invalid`);
+    assert.equal(snapshot.valueSha256, PROFILE_VALUE_SHA256, `Profile ${name} value hash is invalid`);
+    assert.equal(snapshot.rowSha256, hashJson(snapshot.row), `Profile ${name} row hash is invalid`);
+  }
+  assert.deepEqual(report.database.postRelaunch, report.database.postSave, "Profile row changed across relaunch");
+
+  exactKeys(report.lifecycle, ["releaseInstalledFresh", "metro", "directLaunches", "terminatedBeforeEmptySnapshot", "savePidGone", "relaunchPidDifferent", "postInstallMutations"], "Profile lifecycle");
+  assert.equal(report.lifecycle.releaseInstalledFresh, true, "Profile Release install was not fresh");
+  assert.deepEqual(report.lifecycle.metro, {
+    killCount: 1,
+    waitCount: 1,
+    pidCleared: true,
+    androidReverseRemoved: platform === "android",
+    negativeProbe: true,
+  }, "Profile Metro teardown proof is invalid");
+  exactKeys(report.lifecycle.directLaunches, ["preSavePid", "savePid", "relaunchPid"], "Profile direct launches");
+  for (const pid of Object.values(report.lifecycle.directLaunches)) assert.match(String(pid), /^\d+$/, "Profile direct launch PID is invalid");
+  assert.notEqual(report.lifecycle.directLaunches.savePid, report.lifecycle.directLaunches.relaunchPid, "Profile relaunch reused the save PID");
+  assert.equal(report.lifecycle.terminatedBeforeEmptySnapshot, true, "Profile empty snapshot was not taken after termination");
+  assert.equal(report.lifecycle.savePidGone, true, "Profile save PID survived termination");
+  assert.equal(report.lifecycle.relaunchPidDifferent, true, "Profile relaunch PID transition is unproven");
+  assert.deepEqual(report.lifecycle.postInstallMutations, { install: 0, clear: 0, seed: 0, databasePush: 0, rebuild: 0, metroRestart: 0 }, "Profile lifecycle contains a forbidden post-install mutation");
+
+  exactKeys(report.binary, platform === "android"
+    ? ["kind", "embeddedJsBundle", "localBeforeSha256", "installedBeforeSha256", "localAfterSha256", "installedAfterSha256"]
+    : ["kind", "embeddedJsBundle", "before", "after"], "Profile binary");
+  assert.equal(report.binary.embeddedJsBundle, true, "Profile Release binary lacks an embedded JS bundle");
+  if (platform === "android") {
+    assert.equal(report.binary.kind, "apk");
+    for (const key of ["localBeforeSha256", "installedBeforeSha256", "localAfterSha256", "installedAfterSha256"]) assert.match(report.binary[key], /^[0-9a-f]{64}$/, `Profile Android ${key} is invalid`);
+    assert.equal(report.binary.localBeforeSha256, report.binary.installedBeforeSha256, "Installed Android APK differs before save");
+    assert.equal(report.binary.localBeforeSha256, report.binary.localAfterSha256, "Local Android APK changed after relaunch");
+    assert.equal(report.binary.localBeforeSha256, report.binary.installedAfterSha256, "Installed Android APK changed after relaunch");
+  } else {
+    assert.equal(report.binary.kind, "ios-app");
+    const binaryKeys = ["executableSha256", "mainJsBundleSha256", "infoPlistSha256"];
+    exactKeys(report.binary.before, binaryKeys, "Profile iOS binary before");
+    exactKeys(report.binary.after, binaryKeys, "Profile iOS binary after");
+    for (const value of Object.values(report.binary.before)) assert.match(value, /^[0-9a-f]{64}$/, "Profile iOS binary hash is invalid");
+    assert.deepEqual(report.binary.after, report.binary.before, "Profile iOS installed binary changed after relaunch");
+  }
+
+  const source = await readFile(resolve(root, "src/infrastructure/db/migrations/migration1.ts"));
+  const sourceText = source.toString("utf8");
+  const sqlStart = sourceText.indexOf("String.raw`") + "String.raw`".length;
+  const sqlEnd = sourceText.indexOf("`;\n\nexport const MIGRATION_1_SHA256", sqlStart);
+  assert(sqlStart >= "String.raw`".length && sqlEnd > sqlStart, "Profile migration source is malformed");
+  const migrationMatch = /export const MIGRATION_1_SHA256 = "([0-9a-f]{64})"/.exec(sourceText);
+  assert(migrationMatch, "Profile migration recorded SHA is absent");
+  assert.deepEqual(report.migration, {
+    recordedSha256: migrationMatch[1],
+    sourceSha256: createHash("sha256").update(source).digest("hex"),
+    sqlBytes: Buffer.byteLength(sourceText.slice(sqlStart, sqlEnd)),
+    inventory: { tables: 26, indexes: 14, triggers: 3 },
+  }, "Profile migration identity is invalid");
+  assert.deepEqual(report.privacy, collectProfilePrivacyProof(root), "Profile privacy source proof is invalid");
+  assert.deepEqual(report.privacy.requestPrimitiveMatches, [], "Product request primitives are present");
+
+  const exactFlows = { saveFlow: "e2e/maestro/profile-save.yaml", restartFlow: "e2e/maestro/profile-restart.yaml" };
+  exactKeys(report.evidence, Object.keys(exactFlows), "Profile UI evidence");
+  for (const [name, path] of Object.entries(exactFlows)) {
+    assert.deepEqual(report.evidence[name], { path, sha256: await sha256(resolve(root, path)) }, `Profile ${name} evidence is invalid`);
+  }
+  assert.equal(report.status, "pass", "Profile restart did not pass");
+  assert.deepEqual(report.skipped, [], "Profile restart cannot be skipped");
+  return { testId: report.testId, fixtureId: report.fixture.id, valueSha256: report.fixture.valueSha256 };
+}
+
 async function frozenMigrationSha() {
   const source = await readFile(resolve(repoRoot, "src/infrastructure/db/migrations/migration1.ts"), "utf8");
   const match = /export const MIGRATION_1_SHA256 = "([0-9a-f]{64})"/.exec(source);
@@ -218,6 +441,7 @@ async function main() {
   let nativeFiles = null;
   let faultBundles = null;
   let persistence = null;
+  let profileRestart = null;
   if (platform === "host") {
     assert.equal(flavor, "static", "Host evidence must represent static gates");
     const faultBundleProof = await loadReport(option("--fault-bundle-proof", null));
@@ -248,9 +472,13 @@ async function main() {
       sha256: persistenceReport.sha256,
       ...validatePersistenceReport(persistenceReport.report, platform, expectedSha, await frozenMigrationSha()),
     };
+    const profileRestartReport = await loadReport(option("--profile-restart-report", null));
+    assert.equal(profileRestartReport.path, `.artifacts/${platform}-profile-restart.json`, "Profile restart report path is noncanonical");
+    await validateProfileRestartReport(profileRestartReport.report, platform, expectedSha);
+    profileRestart = collectProfileRestartEvidence(profileRestartReport.path, profileRestartReport.sha256);
   }
   const evidence = {
-    schemaVersion: 4,
+    schemaVersion: CI_EVIDENCE_SCHEMA_VERSION,
     checkedOutSha,
     expectedSha,
     platform,
@@ -266,6 +494,7 @@ async function main() {
     reports,
     faultBundles,
     persistence,
+    profileRestart,
     runner: {
       os: process.env.RUNNER_OS ?? process.platform,
       arch: process.env.RUNNER_ARCH ?? process.arch,

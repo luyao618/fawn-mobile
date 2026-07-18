@@ -91,3 +91,59 @@ test("persistence evidence tool checkpoints WAL and keeps exact frozen identitie
     status: "pass", collisionObject: "chat_turns", beforeSnapshot: poison, afterSnapshot: poison,
   });
 });
+
+test("profile evidence snapshots the exact leap-day fixture and computes age without product imports", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "fawn-profile-evidence-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "user.db");
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA journal_mode = WAL");
+  const adapter = {
+    async execAsync(sql: string) { db.exec(sql); },
+    async getAllAsync<T>(sql: string, ...values: unknown[]) { return db.prepare(sql).all(...parameters(values)) as T[]; },
+    async runAsync(sql: string, ...values: unknown[]) { return db.prepare(sql).run(...parameters(values)); },
+  };
+  await applyUserDatabaseMigrations(adapter);
+  db.prepare(`INSERT INTO baby_profile(
+    singleton_id,name,sex,birth_date,birth_weight_g,birth_height_cm,birth_head_cm,
+    is_premature,gestational_weeks,created_at,updated_at
+  ) VALUES (1,?,?,?,?,?,?,?,?,?,?)`).run(
+    "G031LeapBaby", "female", "2024-02-29", 3200, 50.5, 34.2, 1, 36,
+    "2026-07-18T01:02:03.000Z", "2026-07-18T01:02:03.000Z",
+  );
+  db.close();
+
+  const snapshotPath = join(directory, "profile.json");
+  tool("--action", "profile-snapshot", "--database", path, "--output", snapshotPath);
+  const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+  assert.equal(snapshot.babyProfileCount, 1);
+  assert.equal(snapshot.modelConfigCount, 0);
+  assert.equal(snapshot.modelCapabilitiesCount, 0);
+  assert.equal(snapshot.valueSha256, "6bfb59d6996bf798923420d4ffb334430f3b1c6cd0c87988d29e353c06a7f6db");
+  assert.deepEqual(snapshot.row, {
+    singleton_id: 1,
+    name: "G031LeapBaby",
+    sex: "female",
+    birth_date: "2024-02-29",
+    birth_weight_g: 3200,
+    birth_height_cm: 50.5,
+    birth_head_cm: 34.2,
+    is_premature: 1,
+    gestational_weeks: 36,
+    created_at: "2026-07-18T01:02:03.000Z",
+    updated_at: "2026-07-18T01:02:03.000Z",
+  });
+  assert.match(snapshot.rowSha256, /^[0-9a-f]{64}$/);
+
+  const agePath = join(directory, "age.json");
+  tool("--action", "age-oracle", "--local-date", "2026-07-18", "--output", agePath);
+  assert.deepEqual(JSON.parse(readFileSync(agePath, "utf8")), {
+    algorithm: "independent-gregorian-v1",
+    birthDate: "2024-02-29",
+    localDate: "2026-07-18",
+    ageDays: 870,
+    completedMonths: 28,
+    remainingDays: 19,
+    display: "28个月19天",
+  });
+});

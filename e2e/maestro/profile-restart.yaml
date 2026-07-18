@@ -1,0 +1,43 @@
+appId: com.luyao618.formobile
+---
+- extendedWaitUntil:
+    visible: "宝宝资料已保存在本机"
+    timeout: 120000
+- tapOn: "我的"
+- extendedWaitUntil:
+    visible: "宝宝资料"
+    timeout: 120000
+- assertNotVisible: "宝宝资料已保存"
+- assertVisible: "G031LeapBaby"
+- assertVisible: "${AGE_DISPLAY}"
+- assertVisible: "2024-02-29"
+- assertVisible:
+    text: "性别女孩"
+    checked: true
+- scrollUntilVisible:
+    element:
+      text: "出生体重（克）"
+    direction: DOWN
+- assertVisible: "3200"
+- scrollUntilVisible:
+    element:
+      text: "出生身长（厘米）"
+    direction: DOWN
+- assertVisible: "50.5"
+- scrollUntilVisible:
+    element:
+      text: "出生头围（厘米）"
+    direction: DOWN
+- assertVisible: "34.2"
+- scrollUntilVisible:
+    element:
+      text: "早产"
+    direction: DOWN
+- assertVisible:
+    text: "早产"
+    checked: true
+- scrollUntilVisible:
+    element:
+      text: "出生孕周（周）"
+    direction: DOWN
+- assertVisible: "36"

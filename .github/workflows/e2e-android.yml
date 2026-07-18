@@ -57,7 +57,10 @@ jobs:
           mkdir -p .artifacts/native/android/e2e
           cp android/app/src/main/AndroidManifest.xml .artifacts/native/android/e2e/AndroidManifest.xml
           node tools/check-native-schemes.mjs --platform android --flavor e2e --input .artifacts/native/android/e2e/AndroidManifest.xml --expected-sha "${{ inputs.expected_sha }}" --output .artifacts/schemes/android-e2e.json
-          (cd android && ./gradlew :app:assembleDebug -PreactNativeArchitectures=x86_64 --no-daemon)
+          (cd android && ./gradlew :app:assembleDebug :app:assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon)
+          test -s android/app/build/outputs/apk/release/app-release.apk
+          unzip -Z1 android/app/build/outputs/apk/release/app-release.apk > /tmp/g031-release-apk.entries
+          grep -Eq '^assets/(index\.android\.bundle|index\.bundle)$' /tmp/g031-release-apk.entries
       - name: Verify KVM immediately before emulator launch
         run: |
           set -euo pipefail
@@ -85,6 +88,7 @@ jobs:
             --scheme-report-production .artifacts/schemes/android-production.json \
             --scheme-report-e2e .artifacts/schemes/android-e2e.json \
             --persistence-report .artifacts/android-persistence.json \
+            --profile-restart-report .artifacts/android-profile-restart.json \
             --output .artifacts/android-e2e.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -97,6 +101,7 @@ jobs:
             .artifacts/launch/android-dev-client.log
             .artifacts/test-results/android-maestro.log
             .artifacts/android-persistence.json
+            .artifacts/android-profile-restart.json
             .artifacts/persistence/android/*.json
           if-no-files-found: error
       - name: Retain Android launch and Maestro diagnostics

@@ -1,0 +1,74 @@
+appId: com.luyao618.formobile
+---
+- extendedWaitUntil:
+    visible: "照护空间尚未设置"
+    timeout: 120000
+- tapOn: "我的"
+- extendedWaitUntil:
+    visible: "宝宝资料"
+    timeout: 120000
+- tapOn: "宝宝姓名"
+- inputText: "G031LeapBaby"
+- assertVisible: "G031LeapBaby"
+- tapOn: "出生日期"
+- inputText: "2024-02-29"
+- hideKeyboard
+- assertVisible: "2024-02-29"
+- tapOn: "性别女孩"
+- assertVisible:
+    text: "性别女孩"
+    checked: true
+- scrollUntilVisible:
+    element:
+      text: "出生体重（克）"
+    direction: DOWN
+- tapOn: "出生体重（克）"
+- inputText: "3200"
+- hideKeyboard
+- assertVisible: "3200"
+- scrollUntilVisible:
+    element:
+      text: "出生身长（厘米）"
+    direction: DOWN
+- tapOn: "出生身长（厘米）"
+- inputText: "50.5"
+- hideKeyboard
+- assertVisible: "50.5"
+- scrollUntilVisible:
+    element:
+      text: "出生头围（厘米）"
+    direction: DOWN
+- tapOn: "出生头围（厘米）"
+- inputText: "34.2"
+- hideKeyboard
+- assertVisible: "34.2"
+- scrollUntilVisible:
+    element:
+      text: "早产"
+    direction: DOWN
+- tapOn: "早产"
+- assertVisible:
+    text: "早产"
+    checked: true
+- scrollUntilVisible:
+    element:
+      text: "出生孕周（周）"
+    direction: DOWN
+- tapOn: "出生孕周（周）"
+- inputText: "36"
+- hideKeyboard
+- assertVisible: "36"
+- scrollUntilVisible:
+    element:
+      text: "保存宝宝资料"
+    direction: DOWN
+- tapOn: "保存宝宝资料"
+- extendedWaitUntil:
+    visible: "宝宝资料已保存"
+    timeout: 30000
+- scrollUntilVisible:
+    element:
+      text: "G031LeapBaby"
+    direction: UP
+- assertVisible: "G031LeapBaby"
+- assertVisible: "${AGE_DISPLAY}"

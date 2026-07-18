@@ -70,4 +70,17 @@ maestro --device "$emulator_serial" test --debug-output .artifacts/launch/maestr
 mv .artifacts/test-results/android-maestro.attempt.log .artifacts/test-results/android-maestro.log
 if [ -n "${EXPECTED_SHA:-}" ]; then
   bash scripts/e2e/run-persistence-android.sh "$emulator_serial" "$EXPECTED_SHA"
+  kill "$metro_pid"
+  set +e
+  wait "$metro_pid"
+  metro_status=$?
+  set -e
+  test "$metro_status" -eq 0 -o "$metro_status" -eq 143
+  metro_pid=
+  adb -s "$emulator_serial" reverse --remove tcp:8081
+  if curl --silent --fail http://127.0.0.1:8081/status >/dev/null; then
+    echo "Metro remained reachable after teardown" >&2
+    exit 1
+  fi
+  bash scripts/e2e/run-profile-restart-android.sh "$emulator_serial" "$EXPECTED_SHA" android/app/build/outputs/apk/release/app-release.apk
 fi
