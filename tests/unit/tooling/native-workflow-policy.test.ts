@@ -2230,14 +2230,17 @@ metro_pid=$!
 set +m
 for _ in $(seq 1 100); do [ -s "$child_file" ] && break; sleep 0.01; done
 child_pid=$(cat "$child_file")
-test "$(ps -o pgid= -p "$metro_pid" | tr -d ' ')" = "$metro_pid"
-test "$(ps -o pgid= -p "$child_pid" | tr -d ' ')" = "$metro_pid"
+test "$(jobs -p)" = "$metro_pid"
+kill -0 -- "-$metro_pid"
 kill -- "-$metro_pid"
 set +e
 wait "$metro_pid"
 metro_status=$?
 set -e
-test "$metro_status" -eq 143
+case "$metro_status" in
+  0|143) ;;
+  *) exit 1 ;;
+esac
 for _ in $(seq 1 100); do ! kill -0 "$child_pid" 2>/dev/null && break; sleep 0.01; done
 ! kill -0 "$child_pid" 2>/dev/null
 metro_pid=
@@ -2934,12 +2937,32 @@ const exactProfileReadinessCommands = {
 } as const;
 
 const exactAndroidProfilePidofHelper = `pidof_app() {
+  local observation adb_status remote_status
   set +e
-  pid=$(adb -s "$serial" shell pidof -s "$app_id" 2>/dev/null)
-  pid_status=$?
+  observation=$(adb -s "$serial" shell "pidof -s '$app_id'; remote_status=\\$?; printf '__PIDOF_STATUS__=%s\\\\n' \\"\\$remote_status\\"" 2>&1)
+  adb_status=$?
   set -e
-  [ "$pid_status" -eq 0 ] || [ "$pid_status" -eq 1 ] || return "$pid_status"
-  printf '%s' "\${pid//$'\\r'/}"
+  if [ "$adb_status" -ne 0 ]; then
+    printf '%s\\n' "$observation" >&2
+    return "$adb_status"
+  fi
+  observation=\${observation//$'\\r'/}
+  if [ "$observation" = '__PIDOF_STATUS__=1' ]; then
+    return 0
+  fi
+  if [[ "$observation" =~ ^([0-9]+)$'\\n'__PIDOF_STATUS__=0$ ]]; then
+    printf '%s' "\${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$observation" =~ (^|$'\\n')__PIDOF_STATUS__=([0-9]+)$ ]]; then
+    remote_status=\${BASH_REMATCH[2]}
+    if [ "$remote_status" -gt 0 ] && [ "$remote_status" -lt 256 ]; then
+      printf '%s\\n' "$observation" >&2
+      return "$remote_status"
+    fi
+  fi
+  printf 'Malformed remote pidof observation: %s\\n' "$observation" >&2
+  return 1
 }`;
 
 const exactIosDeviceCalendarSource = `import Foundation
@@ -3031,11 +3054,16 @@ function assertAndroidProfilePidofPolicy(script: string) {
     "Android profile PID lookup must use the exact status-aware helper once",
   );
   assert.deepEqual(
-    script.split(/\r\n|\n|\r/).filter((line) => line.includes("shell pidof")),
-    ['  pid=$(adb -s "$serial" shell pidof -s "$app_id" 2>/dev/null)'],
-    "Android profile PID lookup must not use a pipefail-sensitive pipeline",
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes("pidof -s")),
+    ['  observation=$(adb -s "$serial" shell "pidof -s \'$app_id\'; remote_status=\\$?; printf \'__PIDOF_STATUS__=%s\\\\n\' \\"\\$remote_status\\"" 2>&1)'],
+    "Android profile PID lookup must capture one status-marked remote observation without a pipefail-sensitive pipeline",
   );
   assert.equal((script.match(/\$\(pidof_app\)/g) ?? []).length, 3, "All Android profile PID probes must use the helper");
+  assert.match(
+    script,
+    /stopped_pid=\$\(pidof_app\)\ntest -z "\$stopped_pid"/,
+    "Android profile PID absence must preserve helper failure before checking for empty output",
+  );
 }
 
 function assertNonPipelinedApkInspection(androidWorkflow: string, androidProfile: string) {
@@ -3053,13 +3081,40 @@ function assertNonPipelinedApkInspection(androidWorkflow: string, androidProfile
   );
 }
 
+const exactProfileTabNavigation = `- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
+          retryTapIfNoChange: true
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
+- extendedWaitUntil:
+    visible: "宝宝姓名"
+    timeout: 120000`;
+
+function assertProfileTabNavigation(flow: string) {
+  assert.equal(
+    flow.split(exactProfileTabNavigation).length - 1,
+    1,
+    "Profile navigation must use the exact tab identifier, the iOS no-change compatibility retry, and unique ready-form evidence",
+  );
+  assert.equal(flow.includes('- tapOn: "我的"'), false, "Profile navigation must not use the ambiguous tab text");
+  assert.equal(flow.includes('visible: "宝宝资料"'), false, "Profile readiness must not accept the StewardScreen label");
+  assert.equal((flow.match(/retryTapIfNoChange/g) ?? []).length, 1, "Only the first iOS profile-tab tap may retry on no UI change");
+}
+
 function assertProfileRestartFlowOrder(flow: string) {
   assert.equal((flow.match(/G031LeapBaby/g) ?? []).length, 1, "Restart must require the synthetic name exactly once");
   ordered(
     flow,
     'visible: "宝宝资料已保存在本机"',
-    '- tapOn: "我的"',
-    'visible: "宝宝资料"',
+    exactProfileTabNavigation,
     'assertNotVisible: "宝宝资料已保存"',
     'assertVisible: "G031LeapBaby"',
     'assertVisible: "${AGE_DISPLAY}"',
@@ -3211,6 +3266,8 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertProfileBootstrapReadiness(androidProfile, "android");
   assertProfileBootstrapReadiness(iosProfile, "ios");
   assertIosDeviceCalendarPolicy(iosProfile, iosCalendarQuery, iosCalendarSource);
+  assertProfileTabNavigation(saveFlow);
+  assertProfileTabNavigation(restartFlow);
   assertProfileKeyboardDismissalPolicy(saveFlow);
   assertProfileNameToBirthDateTransition(saveFlow);
   assertProfileNumericInputTargeting(saveFlow);
@@ -3308,16 +3365,39 @@ printf '%b' ${JSON.stringify(output)}
   assert.notEqual(pidPipelineMutation, androidProfile);
   assert.throws(() => assertAndroidProfilePidofPolicy(pidPipelineMutation));
 
-  const pidHarness = spawnSync("bash", ["-c", `set -euo pipefail
-adb() { return 1; }
+  const pidTransportFailure = spawnSync("bash", ["-c", `set -euo pipefail
+adb() { printf '%s\\n' 'adb transport unavailable' >&2; return 1; }
 serial=emulator-5554
 app_id=com.luyao618.formobile
 ${exactAndroidProfilePidofHelper}
-test -z "$(pidof_app)"
-printf '%s\\n' survived-no-process
+pid=$(pidof_app)
+test -z "$pid"
 `], { encoding: "utf8" });
-  assert.equal(pidHarness.status, 0, pidHarness.stderr);
-  assert.equal(pidHarness.stdout, "survived-no-process\n");
+  assert.equal(pidTransportFailure.status, 1);
+  assert.match(pidTransportFailure.stderr, /adb transport unavailable/);
+
+  const pidRemoteNoProcess = spawnSync("bash", ["-c", `set -euo pipefail
+adb() { printf '%s\\n' '__PIDOF_STATUS__=1'; return 0; }
+serial=emulator-5554
+app_id=com.luyao618.formobile
+${exactAndroidProfilePidofHelper}
+pid=$(pidof_app)
+test -z "$pid"
+printf '%s\\n' accepted-remote-no-process
+`], { encoding: "utf8" });
+  assert.equal(pidRemoteNoProcess.status, 0, pidRemoteNoProcess.stderr);
+  assert.equal(pidRemoteNoProcess.stdout, "accepted-remote-no-process\n");
+
+  for (const output of ["", "123", "abc\\n__PIDOF_STATUS__=0", "123\\n__PIDOF_STATUS__=1", "123\\n__PIDOF_STATUS__=999"]) {
+    const malformedPid = spawnSync("bash", ["-c", `set -euo pipefail
+adb() { printf '%b' ${JSON.stringify(output)}; return 0; }
+serial=emulator-5554
+app_id=com.luyao618.formobile
+${exactAndroidProfilePidofHelper}
+pid=$(pidof_app)
+`], { encoding: "utf8" });
+    assert.notEqual(malformedPid.status, 0, `malformed pidof observation survived: ${JSON.stringify(output)}`);
+  }
 
   const workflowPipelineMutation = androidWorkflow.replace(
     "unzip -Z1 android/app/build/outputs/apk/release/app-release.apk > /tmp/g031-release-apk.entries\n          grep -Eq '^assets/(index\\.android\\.bundle|index\\.bundle)$' /tmp/g031-release-apk.entries",
@@ -3391,7 +3471,20 @@ printf '%s\\n' survived-no-process
     assert.throws(() => assertProfileNumericInputTargeting(unanchoredScrollMutation));
   }
 
-  const restartOrderMutation = restartFlow.replace('- tapOn: "我的"', '- assertVisible: "G031LeapBaby"\n- tapOn: "我的"');
+  for (const [label, flow] of [["save", saveFlow], ["restart", restartFlow]] as const) {
+    const navigationMutations = [
+      flow.replace('id: "tab-MeTab"', 'text: "我的"'),
+      flow.replace("          retryTapIfNoChange: true\n", ""),
+      flow.replace('visible: "宝宝姓名"', 'visible: "宝宝资料"'),
+      flow.replace("      platform: iOS", "      platform: Android"),
+    ];
+    for (const mutation of navigationMutations) {
+      assert.notEqual(mutation, flow, `${label} navigation mutation must change the flow`);
+      assert.throws(() => assertProfileTabNavigation(mutation), `${label} hostile navigation mutation`);
+    }
+  }
+
+  const restartOrderMutation = restartFlow.replace(exactProfileTabNavigation, `- assertVisible: "G031LeapBaby"\n${exactProfileTabNavigation}`);
   assert.notEqual(restartOrderMutation, restartFlow);
   assert.throws(() => assertProfileRestartFlowOrder(restartOrderMutation));
 });

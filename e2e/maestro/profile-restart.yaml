@@ -3,9 +3,21 @@ appId: com.luyao618.formobile
 - extendedWaitUntil:
     visible: "宝宝资料已保存在本机"
     timeout: 120000
-- tapOn: "我的"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
+          retryTapIfNoChange: true
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
 - extendedWaitUntil:
-    visible: "宝宝资料"
+    visible: "宝宝姓名"
     timeout: 120000
 - assertNotVisible: "宝宝资料已保存"
 - assertVisible: "G031LeapBaby"

@@ -48,12 +48,32 @@ if ! install_apk; then
 fi
 
 pidof_app() {
+  local observation adb_status remote_status
   set +e
-  pid=$(adb -s "$serial" shell pidof -s "$app_id" 2>/dev/null)
-  pid_status=$?
+  observation=$(adb -s "$serial" shell "pidof -s '$app_id'; remote_status=\$?; printf '__PIDOF_STATUS__=%s\\n' \"\$remote_status\"" 2>&1)
+  adb_status=$?
   set -e
-  [ "$pid_status" -eq 0 ] || [ "$pid_status" -eq 1 ] || return "$pid_status"
-  printf '%s' "${pid//$'\r'/}"
+  if [ "$adb_status" -ne 0 ]; then
+    printf '%s\n' "$observation" >&2
+    return "$adb_status"
+  fi
+  observation=${observation//$'\r'/}
+  if [ "$observation" = '__PIDOF_STATUS__=1' ]; then
+    return 0
+  fi
+  if [[ "$observation" =~ ^([0-9]+)$'\n'__PIDOF_STATUS__=0$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$observation" =~ (^|$'\n')__PIDOF_STATUS__=([0-9]+)$ ]]; then
+    remote_status=${BASH_REMATCH[2]}
+    if [ "$remote_status" -gt 0 ] && [ "$remote_status" -lt 256 ]; then
+      printf '%s\n' "$observation" >&2
+      return "$remote_status"
+    fi
+  fi
+  printf 'Malformed remote pidof observation: %s\n' "$observation" >&2
+  return 1
 }
 
 launch() {
@@ -112,7 +132,8 @@ test "$installed_before_sha" = "$local_before_sha"
 maestro --device "$serial" test -e AGE_DISPLAY="$age_display" --debug-output .artifacts/launch/maestro/android-profile-save e2e/maestro/profile-save.yaml 2>&1 | tee .artifacts/test-results/android-profile-save.log
 after_save_date=$(device_date)
 terminate "$save_pid"
-test -z "$(pidof_app)"
+stopped_pid=$(pidof_app)
+test -z "$stopped_pid"
 pull_db "$artifacts/post-save.db"
 node tools/persistence-evidence.mjs --action profile-snapshot --database "$artifacts/post-save.db" --output "$artifacts/post-save.json"
 
