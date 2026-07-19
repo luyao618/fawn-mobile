@@ -384,7 +384,7 @@ export function BabyProfileScreen() {
 
   const age = !ageRefreshFailed && snapshot ? formatExactAge(snapshot.exactAge) : null;
   return (
-    <AppFrame localOnly title="我的">
+    <AppFrame keyboardDismissMode="on-drag" localOnly title="我的">
       <View style={styles.headingGroup}>
         <Text accessibilityRole="header" allowFontScaling style={styles.sectionTitle}>宝宝资料</Text>
         <Text allowFontScaling style={styles.description}>资料只保存在本机；其他项目可以暂不填写，出生状态需选择足月或早产。</Text>

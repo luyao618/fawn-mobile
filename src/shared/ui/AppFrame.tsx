@@ -1,18 +1,28 @@
 import type { PropsWithChildren } from "react";
-import { ScrollView, StyleSheet, useWindowDimensions, View } from "react-native";
+import { ScrollView, type ScrollViewProps, StyleSheet, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { colors, spacing } from "../theme/tokens";
 import { TopBar } from "./TopBar";
 
-export function AppFrame({ children, title, localOnly = false }: PropsWithChildren<{ title: string; localOnly?: boolean }>) {
+type AppFrameProps = PropsWithChildren<{
+  title: string;
+  localOnly?: boolean;
+  keyboardDismissMode?: ScrollViewProps["keyboardDismissMode"];
+}>;
+
+export function AppFrame({ children, title, localOnly = false, keyboardDismissMode }: AppFrameProps) {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const horizontal = width >= 768 ? spacing.xxl : width >= 431 ? spacing.xl : spacing.md;
   return (
     <View style={[styles.canvas, { paddingTop: insets.top }]}>
       <View style={[styles.headerWidth, { paddingHorizontal: horizontal }]}><TopBar title={title} localOnly={localOnly} /></View>
-      <ScrollView contentContainerStyle={[styles.content, { paddingHorizontal: horizontal }]} keyboardShouldPersistTaps="handled">
+      <ScrollView
+        contentContainerStyle={[styles.content, { paddingHorizontal: horizontal }]}
+        keyboardDismissMode={keyboardDismissMode}
+        keyboardShouldPersistTaps="handled"
+      >
         {children}
       </ScrollView>
     </View>

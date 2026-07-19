@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
-import { AppState, type AppStateStatus, StyleSheet, Text } from "react-native";
+import { AppState, type AppStateStatus, ScrollView, StyleSheet, Text } from "react-native";
 
 import type {
   BabyProfileServicePort,
@@ -187,6 +187,11 @@ function renderProfile(profileService: BabyProfileServicePort) {
 test("我的 exposes every partial profile field with scalable, accessible controls", async () => {
   const view = renderProfile(service());
   await waitFor(() => expect(screen.getByRole("header", { name: "宝宝资料" })).toBeTruthy());
+
+  expect(view.UNSAFE_getByType(ScrollView).props).toMatchObject({
+    keyboardDismissMode: "on-drag",
+    keyboardShouldPersistTaps: "handled",
+  });
 
   for (const label of ["宝宝姓名", "出生日期", "出生体重（克）", "出生身长（厘米）", "出生头围（厘米）", "出生孕周（周）"]) {
     expect(screen.getByLabelText(label)).toBeTruthy();

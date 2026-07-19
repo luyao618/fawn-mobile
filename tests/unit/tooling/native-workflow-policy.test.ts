@@ -3262,13 +3262,13 @@ const exactProfileTextInputs = [
 ] as const;
 
 const exactProfileNumericInputs = [
-  { label: "出生体重（克）", placeholder: "100–10000", value: "3200" },
-  { label: "出生身长（厘米）", placeholder: "10–100", value: "50.5" },
-  { label: "出生头围（厘米）", placeholder: "10–80", value: "34.2" },
-  { label: "出生孕周（周）", placeholder: "20–45，可暂不填", value: "36" },
+  { label: "出生体重（克）", placeholder: "100–10000", value: "3200", dismissDirection: "UP" },
+  { label: "出生身长（厘米）", placeholder: "10–100", value: "50.5", dismissDirection: "UP" },
+  { label: "出生头围（厘米）", placeholder: "10–80", value: "34.2", dismissDirection: "UP" },
+  { label: "出生孕周（周）", placeholder: "20–45，可暂不填", value: "36", dismissDirection: "UP" },
 ] as const;
 
-function exactProfileKeyboardDismissal(label: string): string {
+function exactProfileTextKeyboardDismissal(label: string): string {
   return `- runFlow:
     when:
       platform: Android
@@ -3281,13 +3281,29 @@ function exactProfileKeyboardDismissal(label: string): string {
       - tapOn: "${label}"`;
 }
 
+function exactProfileNumericKeyboardDismissal({ value, dismissDirection }: typeof exactProfileNumericInputs[number]): string {
+  return `- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - scrollUntilVisible:
+          element:
+            text: "^${value}$"
+          direction: ${dismissDirection}`;
+}
+
 function assertProfileKeyboardDismissalPolicy(flow: string): void {
   assert.doesNotMatch(flow, /^- hideKeyboard(?:\s*:.*)?\s*$/m, "Profile save must not use universal hideKeyboard");
   assert.doesNotMatch(flow, /\b(?:optional|retry|sleep)\b/i, "Profile save must not mask dismissal failures");
   assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile save must not use coordinate taps");
-  for (const { label } of [...exactProfileTextInputs, ...exactProfileNumericInputs]) {
+  for (const { label } of exactProfileTextInputs) {
     assert.equal(
-      flow.split(exactProfileKeyboardDismissal(label)).length - 1,
+      flow.split(exactProfileTextKeyboardDismissal(label)).length - 1,
       1,
       `${label} must use one exact Android hideKeyboard then iOS static-label dismissal block`,
     );
@@ -3297,6 +3313,40 @@ function assertProfileKeyboardDismissalPolicy(flow: string): void {
       `${label} static label must be tapped only by its iOS dismissal branch`,
     );
   }
+  for (const input of exactProfileNumericInputs) {
+    const { label, value } = input;
+    assert.equal(
+      flow.split(exactProfileNumericKeyboardDismissal(input)).length - 1,
+      1,
+      `${label} must use one exact Android hideKeyboard then iOS anchored entered-value scroll dismissal block`,
+    );
+    assert.equal(flow.split(`- tapOn: "${label}"`).length - 1, 0, `${label} must never be tapped to dismiss the iOS numeric keyboard`);
+    assert.equal(flow.split(`text: "^${value}$"`).length - 1, 1, `${label} entered value must be the unique anchored iOS dismissal scroll target`);
+  }
+}
+
+function assertProfileOnDragKeyboardDismissal(appFrameSource: string, profileSource: string): void {
+  assert.match(appFrameSource, /keyboardDismissMode\?: ScrollViewProps\["keyboardDismissMode"\]/, "AppFrame must expose the native ScrollView keyboardDismissMode type as optional");
+  assert.equal(
+    appFrameSource.split("keyboardDismissMode={keyboardDismissMode}").length - 1,
+    1,
+    "AppFrame must forward keyboardDismissMode to its ScrollView exactly once",
+  );
+  assert.equal(
+    appFrameSource.split('keyboardShouldPersistTaps="handled"').length - 1,
+    1,
+    "AppFrame must preserve handled keyboard taps exactly once",
+  );
+  assert.equal(
+    profileSource.split('<AppFrame keyboardDismissMode="on-drag" localOnly title="我的">').length - 1,
+    1,
+    "BabyProfileScreen must be the exact on-drag AppFrame opt-in",
+  );
+  assert.equal(
+    (profileSource.match(/keyboardDismissMode=/g) ?? []).length,
+    1,
+    "BabyProfileScreen must contain exactly one keyboard dismissal mode opt-in",
+  );
 }
 
 function assertProfileNameToBirthDateTransition(flow: string) {
@@ -3306,10 +3356,10 @@ function assertProfileNameToBirthDateTransition(flow: string) {
   const transition = `- tapOn: "${nameSelector}"
 - inputText: "${name.value}"
 - assertVisible: "${name.value}"
-${exactProfileKeyboardDismissal(name.label)}
+${exactProfileTextKeyboardDismissal(name.label)}
 - tapOn: "${birthDateSelector}"
 - inputText: "${birthDate.value}"
-${exactProfileKeyboardDismissal(birthDate.label)}
+${exactProfileTextKeyboardDismissal(birthDate.label)}
 - assertVisible: "${birthDate.value}"`;
   assert.equal(
     flow.split(transition).length - 1,
@@ -3416,7 +3466,8 @@ function assertProfileRadioSelectionPolicy(saveFlow: string, restartFlow: string
 }
 
 function assertProfileNumericInputTargeting(flow: string) {
-  for (const { label, placeholder, value } of exactProfileNumericInputs) {
+  for (const input of exactProfileNumericInputs) {
+    const { label, placeholder, value } = input;
     const selector = `^${placeholder}$`;
     const exactInputSequence = `- scrollUntilVisible:
     element:
@@ -3424,7 +3475,7 @@ function assertProfileNumericInputTargeting(flow: string) {
     direction: DOWN
 - tapOn: "${selector}"
 - inputText: "${value}"
-${exactProfileKeyboardDismissal(label)}
+${exactProfileNumericKeyboardDismissal(input)}
 - assertVisible: "${value}"`;
     assert.equal(
       flow.split(exactInputSequence).length - 1,
@@ -3471,7 +3522,7 @@ function assertProfileSaveVisibilityPolicy(flow: string): void {
 }
 
 test("G031 native policy preserves Debug evidence before one-way offline Release profile proof", async () => {
-  const [androidWorkflow, iosWorkflow, androidRunner, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, saveFlow, restartFlow] = await Promise.all([
+  const [androidWorkflow, iosWorkflow, androidRunner, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, appFrameSource, profileSource, saveFlow, restartFlow] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
     readFile(".github/workflows/e2e-ios.yml", "utf8"),
     readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
@@ -3479,6 +3530,8 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
     readFile("scripts/e2e/run-profile-restart-ios.sh", "utf8"),
     readFile("scripts/e2e/query-ios-device-calendar.sh", "utf8"),
     readFile("scripts/e2e/ios-device-calendar.swift", "utf8"),
+    readFile("src/shared/ui/AppFrame.tsx", "utf8"),
+    readFile("src/features/profile/BabyProfileScreen.tsx", "utf8"),
     readFile("e2e/maestro/profile-save.yaml", "utf8"),
     readFile("e2e/maestro/profile-restart.yaml", "utf8"),
   ]);
@@ -3525,6 +3578,7 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertProfileTabNavigation(saveFlow, exactProfileSourceStates.save);
   assertProfileTabNavigation(restartFlow, exactProfileSourceStates.restart);
   assertProfileKeyboardDismissalPolicy(saveFlow);
+  assertProfileOnDragKeyboardDismissal(appFrameSource, profileSource);
   assertProfileNameToBirthDateTransition(saveFlow);
   assertProfileRadioSelectionPolicy(saveFlow, restartFlow);
   assertProfileNumericInputTargeting(saveFlow);
@@ -3599,12 +3653,14 @@ test("G031 Android root transition accepts only exact outcomes and proves root a
 });
 
 test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, keyboard, save visibility, and restart-order regressions", async () => {
-  const [androidWorkflow, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, saveFlow, restartFlow] = await Promise.all([
+  const [androidWorkflow, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, appFrameSource, profileSource, saveFlow, restartFlow] = await Promise.all([
     readFile(".github/workflows/e2e-android.yml", "utf8"),
     readFile("scripts/e2e/run-profile-restart-android.sh", "utf8"),
     readFile("scripts/e2e/run-profile-restart-ios.sh", "utf8"),
     readFile("scripts/e2e/query-ios-device-calendar.sh", "utf8"),
     readFile("scripts/e2e/ios-device-calendar.swift", "utf8"),
+    readFile("src/shared/ui/AppFrame.tsx", "utf8"),
+    readFile("src/features/profile/BabyProfileScreen.tsx", "utf8"),
     readFile("e2e/maestro/profile-save.yaml", "utf8"),
     readFile("e2e/maestro/profile-restart.yaml", "utf8"),
   ]);
@@ -3739,7 +3795,7 @@ pid=$(pidof_app)
   assert.throws(() => assertNonPipelinedApkInspection(workflowPipelineMutation, androidProfile));
   assert.throws(() => assertNonPipelinedApkInspection(androidWorkflow, profilePipelineMutation));
 
-  const nameDismissal = exactProfileKeyboardDismissal("宝宝姓名");
+  const nameDismissal = exactProfileTextKeyboardDismissal("宝宝姓名");
   const androidDismissal = `- runFlow:
     when:
       platform: Android
@@ -3768,6 +3824,17 @@ pid=$(pidof_app)
     assert.throws(() => assertProfileKeyboardDismissalPolicy(mutation), label);
   }
 
+  const onDragMutations = [
+    ["missing AppFrame forwarding", appFrameSource.replace(" keyboardDismissMode={keyboardDismissMode}", ""), profileSource],
+    ["missing handled tap policy", appFrameSource.replace(' keyboardShouldPersistTaps="handled"', ""), profileSource],
+    ["missing profile on-drag", appFrameSource, profileSource.replace(' keyboardDismissMode="on-drag"', "")],
+    ["wrong profile dismissal mode", appFrameSource, profileSource.replace('keyboardDismissMode="on-drag"', 'keyboardDismissMode="none"')],
+  ] as const;
+  for (const [label, appFrameMutation, profileMutation] of onDragMutations) {
+    assert.ok(appFrameMutation !== appFrameSource || profileMutation !== profileSource, `${label} mutation must change component source`);
+    assert.throws(() => assertProfileOnDragKeyboardDismissal(appFrameMutation, profileMutation), label);
+  }
+
   for (const { label, placeholder } of exactProfileTextInputs) {
     const selector = `^${placeholder}$`;
     const labelTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${label}"`);
@@ -3779,7 +3846,9 @@ pid=$(pidof_app)
     assert.throws(() => assertProfileNameToBirthDateTransition(unanchoredTapMutation));
   }
 
-  for (const { label, placeholder } of exactProfileNumericInputs) {
+  for (const [index, input] of exactProfileNumericInputs.entries()) {
+    const { label, placeholder, value } = input;
+    const otherInput = exactProfileNumericInputs[(index + 1) % exactProfileNumericInputs.length]!;
     const selector = `^${placeholder}$`;
     const labelTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${label}"`);
     assert.notEqual(labelTapMutation, saveFlow, `${label} label-tap mutation must change the flow`);
@@ -3796,6 +3865,19 @@ pid=$(pidof_app)
     const unanchoredScrollMutation = saveFlow.replace(`      text: "${selector}"`, `      text: "${placeholder}"`);
     assert.notEqual(unanchoredScrollMutation, saveFlow, `${label} unanchored-scroll mutation must change the flow`);
     assert.throws(() => assertProfileNumericInputTargeting(unanchoredScrollMutation));
+
+    const exactDismissal = exactProfileNumericKeyboardDismissal(input);
+    const dismissalMutations = [
+      ["iOS label tap dismissal", saveFlow.replace(exactDismissal, exactProfileTextKeyboardDismissal(label))],
+      ["wrong entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(`^${value}$`, `^${otherInput.value}$`))],
+      ["wrong dismissal direction", saveFlow.replace(exactDismissal, exactDismissal.replace(`direction: ${input.dismissDirection}`, "direction: DOWN"))],
+      ["unanchored entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(`^${value}$`, value))],
+      ["missing iOS value-scroll dismissal", saveFlow.replace(exactDismissal, androidDismissal)],
+    ] as const;
+    for (const [mutationLabel, mutation] of dismissalMutations) {
+      assert.notEqual(mutation, saveFlow, `${label} ${mutationLabel} mutation must change the flow`);
+      assert.throws(() => assertProfileKeyboardDismissalPolicy(mutation), `${label} ${mutationLabel}`);
+    }
   }
 
   for (const [index, selection] of exactProfileRadioSelections.entries()) {

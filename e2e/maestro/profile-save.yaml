@@ -86,7 +86,10 @@ appId: com.luyao618.formobile
     when:
       platform: iOS
     commands:
-      - tapOn: "出生体重（克）"
+      - scrollUntilVisible:
+          element:
+            text: "^3200$"
+          direction: UP
 - assertVisible: "3200"
 - scrollUntilVisible:
     element:
@@ -103,7 +106,10 @@ appId: com.luyao618.formobile
     when:
       platform: iOS
     commands:
-      - tapOn: "出生身长（厘米）"
+      - scrollUntilVisible:
+          element:
+            text: "^50.5$"
+          direction: UP
 - assertVisible: "50.5"
 - scrollUntilVisible:
     element:
@@ -120,7 +126,10 @@ appId: com.luyao618.formobile
     when:
       platform: iOS
     commands:
-      - tapOn: "出生头围（厘米）"
+      - scrollUntilVisible:
+          element:
+            text: "^34.2$"
+          direction: UP
 - assertVisible: "34.2"
 - scrollUntilVisible:
     element:
@@ -162,7 +171,10 @@ appId: com.luyao618.formobile
     when:
       platform: iOS
     commands:
-      - tapOn: "出生孕周（周）"
+      - scrollUntilVisible:
+          element:
+            text: "^36$"
+          direction: UP
 - assertVisible: "36"
 - scrollUntilVisible:
     element:
