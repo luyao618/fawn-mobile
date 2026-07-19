@@ -3268,6 +3268,10 @@ const exactProfileNumericInputs = [
   { label: "出生孕周（周）", placeholder: "20–45，可暂不填", value: "36", dismissDirection: "UP" },
 ] as const;
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function exactProfileTextKeyboardDismissal(label: string): string {
   return `- runFlow:
     when:
@@ -3282,6 +3286,7 @@ function exactProfileTextKeyboardDismissal(label: string): string {
 }
 
 function exactProfileNumericKeyboardDismissal({ value, dismissDirection }: typeof exactProfileNumericInputs[number]): string {
+  const selector = `^${escapeRegex(value)}$`;
   return `- runFlow:
     when:
       platform: Android
@@ -3293,7 +3298,7 @@ function exactProfileNumericKeyboardDismissal({ value, dismissDirection }: typeo
     commands:
       - scrollUntilVisible:
           element:
-            text: "^${value}$"
+            text: '${selector}'
           direction: ${dismissDirection}`;
 }
 
@@ -3315,13 +3320,14 @@ function assertProfileKeyboardDismissalPolicy(flow: string): void {
   }
   for (const input of exactProfileNumericInputs) {
     const { label, value } = input;
+    const selector = `^${escapeRegex(value)}$`;
     assert.equal(
       flow.split(exactProfileNumericKeyboardDismissal(input)).length - 1,
       1,
       `${label} must use one exact Android hideKeyboard then iOS anchored entered-value scroll dismissal block`,
     );
     assert.equal(flow.split(`- tapOn: "${label}"`).length - 1, 0, `${label} must never be tapped to dismiss the iOS numeric keyboard`);
-    assert.equal(flow.split(`text: "^${value}$"`).length - 1, 1, `${label} entered value must be the unique anchored iOS dismissal scroll target`);
+    assert.equal(flow.split(`text: '${selector}'`).length - 1, 1, `${label} entered value must be the unique regex-literal anchored iOS dismissal scroll target`);
   }
 }
 
@@ -3867,11 +3873,13 @@ pid=$(pidof_app)
     assert.throws(() => assertProfileNumericInputTargeting(unanchoredScrollMutation));
 
     const exactDismissal = exactProfileNumericKeyboardDismissal(input);
+    const enteredValueSelector = `^${escapeRegex(value)}$`;
+    const otherEnteredValueSelector = `^${escapeRegex(otherInput.value)}$`;
     const dismissalMutations = [
       ["iOS label tap dismissal", saveFlow.replace(exactDismissal, exactProfileTextKeyboardDismissal(label))],
-      ["wrong entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(`^${value}$`, `^${otherInput.value}$`))],
+      ["wrong entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(enteredValueSelector, otherEnteredValueSelector))],
       ["wrong dismissal direction", saveFlow.replace(exactDismissal, exactDismissal.replace(`direction: ${input.dismissDirection}`, "direction: DOWN"))],
-      ["unanchored entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(`^${value}$`, value))],
+      ["unanchored entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(enteredValueSelector, escapeRegex(value)))],
       ["missing iOS value-scroll dismissal", saveFlow.replace(exactDismissal, androidDismissal)],
     ] as const;
     for (const [mutationLabel, mutation] of dismissalMutations) {
