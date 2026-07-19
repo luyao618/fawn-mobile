@@ -3296,6 +3296,8 @@ function exactProfileNumericKeyboardDismissal({ value, dismissDirection }: typeo
     when:
       platform: iOS
     commands:
+      - swipe:
+          direction: DOWN
       - scrollUntilVisible:
           element:
             text: '${selector}'
@@ -3306,6 +3308,11 @@ function assertProfileKeyboardDismissalPolicy(flow: string): void {
   assert.doesNotMatch(flow, /^- hideKeyboard(?:\s*:.*)?\s*$/m, "Profile save must not use universal hideKeyboard");
   assert.doesNotMatch(flow, /\b(?:optional|retry|sleep)\b/i, "Profile save must not mask dismissal failures");
   assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile save must not use coordinate taps");
+  assert.equal(
+    (flow.match(/^\s+- swipe:\s*$/gm) ?? []).length,
+    exactProfileNumericInputs.length,
+    "Profile save must use exactly one forced swipe for each numeric iOS keyboard dismissal",
+  );
   for (const { label } of exactProfileTextInputs) {
     assert.equal(
       flow.split(exactProfileTextKeyboardDismissal(label)).length - 1,
@@ -3875,7 +3882,23 @@ pid=$(pidof_app)
     const exactDismissal = exactProfileNumericKeyboardDismissal(input);
     const enteredValueSelector = `^${escapeRegex(value)}$`;
     const otherEnteredValueSelector = `^${escapeRegex(otherInput.value)}$`;
+    const forcedSwipe = `      - swipe:
+          direction: DOWN`;
+    const valueScroll = `      - scrollUntilVisible:
+          element:
+            text: '${enteredValueSelector}'
+          direction: ${input.dismissDirection}`;
     const dismissalMutations = [
+      ["missing forced DOWN swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(`${forcedSwipe}\n`, ""))],
+      ["UP forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, forcedSwipe.replace("direction: DOWN", "direction: UP")))],
+      ["coordinate forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, `      - swipe:
+          start: "50%,75%"
+          end: "50%,25%"`))],
+      ["reordered forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(`${forcedSwipe}\n${valueScroll}`, `${valueScroll}\n${forcedSwipe}`))],
+      ["optional forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, `${forcedSwipe}\n        optional: true`))],
+      ["retried forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, `${forcedSwipe}\n        retry: 2`))],
+      ["sleep after forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(`${forcedSwipe}\n`, `${forcedSwipe}\n      - evalScript: "sleep(1000)"\n`))],
+      ["label tap instead of forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, `      - tapOn: "${label}"`))],
       ["iOS label tap dismissal", saveFlow.replace(exactDismissal, exactProfileTextKeyboardDismissal(label))],
       ["wrong entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(enteredValueSelector, otherEnteredValueSelector))],
       ["wrong dismissal direction", saveFlow.replace(exactDismissal, exactDismissal.replace(`direction: ${input.dismissDirection}`, "direction: DOWN"))],

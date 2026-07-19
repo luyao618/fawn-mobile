@@ -86,6 +86,8 @@ appId: com.luyao618.formobile
     when:
       platform: iOS
     commands:
+      - swipe:
+          direction: DOWN
       - scrollUntilVisible:
           element:
             text: '^3200$'
@@ -106,6 +108,8 @@ appId: com.luyao618.formobile
     when:
       platform: iOS
     commands:
+      - swipe:
+          direction: DOWN
       - scrollUntilVisible:
           element:
             text: '^50\.5$'
@@ -126,6 +130,8 @@ appId: com.luyao618.formobile
     when:
       platform: iOS
     commands:
+      - swipe:
+          direction: DOWN
       - scrollUntilVisible:
           element:
             text: '^34\.2$'
@@ -171,6 +177,8 @@ appId: com.luyao618.formobile
     when:
       platform: iOS
     commands:
+      - swipe:
+          direction: DOWN
       - scrollUntilVisible:
           element:
             text: '^36$'
