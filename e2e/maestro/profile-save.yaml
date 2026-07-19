@@ -91,7 +91,7 @@ appId: com.luyao618.formobile
       - scrollUntilVisible:
           element:
             text: '^3200$'
-          direction: UP
+          direction: DOWN
 - assertVisible: "3200"
 - scrollUntilVisible:
     element:
@@ -113,7 +113,7 @@ appId: com.luyao618.formobile
       - scrollUntilVisible:
           element:
             text: '^50\.5$'
-          direction: UP
+          direction: DOWN
 - assertVisible: "50.5"
 - scrollUntilVisible:
     element:
@@ -135,7 +135,7 @@ appId: com.luyao618.formobile
       - scrollUntilVisible:
           element:
             text: '^34\.2$'
-          direction: UP
+          direction: DOWN
 - assertVisible: "34.2"
 - scrollUntilVisible:
     element:
@@ -182,7 +182,7 @@ appId: com.luyao618.formobile
       - scrollUntilVisible:
           element:
             text: '^36$'
-          direction: UP
+          direction: DOWN
 - assertVisible: "36"
 - scrollUntilVisible:
     element:

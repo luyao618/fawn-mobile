@@ -3262,10 +3262,10 @@ const exactProfileTextInputs = [
 ] as const;
 
 const exactProfileNumericInputs = [
-  { label: "出生体重（克）", placeholder: "100–10000", value: "3200", dismissDirection: "UP" },
-  { label: "出生身长（厘米）", placeholder: "10–100", value: "50.5", dismissDirection: "UP" },
-  { label: "出生头围（厘米）", placeholder: "10–80", value: "34.2", dismissDirection: "UP" },
-  { label: "出生孕周（周）", placeholder: "20–45，可暂不填", value: "36", dismissDirection: "UP" },
+  { label: "出生体重（克）", placeholder: "100–10000", value: "3200", dismissDirection: "DOWN" },
+  { label: "出生身长（厘米）", placeholder: "10–100", value: "50.5", dismissDirection: "DOWN" },
+  { label: "出生头围（厘米）", placeholder: "10–80", value: "34.2", dismissDirection: "DOWN" },
+  { label: "出生孕周（周）", placeholder: "20–45，可暂不填", value: "36", dismissDirection: "DOWN" },
 ] as const;
 
 function escapeRegex(value: string): string {
@@ -3506,6 +3506,33 @@ ${exactProfileNumericKeyboardDismissal(input)}
   }
 }
 
+function exactProfileRestartNumericValueProof(value: string): string {
+  const selector = `^${escapeRegex(value)}$`;
+  return `- scrollUntilVisible:
+    element:
+      text: '${selector}'
+    direction: DOWN
+- assertVisible: '${selector}'`;
+}
+
+function assertProfileRestartNumericValueProof(flow: string): void {
+  const proofs = exactProfileNumericInputs.map(({ value }) => exactProfileRestartNumericValueProof(value));
+  ordered(flow, ...proofs);
+  for (const { label, value } of exactProfileNumericInputs) {
+    const selector = `^${escapeRegex(value)}$`;
+    assert.equal(
+      flow.split(exactProfileRestartNumericValueProof(value)).length - 1,
+      1,
+      `${label} restart proof must scroll DOWN to and assert the exact anchored value once`,
+    );
+    assert.equal(flow.split(selector).length - 1, 2, `${label} restart proof must use its anchored value only for scroll and assertion`);
+    assert.equal(flow.includes(`text: "${label}"`), false, `${label} must not be a restart scroll target`);
+    assert.equal(flow.includes(`assertVisible: "${value}"`), false, `${label} restart assertion must stay anchored`);
+  }
+  assert.doesNotMatch(flow, /\b(?:optional|retry|sleep)\b/i, "Profile restart numeric proof must not mask failures");
+  assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile restart numeric proof must not use coordinates");
+}
+
 const exactProfileSaveVisibilitySequence = `- tapOn: "保存宝宝资料"
 - scrollUntilVisible:
     element:
@@ -3595,10 +3622,11 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertProfileNameToBirthDateTransition(saveFlow);
   assertProfileRadioSelectionPolicy(saveFlow, restartFlow);
   assertProfileNumericInputTargeting(saveFlow);
+  assertProfileRestartNumericValueProof(restartFlow);
   assertProfileSaveVisibilityPolicy(saveFlow);
   assertProfileRestartFlowOrder(restartFlow);
   for (const flow of [saveFlow, restartFlow]) {
-    for (const value of ["G031LeapBaby", "2024-02-29", "3200", "50.5", "34.2", "36", "${AGE_DISPLAY}"]) assert.match(flow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    for (const value of ["G031LeapBaby", "2024-02-29", "${AGE_DISPLAY}"]) assert.match(flow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(flow, /baby-profile-sex-female-selected/);
     assert.match(flow, /baby-profile-prematurity-preterm-selected/);
   }
@@ -3901,13 +3929,40 @@ pid=$(pidof_app)
       ["label tap instead of forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, `      - tapOn: "${label}"`))],
       ["iOS label tap dismissal", saveFlow.replace(exactDismissal, exactProfileTextKeyboardDismissal(label))],
       ["wrong entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(enteredValueSelector, otherEnteredValueSelector))],
-      ["wrong dismissal direction", saveFlow.replace(exactDismissal, exactDismissal.replace(`direction: ${input.dismissDirection}`, "direction: DOWN"))],
+      ["wrong search direction", saveFlow.replace(exactDismissal, exactDismissal.replace(`direction: ${input.dismissDirection}`, "direction: UP"))],
       ["unanchored entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(enteredValueSelector, escapeRegex(value)))],
       ["missing iOS value-scroll dismissal", saveFlow.replace(exactDismissal, androidDismissal)],
     ] as const;
     for (const [mutationLabel, mutation] of dismissalMutations) {
       assert.notEqual(mutation, saveFlow, `${label} ${mutationLabel} mutation must change the flow`);
       assert.throws(() => assertProfileKeyboardDismissalPolicy(mutation), `${label} ${mutationLabel}`);
+    }
+  }
+
+  for (const [index, input] of exactProfileNumericInputs.entries()) {
+    const { label, value } = input;
+    const otherInput = exactProfileNumericInputs[(index + 1) % exactProfileNumericInputs.length]!;
+    const exactProof = exactProfileRestartNumericValueProof(value);
+    const selector = `^${escapeRegex(value)}$`;
+    const otherSelector = `^${escapeRegex(otherInput.value)}$`;
+    const scroll = `- scrollUntilVisible:
+    element:
+      text: '${selector}'
+    direction: DOWN`;
+    const restartMutations = [
+      ["label target", restartFlow.replace(exactProof, exactProof.replace(`text: '${selector}'`, `text: "${label}"`))],
+      ["unanchored value", restartFlow.replace(exactProof, exactProof.replaceAll(selector, escapeRegex(value)))],
+      ["mismatched assertion", restartFlow.replace(exactProof, exactProof.replace(`assertVisible: '${selector}'`, `assertVisible: '${otherSelector}'`))],
+      ["UP direction", restartFlow.replace(exactProof, exactProof.replace("direction: DOWN", "direction: UP"))],
+      ["missing scroll", restartFlow.replace(exactProof, `- assertVisible: '${selector}'`)],
+      ["optional fallback", restartFlow.replace(exactProof, exactProof.replace(scroll, `${scroll}\n    optional: true`))],
+      ["retry fallback", restartFlow.replace(exactProof, exactProof.replace(scroll, `${scroll}\n    retry: 2`))],
+      ["sleep fallback", restartFlow.replace(exactProof, exactProof.replace(`${scroll}\n`, `${scroll}\n- evalScript: "sleep(1000)"\n`))],
+      ["coordinate fallback", restartFlow.replace(exactProof, `${exactProof}\n- tapOn:\n    point: "50%,50%"`)],
+    ] as const;
+    for (const [mutationLabel, mutation] of restartMutations) {
+      assert.notEqual(mutation, restartFlow, `${label} restart ${mutationLabel} mutation must change the flow`);
+      assert.throws(() => assertProfileRestartNumericValueProof(mutation), `${label} restart ${mutationLabel}`);
     }
   }
 

@@ -32,19 +32,19 @@ appId: com.luyao618.formobile
     id: "baby-profile-sex-female-selected"
 - scrollUntilVisible:
     element:
-      text: "出生体重（克）"
+      text: '^3200$'
     direction: DOWN
-- assertVisible: "3200"
+- assertVisible: '^3200$'
 - scrollUntilVisible:
     element:
-      text: "出生身长（厘米）"
+      text: '^50\.5$'
     direction: DOWN
-- assertVisible: "50.5"
+- assertVisible: '^50\.5$'
 - scrollUntilVisible:
     element:
-      text: "出生头围（厘米）"
+      text: '^34\.2$'
     direction: DOWN
-- assertVisible: "34.2"
+- assertVisible: '^34\.2$'
 - scrollUntilVisible:
     element:
       id: "baby-profile-prematurity-preterm-selected"
@@ -53,6 +53,6 @@ appId: com.luyao618.formobile
     id: "baby-profile-prematurity-preterm-selected"
 - scrollUntilVisible:
     element:
-      text: "出生孕周（周）"
+      text: '^36$'
     direction: DOWN
-- assertVisible: "36"
+- assertVisible: '^36$'
