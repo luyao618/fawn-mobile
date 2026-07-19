@@ -146,7 +146,7 @@ function RadioGroup<T extends string | boolean | null>({
   disabled = false,
 }: {
   label: string;
-  options: readonly Readonly<{ value: T; label: string; accessibilityLabel: string }>[];
+  options: readonly Readonly<{ value: T; label: string; accessibilityLabel: string; testID: string }>[];
   selected: T;
   onSelect: (value: T) => void;
   error?: string;
@@ -166,6 +166,7 @@ function RadioGroup<T extends string | boolean | null>({
               disabled={disabled}
               key={option.accessibilityLabel}
               onPress={() => onSelect(option.value)}
+              testID={`${option.testID}-${checked ? "selected" : "unselected"}`}
               style={({ pressed }) => [
                 styles.radio,
                 checked ? styles.radioSelected : null,
@@ -434,9 +435,9 @@ export function BabyProfileScreen() {
               label="性别"
               onSelect={(value) => updateDraft("sex", value)}
               options={[
-                { value: null, label: "暂不填", accessibilityLabel: "性别暂不填" },
-                { value: "male", label: "男孩", accessibilityLabel: "性别男孩" },
-                { value: "female", label: "女孩", accessibilityLabel: "性别女孩" },
+                { value: null, label: "暂不填", accessibilityLabel: "性别暂不填", testID: "baby-profile-sex-unspecified" },
+                { value: "male", label: "男孩", accessibilityLabel: "性别男孩", testID: "baby-profile-sex-male" },
+                { value: "female", label: "女孩", accessibilityLabel: "性别女孩", testID: "baby-profile-sex-female" },
               ]}
               selected={draft.sex}
             />
@@ -475,8 +476,8 @@ export function BabyProfileScreen() {
               label="出生状态"
               onSelect={(value) => updateDraft("isPremature", value)}
               options={[
-                { value: false, label: "足月", accessibilityLabel: "足月" },
-                { value: true, label: "早产", accessibilityLabel: "早产" },
+                { value: false, label: "足月", accessibilityLabel: "足月", testID: "baby-profile-prematurity-term" },
+                { value: true, label: "早产", accessibilityLabel: "早产", testID: "baby-profile-prematurity-preterm" },
               ]}
               selected={draft.isPremature}
             />

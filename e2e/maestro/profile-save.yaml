@@ -54,22 +54,23 @@ appId: com.luyao618.formobile
     when:
       platform: Android
     commands:
-      - tapOn: "性别女孩"
+      - tapOn:
+          id: "baby-profile-sex-female-unselected"
 - runFlow:
     when:
       platform: iOS
     commands:
-      - tapOn: "性别女孩"
+      - tapOn:
+          id: "baby-profile-sex-female-unselected"
       - runFlow:
           when:
             visible:
-              text: "性别暂不填"
-              checked: true
+              id: "baby-profile-sex-unspecified-selected"
           commands:
-            - tapOn: "性别女孩"
+            - tapOn:
+                id: "baby-profile-sex-female-unselected"
 - assertVisible:
-    text: "性别女孩"
-    checked: true
+    id: "baby-profile-sex-female-selected"
 - scrollUntilVisible:
     element:
       text: "^100–10000$"
@@ -123,28 +124,29 @@ appId: com.luyao618.formobile
 - assertVisible: "34.2"
 - scrollUntilVisible:
     element:
-      text: "早产"
+      id: "baby-profile-prematurity-preterm-unselected"
     direction: DOWN
 - runFlow:
     when:
       platform: Android
     commands:
-      - tapOn: "早产"
+      - tapOn:
+          id: "baby-profile-prematurity-preterm-unselected"
 - runFlow:
     when:
       platform: iOS
     commands:
-      - tapOn: "早产"
+      - tapOn:
+          id: "baby-profile-prematurity-preterm-unselected"
       - runFlow:
           when:
             visible:
-              text: "足月"
-              checked: true
+              id: "baby-profile-prematurity-term-selected"
           commands:
-            - tapOn: "早产"
+            - tapOn:
+                id: "baby-profile-prematurity-preterm-unselected"
 - assertVisible:
-    text: "早产"
-    checked: true
+    id: "baby-profile-prematurity-preterm-selected"
 - scrollUntilVisible:
     element:
       text: "^20–45，可暂不填$"

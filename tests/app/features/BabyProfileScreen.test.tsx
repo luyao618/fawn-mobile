@@ -220,6 +220,26 @@ test("我的 requires an explicit prematurity choice before the first save", asy
   expect(save).not.toHaveBeenCalled();
 });
 
+test("我的 derives stable ASCII radio IDs from the current React selection state", async () => {
+  renderProfile(service());
+  await waitFor(() => expect(screen.getByLabelText("宝宝姓名")).toBeTruthy());
+
+  expect(screen.getByTestId("baby-profile-sex-unspecified-selected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-sex-male-unselected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-sex-female-unselected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-prematurity-term-unselected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-prematurity-preterm-unselected")).toBeTruthy();
+
+  fireEvent.press(screen.getByRole("radio", { name: "性别女孩" }));
+  fireEvent.press(screen.getByRole("radio", { name: "足月" }));
+
+  expect(screen.queryByTestId("baby-profile-sex-unspecified-selected")).toBeNull();
+  expect(screen.getByTestId("baby-profile-sex-unspecified-unselected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-sex-female-selected")).toBeTruthy();
+  expect(screen.queryByTestId("baby-profile-prematurity-term-unselected")).toBeNull();
+  expect(screen.getByTestId("baby-profile-prematurity-term-selected")).toBeTruthy();
+});
+
 test("我的 permits a partial first save after choosing 足月", async () => {
   const save = jest.fn(async () => termSnapshot);
   renderProfile(service({ save }));
@@ -255,6 +275,9 @@ test("我的 hydrates every persisted field including the prematurity boolean", 
   expect(screen.getByRole("radio", { name: "性别女孩" }).props.accessibilityState.checked).toBe(true);
   expect(screen.getByRole("radio", { name: "早产" }).props.accessibilityState.checked).toBe(true);
   expect(screen.getByRole("radio", { name: "足月" }).props.accessibilityState.checked).toBe(false);
+  expect(screen.getByTestId("baby-profile-sex-female-selected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-prematurity-preterm-selected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-prematurity-term-unselected")).toBeTruthy();
 });
 
 test("我的 saves canonical field values only after the service commits", async () => {

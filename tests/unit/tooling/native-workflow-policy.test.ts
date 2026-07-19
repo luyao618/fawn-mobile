@@ -3324,55 +3324,94 @@ ${exactProfileKeyboardDismissal(birthDate.label)}
 }
 
 const exactProfileRadioSelections = [
-  { target: "性别女孩", source: "性别暂不填" },
-  { target: "早产", source: "足月" },
+  {
+    targetLabel: "性别女孩",
+    targetID: "baby-profile-sex-female",
+    sourceLabel: "性别暂不填",
+    sourceID: "baby-profile-sex-unspecified",
+  },
+  {
+    targetLabel: "早产",
+    targetID: "baby-profile-prematurity-preterm",
+    sourceLabel: "足月",
+    sourceID: "baby-profile-prematurity-term",
+  },
 ] as const;
 
 type ProfileRadioSelection = {
-  readonly target: string;
-  readonly source: string;
+  readonly targetLabel: string;
+  readonly targetID: string;
+  readonly sourceLabel: string;
+  readonly sourceID: string;
 };
 
-function exactIosConditionalSecondProfileRadioTap({ target, source }: ProfileRadioSelection): string {
+function exactIosConditionalSecondProfileRadioTap({ targetID, sourceID }: ProfileRadioSelection): string {
   return `      - runFlow:
           when:
             visible:
-              text: "${source}"
-              checked: true
+              id: "${sourceID}-selected"
           commands:
-            - tapOn: "${target}"`;
+            - tapOn:
+                id: "${targetID}-unselected"`;
 }
 
 function exactProfileRadioSelection(selection: ProfileRadioSelection): string {
-  const { target } = selection;
+  const { targetID } = selection;
   return `- runFlow:
     when:
       platform: Android
     commands:
-      - tapOn: "${target}"
+      - tapOn:
+          id: "${targetID}-unselected"
 - runFlow:
     when:
       platform: iOS
     commands:
-      - tapOn: "${target}"
+      - tapOn:
+          id: "${targetID}-unselected"
 ${exactIosConditionalSecondProfileRadioTap(selection)}
 - assertVisible:
-    text: "${target}"
-    checked: true`;
+    id: "${targetID}-selected"`;
 }
 
-function assertProfileRadioSelectionPolicy(flow: string): void {
-  assert.doesNotMatch(flow, /retryTapIfNoChange|\b(?:optional|retry|sleep)\b/i, "Profile radio selection must not mask failures");
-  assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile radio selection must not use coordinates");
+function exactProfileRestartRadioAssertion({ targetID }: ProfileRadioSelection): string {
+  return `- assertVisible:
+    id: "${targetID}-selected"`;
+}
+
+function assertProfileRadioSelectionPolicy(saveFlow: string, restartFlow: string): void {
+  for (const flow of [saveFlow, restartFlow]) {
+    assert.doesNotMatch(flow, /retryTapIfNoChange|\b(?:optional|retry|sleep)\b/i, "Profile radio selection must not mask failures");
+    assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile radio selection must not use coordinates");
+    assert.doesNotMatch(flow, /\bchecked\s*:/, "Profile radio proof must use React-derived exact IDs instead of Maestro checked state");
+  }
   for (const selection of exactProfileRadioSelections) {
-    const { target, source } = selection;
+    const { targetID, targetLabel, sourceID } = selection;
     assert.equal(
-      flow.split(exactProfileRadioSelection(selection)).length - 1,
+      saveFlow.split(exactProfileRadioSelection(selection)).length - 1,
       1,
-      `${target} must use one exact Android tap and one exact iOS tap followed by one source-checked conditional second tap and a mandatory target assertion`,
+      `${targetLabel} must use one exact Android ID tap and one exact iOS ID tap followed by one source-selected conditional second tap and a target-selected ID assertion`,
     );
-    assert.equal(flow.split(`- tapOn: "${target}"`).length - 1, 3, `${target} must be tapped exactly once on Android and at most twice on iOS`);
-    assert.equal(flow.split(`text: "${source}"`).length - 1, 1, `${source} must be the unique source-state condition for ${target}`);
+    assert.equal(
+      (saveFlow.match(new RegExp(`- tapOn:\\n\\s+id: "${targetID}-unselected"`, "g")) ?? []).length,
+      3,
+      `${targetLabel} must use its exact unselected ID once on Android and at most twice on iOS`,
+    );
+    assert.equal(
+      saveFlow.split(`id: "${sourceID}-selected"`).length - 1,
+      1,
+      `${targetLabel} must use the exact source-selected ID once for the iOS second-tap condition`,
+    );
+    assert.equal(
+      saveFlow.split(`id: "${targetID}-selected"`).length - 1,
+      1,
+      `${targetLabel} save proof must assert its exact selected ID once`,
+    );
+    assert.equal(
+      restartFlow.split(exactProfileRestartRadioAssertion(selection)).length - 1,
+      1,
+      `${targetLabel} restart proof must assert its exact selected ID once`,
+    );
   }
 }
 
@@ -3487,14 +3526,14 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assertProfileTabNavigation(restartFlow, exactProfileSourceStates.restart);
   assertProfileKeyboardDismissalPolicy(saveFlow);
   assertProfileNameToBirthDateTransition(saveFlow);
-  assertProfileRadioSelectionPolicy(saveFlow);
+  assertProfileRadioSelectionPolicy(saveFlow, restartFlow);
   assertProfileNumericInputTargeting(saveFlow);
   assertProfileSaveVisibilityPolicy(saveFlow);
   assertProfileRestartFlowOrder(restartFlow);
   for (const flow of [saveFlow, restartFlow]) {
     for (const value of ["G031LeapBaby", "2024-02-29", "3200", "50.5", "34.2", "36", "${AGE_DISPLAY}"]) assert.match(flow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    assert.match(flow, /性别女孩/);
-    assert.match(flow, /早产/);
+    assert.match(flow, /baby-profile-sex-female-selected/);
+    assert.match(flow, /baby-profile-prematurity-preterm-selected/);
   }
   assert.match(saveFlow, /宝宝资料已保存/);
   assert.match(restartFlow, /assertNotVisible: "宝宝资料已保存"/);
@@ -3763,26 +3802,43 @@ pid=$(pidof_app)
     const otherSelection = exactProfileRadioSelections[1 - index]!;
     const exactSelection = exactProfileRadioSelection(selection);
     const conditionalSecondTap = exactIosConditionalSecondProfileRadioTap(selection);
-    const unconditionalSecondTap = `      - tapOn: "${selection.target}"`;
+    const unconditionalSecondTap = `      - tapOn:
+          id: "${selection.targetID}-unselected"`;
     const radioMutations = [
       ["missing conditional second tap", saveFlow.replace(`${conditionalSecondTap}\n`, "")],
       ["extra conditional second tap", saveFlow.replace(conditionalSecondTap, `${conditionalSecondTap}\n${conditionalSecondTap}`)],
       ["unconditional second tap", saveFlow.replace(conditionalSecondTap, unconditionalSecondTap)],
-      ["wrong source radio", saveFlow.replace(conditionalSecondTap, exactIosConditionalSecondProfileRadioTap({ ...selection, source: otherSelection.source }))],
-      ["wrong second-tap target", saveFlow.replace(conditionalSecondTap, exactIosConditionalSecondProfileRadioTap({ ...selection, target: otherSelection.target }))],
-      ["missing source checked state", saveFlow.replace(exactSelection, exactSelection.replace("              checked: true\n", ""))],
-      ["missing target checked state", saveFlow.replace(exactSelection, exactSelection.replace("    checked: true", ""))],
+      ["wrong source radio ID", saveFlow.replace(conditionalSecondTap, exactIosConditionalSecondProfileRadioTap({ ...selection, sourceID: otherSelection.sourceID }))],
+      ["wrong second-tap target ID", saveFlow.replace(conditionalSecondTap, exactIosConditionalSecondProfileRadioTap({ ...selection, targetID: otherSelection.targetID }))],
+      ["source unselected condition", saveFlow.replace(conditionalSecondTap, conditionalSecondTap.replace(`${selection.sourceID}-selected`, `${selection.sourceID}-unselected`))],
+      ["source text and checked fallback", saveFlow.replace(conditionalSecondTap, conditionalSecondTap.replace(`id: "${selection.sourceID}-selected"`, `text: "${selection.sourceLabel}"\n              checked: true`))],
+      ["target selected tap", saveFlow.replace(exactSelection, exactSelection.replace(`${selection.targetID}-unselected`, `${selection.targetID}-selected`))],
+      ["target unselected assertion", saveFlow.replace(exactSelection, exactSelection.replace(`${selection.targetID}-selected`, `${selection.targetID}-unselected`))],
+      ["text and checked fallback", saveFlow.replace(exactSelection, exactSelection.replace(`id: "${selection.targetID}-selected"`, `text: "${selection.targetLabel}"\n    checked: true`))],
       ["Android platform drift", saveFlow.replace(exactSelection, exactSelection.replace("platform: Android", "platform: iOS"))],
       ["iOS platform drift", saveFlow.replace(exactSelection, exactSelection.replace("platform: iOS", "platform: Android"))],
-      ["retryTapIfNoChange", saveFlow.replace(exactSelection, exactSelection.replace(`      - tapOn: "${selection.target}"`, `      - tapOn: "${selection.target}"\n        retryTapIfNoChange: true`))],
-      ["optional tap", `${saveFlow}\n- tapOn:\n    text: "${selection.target}"\n    optional: true\n`],
+      ["retryTapIfNoChange", saveFlow.replace(exactSelection, exactSelection.replace(`          id: "${selection.targetID}-unselected"`, `          id: "${selection.targetID}-unselected"\n        retryTapIfNoChange: true`))],
+      ["optional tap", `${saveFlow}\n- tapOn:\n    id: "${selection.targetID}-unselected"\n    optional: true\n`],
       ["coordinate tap", `${saveFlow}\n- tapOn:\n    point: "50%,50%"\n`],
       ["sleep", `${saveFlow}\n- evalScript: "sleep(1000)"\n`],
       ["broad retry", `${saveFlow}\n- retry: 2\n`],
     ] as const;
     for (const [label, mutation] of radioMutations) {
-      assert.notEqual(mutation, saveFlow, `${selection.target} ${label} mutation must change the flow`);
-      assert.throws(() => assertProfileRadioSelectionPolicy(mutation), `${selection.target} ${label}`);
+      assert.notEqual(mutation, saveFlow, `${selection.targetLabel} ${label} mutation must change the flow`);
+      assert.throws(() => assertProfileRadioSelectionPolicy(mutation, restartFlow), `${selection.targetLabel} ${label}`);
+    }
+
+    const restartAssertion = exactProfileRestartRadioAssertion(selection);
+    const restartMutations = [
+      ["missing restart ID assertion", restartFlow.replace(`${restartAssertion}\n`, "")],
+      ["duplicate restart ID assertion", restartFlow.replace(restartAssertion, `${restartAssertion}\n${restartAssertion}`)],
+      ["restart unselected assertion", restartFlow.replace(restartAssertion, restartAssertion.replace(`${selection.targetID}-selected`, `${selection.targetID}-unselected`))],
+      ["wrong restart radio ID", restartFlow.replace(restartAssertion, exactProfileRestartRadioAssertion({ ...selection, targetID: otherSelection.targetID }))],
+      ["restart text and checked fallback", restartFlow.replace(restartAssertion, `- assertVisible:\n    text: "${selection.targetLabel}"\n    checked: true`)],
+    ] as const;
+    for (const [label, mutation] of restartMutations) {
+      assert.notEqual(mutation, restartFlow, `${selection.targetLabel} ${label} mutation must change the flow`);
+      assert.throws(() => assertProfileRadioSelectionPolicy(saveFlow, mutation), `${selection.targetLabel} ${label}`);
     }
   }
 
