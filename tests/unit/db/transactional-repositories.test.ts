@@ -12,7 +12,18 @@ import { LocalJobRepository } from "../../../src/infrastructure/db/repositories/
 import { PendingTaskRepository } from "../../../src/infrastructure/db/repositories/pendingTaskRepository.ts";
 import { RepositoryConflictError } from "../../../src/infrastructure/db/repositories/conflicts.ts";
 import { TurnMessageRepository } from "../../../src/infrastructure/db/repositories/turnMessageRepository.ts";
+import { TrackerRepository } from "../../../src/infrastructure/db/repositories/trackerRepository.ts";
+import type {
+  TrackerCreateInputByDomain,
+  TrackerDomain,
+  TrackerUpdateInputByDomain,
+} from "../../../src/domain/tracker/types.ts";
 import { migratedTestDatabase } from "../../support/sqliteTestDatabase.ts";
+import {
+  loadManualTrackerFixture,
+  seedTrackerSourceMessage,
+  type ManualTrackerFixture,
+} from "../../support/trackerTestHarness.ts";
 
 const timestamp = "2026-07-16T01:00:00.000Z";
 const later = "2026-07-16T01:00:01.000Z";
@@ -257,8 +268,112 @@ test("pending tasks and jobs enforce legal transitions with idempotent terminal 
   );
 });
 
+function trackerCreateInput<D extends TrackerDomain>(
+  input: TrackerUpdateInputByDomain[D],
+  sourceMessageId: string,
+): TrackerCreateInputByDomain[D] {
+  return { ...input, sourceMessageId } as TrackerCreateInputByDomain[D];
+}
+
+async function proveTrackerRollback<D extends TrackerDomain>(
+  domain: D,
+  entry: ManualTrackerFixture["domains"][D],
+  fixture: ManualTrackerFixture,
+  transactions: ExpoSqliteExclusiveTransactionAdapter,
+  repository: TrackerRepository,
+): Promise<void> {
+  const rollbackId = `${entry.id}-create-rollback`;
+  await assert.rejects(transactions.runExclusive(async (transaction) => {
+    await repository.create(
+      transaction,
+      domain,
+      rollbackId,
+      trackerCreateInput(entry.create, fixture.sourceMessageId),
+      fixture.createdAt,
+    );
+    throw new Error(`${domain} create fault`);
+  }), new RegExp(`${domain} create fault`));
+  assert.equal(await transactions.runExclusive((transaction) => repository.getById(transaction, domain, rollbackId)), null);
+  await transactions.runExclusive((transaction) => repository.create(
+    transaction,
+    domain,
+    rollbackId,
+    trackerCreateInput(entry.create, fixture.sourceMessageId),
+    fixture.createdAt,
+  ));
+
+  const original = await transactions.runExclusive((transaction) => repository.create(
+    transaction,
+    domain,
+    entry.id,
+    trackerCreateInput(entry.create, fixture.sourceMessageId),
+    fixture.createdAt,
+  ));
+  await assert.rejects(transactions.runExclusive(async (transaction) => {
+    await repository.update(
+      transaction,
+      domain,
+      entry.id,
+      entry.update,
+      original.updatedAt,
+      fixture.updatedAt,
+    );
+    throw new Error(`${domain} update fault`);
+  }), new RegExp(`${domain} update fault`));
+  assert.deepEqual(
+    await transactions.runExclusive((transaction) => repository.getById(transaction, domain, entry.id)),
+    original,
+  );
+  const updated = await transactions.runExclusive((transaction) => repository.update(
+    transaction,
+    domain,
+    entry.id,
+    entry.update,
+    original.updatedAt,
+    fixture.updatedAt,
+  ));
+
+  await assert.rejects(transactions.runExclusive(async (transaction) => {
+    await repository.softDelete(
+      transaction,
+      domain,
+      entry.id,
+      updated.updatedAt,
+      fixture.deletedAt,
+    );
+    throw new Error(`${domain} delete fault`);
+  }), new RegExp(`${domain} delete fault`));
+  assert.deepEqual(
+    await transactions.runExclusive((transaction) => repository.getById(transaction, domain, entry.id)),
+    updated,
+  );
+  await transactions.runExclusive((transaction) => repository.softDelete(
+    transaction,
+    domain,
+    entry.id,
+    updated.updatedAt,
+    fixture.deletedAt,
+  ));
+  assert.equal(await transactions.runExclusive((transaction) => repository.getById(transaction, domain, entry.id)), null);
+}
+
+test("tracker create, update, and delete faults rollback for every domain before the next writer commits", async (context) => {
+  const database = await migratedTestDatabase();
+  context.after(() => database.closeAsync());
+  const fixture = await loadManualTrackerFixture();
+  await seedTrackerSourceMessage(database, fixture.sourceMessageId, fixture.createdAt);
+  const transactions = new ExpoSqliteExclusiveTransactionAdapter(database);
+  const repository = new TrackerRepository();
+
+  await proveTrackerRollback("growth", fixture.domains.growth, fixture, transactions, repository);
+  await proveTrackerRollback("feeding", fixture.domains.feeding, fixture, transactions, repository);
+  await proveTrackerRollback("sleep", fixture.domains.sleep, fixture, transactions, repository);
+  await proveTrackerRollback("diaper", fixture.domains.diaper, fixture, transactions, repository);
+  await proveTrackerRollback("health", fixture.domains.health, fixture, transactions, repository);
+});
+
 test("transaction repositories contain no transaction-control SQL and receive handles per call", () => {
-  for (const file of ["turnMessageRepository.ts", "pendingTaskRepository.ts", "localJobRepository.ts", "modelConfigRepository.ts", "babyProfileRepository.ts"]) {
+  for (const file of ["turnMessageRepository.ts", "pendingTaskRepository.ts", "localJobRepository.ts", "modelConfigRepository.ts", "babyProfileRepository.ts", "trackerRepository.ts"]) {
     const source = readFileSync(new URL(`../../../src/infrastructure/db/repositories/${file}`, import.meta.url), "utf8");
     assert.doesNotMatch(source, /\b(?:BEGIN|COMMIT|ROLLBACK)\b/i);
     assert.doesNotMatch(source, /private readonly (?:transaction|database|handle)/i);
