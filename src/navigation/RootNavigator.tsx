@@ -4,10 +4,13 @@ import { NavigationContainer, type Theme } from "@react-navigation/native";
 import { useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import type { ReadyAppServices } from "../application/bootstrap/appRuntime";
 import { type Bootstrap, BootstrapHost } from "../features/bootstrap/BootstrapHost";
 import { BabyProfileScreen } from "../features/profile/BabyProfileScreen";
 import { BabyProfileServiceProvider } from "../features/profile/BabyProfileServiceContext";
-import { AlbumScreen, GrowthScreen, RecordsScreen, StewardScreen } from "../features/shell/ShellScreens";
+import { AlbumScreen, GrowthScreen, StewardScreen } from "../features/shell/ShellScreens";
+import { ManualTrackerScreen } from "../features/tracker/ManualTrackerScreen";
+import { ManualTrackerServiceProvider } from "../features/tracker/ManualTrackerServiceContext";
 import { colors } from "../shared/theme/tokens";
 import { ROUTES, type RootTabParamList } from "./routeNames";
 
@@ -25,7 +28,7 @@ const navigationTheme: Theme = {
 
 const tabs: readonly { name: keyof RootTabParamList; label: string; icon: LucideIconName; component: React.ComponentType }[] = [
   { name: ROUTES.steward, label: "管家", icon: "message-circle", component: StewardScreen },
-  { name: ROUTES.records, label: "记录", icon: "clipboard-list", component: RecordsScreen },
+  { name: ROUTES.records, label: "记录", icon: "clipboard-list", component: ManualTrackerScreen },
   { name: ROUTES.growth, label: "成长", icon: "chart-line", component: GrowthScreen },
   { name: ROUTES.album, label: "相册", icon: "images", component: AlbumScreen },
   { name: ROUTES.me, label: "我的", icon: "circle-user-round", component: BabyProfileScreen },
@@ -40,7 +43,7 @@ export function getTabBarMetrics(fontScale: number, bottomInset: number) {
   } as const;
 }
 
-export function RootNavigator({ bootstrap }: { bootstrap: Bootstrap }) {
+export function RootNavigator({ bootstrap }: { bootstrap: Bootstrap<ReadyAppServices> }) {
   const { fontScale } = useWindowDimensions();
   const { bottom } = useSafeAreaInsets();
   const tabMetrics = getTabBarMetrics(fontScale, bottom);
@@ -83,7 +86,9 @@ export function RootNavigator({ bootstrap }: { bootstrap: Bootstrap }) {
     <BootstrapHost bootstrap={bootstrap}>
       {(services) => (
         <BabyProfileServiceProvider service={services.babyProfile}>
-          {navigation}
+          <ManualTrackerServiceProvider service={services.tracker}>
+            {navigation}
+          </ManualTrackerServiceProvider>
         </BabyProfileServiceProvider>
       )}
     </BootstrapHost>
