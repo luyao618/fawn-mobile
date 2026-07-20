@@ -2,38 +2,69 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type Rea
 import { Text, TextInput, View } from "react-native";
 import { useFocusEffect } from "@react-navigation/native";
 
-import type { TrackerDomain, TrackerRecordByDomain } from "../../domain/tracker/types";
+import type {
+  TrackerDeletion,
+  TrackerDomain,
+  TrackerRecordByDomain,
+  TrackerUpdateInputByDomain,
+} from "../../domain/tracker/types";
 import { normalizePersistedTrackerRecord, TrackerValidationError } from "../../domain/tracker/validation";
 import { colors, spacing } from "../../shared/theme/tokens";
 import { AppFrame } from "../../shared/ui/AppFrame";
 import { focusRefIfAvailable } from "./trackerAccessibility";
 import {
   createInitialDraft,
+  isDraftDirty,
+  isNormalizedUpdateNoop,
   parseDraftToCreateInput,
+  parseDraftToUpdateInput,
   recordToEditorDraft,
   type TrackerEditorDraftByDomain,
 } from "./trackerEditorModel";
 import { captureDeviceTimeZone } from "./trackerLocalTime";
 import { useManualTrackerService } from "./ManualTrackerServiceContext";
+import type {
+  TrackerDeleteSummary,
+  TrackerUpdateSummary,
+} from "../../application/tracker/manualTrackerService";
 import {
   type AnyEditorSnapshot,
   type AnyListFact,
+  type CorrelatedTrackerScreenAction,
   type CreateEditorSnapshot,
   type DomainAction,
   type DomainRows,
   type EditEditorSnapshot,
+  type EditorSnapshot,
   type ListFact,
   type GlobalTrackerScreenAction,
+  type MutationCompletion,
   type OperationOwner,
   type ReadOwner,
+  type ScreenTrackerDecision,
   type TrackerScreenAction,
   type TrackerScreenState,
   correlatedAction,
+  deleteConfirmationRequiredAction,
+  deleteConfirmedStartedAction,
+  deleteProbeStartedAction,
+  directCreateStartedAction,
+  mutationCompletedAction,
+  operationRefreshStartedAction,
   sameOperationOwner,
   sameReadOwner,
   stateDomain,
   trackerScreenReducer,
+  updateConfirmationRequiredAction,
+  updateConfirmedStartedAction,
+  updateProbeStartedAction,
 } from "./trackerScreenState";
+import {
+  createTrackerDecisionSnapshot,
+  InlineTrackerConfirmation,
+  type TrackerDeleteDecision,
+  type TrackerUpdateDecision,
+} from "./InlineTrackerConfirmation";
 import { TrackerDomainSwitcher, TRACKER_DOMAIN_LABELS } from "./TrackerDomainSwitcher";
 import {
   TrackerEditor,
@@ -49,6 +80,10 @@ const SAVE_FAILURE = "保存失败，本机记录没有更改。";
 
 type FocusField = keyof TrackerInputRefs | keyof TrackerGroupRefs;
 type LowRiskDomain = Exclude<TrackerDomain, "health">;
+type EditDecision = Extract<ScreenTrackerDecision, Readonly<{ kind: "update" | "delete" }>>;
+type UpdateDecision = Extract<ScreenTrackerDecision, Readonly<{ kind: "update" }>>;
+type DeleteDecision = Extract<ScreenTrackerDecision, Readonly<{ kind: "delete" }>>;
+type AnyMutationCompletion = MutationCompletion<TrackerDomain>;
 
 function freezeListFact<D extends TrackerDomain>(
   domain: D,
@@ -83,16 +118,23 @@ function stateListFact(state: TrackerScreenState): AnyListFact {
     case "list.error": return state.fact;
     case "create.editing":
     case "edit.editing": return state.editor.prior;
+    case "confirm.healthCreate":
+    case "confirm.update":
+    case "confirm.delete": return state.decision.prior.prior;
     case "edit.loading":
     case "edit.error": return state.prior;
     case "read.suspended": return state.request.prior;
     case "mutation.submitting": return state.prior.prior;
+    case "mutation.completed": return state.prior.prior;
   }
 }
 
 function stateEditor(state: TrackerScreenState): AnyEditorSnapshot | null {
   if (state.tag === "create.editing" || state.tag === "edit.editing") return state.editor;
   if (state.tag === "mutation.submitting") return state.prior;
+  if (state.tag === "confirm.healthCreate" || state.tag === "confirm.update" || state.tag === "confirm.delete") {
+    return state.decision.prior;
+  }
   return null;
 }
 
@@ -166,6 +208,224 @@ function validRecordForDomain<D extends TrackerDomain>(
   }
 }
 
+function ownerMatches<D extends TrackerDomain, K extends "create" | "update" | "delete">(
+  owner: OperationOwner,
+  domain: D,
+  kind: K,
+): owner is OperationOwner<D, K> {
+  return owner.domain === domain && owner.kind === kind;
+}
+
+function isCreateEditorForDomain<D extends TrackerDomain>(
+  editor: EditorSnapshot,
+  domain: D,
+): editor is CreateEditorSnapshot<D> {
+  return editor.mode === "create" && editor.domain === domain;
+}
+
+function isEditEditorForDomain<D extends TrackerDomain>(
+  editor: EditorSnapshot,
+  domain: D,
+): editor is EditEditorSnapshot<D> {
+  return editor.mode === "edit" && editor.domain === domain;
+}
+
+function isListFactForDomain<D extends TrackerDomain>(
+  fact: ListFact<TrackerDomain>,
+  domain: D,
+): fact is ListFact<D> {
+  return fact.domain === domain;
+}
+
+function isUpdateSummaryForDomain<D extends TrackerDomain>(
+  summary: TrackerUpdateSummary,
+  domain: D,
+): summary is TrackerUpdateSummary<D> {
+  return summary.domain === domain;
+}
+
+function isDeleteSummaryForDomain<D extends TrackerDomain>(
+  summary: TrackerDeleteSummary,
+  domain: D,
+): summary is TrackerDeleteSummary<D> {
+  return summary.domain === domain;
+}
+
+function isDeletionForDomain<D extends TrackerDomain>(
+  deletion: TrackerDeletion,
+  domain: D,
+): deletion is Omit<TrackerDeletion, "domain"> & Readonly<{ domain: D }> {
+  return deletion.domain === domain;
+}
+
+function directCreateAction(
+  owner: OperationOwner,
+  prior: EditorSnapshot,
+): CorrelatedTrackerScreenAction | null {
+  switch (prior.domain) {
+    case "growth": return ownerMatches(owner, "growth", "create") && isCreateEditorForDomain(prior, "growth") ? directCreateStartedAction(owner, prior) : null;
+    case "feeding": return ownerMatches(owner, "feeding", "create") && isCreateEditorForDomain(prior, "feeding") ? directCreateStartedAction(owner, prior) : null;
+    case "sleep": return ownerMatches(owner, "sleep", "create") && isCreateEditorForDomain(prior, "sleep") ? directCreateStartedAction(owner, prior) : null;
+    case "diaper": return ownerMatches(owner, "diaper", "create") && isCreateEditorForDomain(prior, "diaper") ? directCreateStartedAction(owner, prior) : null;
+    case "health": return null;
+  }
+}
+
+function editProbeAction(
+  owner: OperationOwner,
+  prior: EditorSnapshot,
+): CorrelatedTrackerScreenAction | null {
+  switch (prior.domain) {
+    case "growth":
+      if (!isEditEditorForDomain(prior, "growth")) return null;
+      return ownerMatches(owner, "growth", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "growth", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+    case "feeding":
+      if (!isEditEditorForDomain(prior, "feeding")) return null;
+      return ownerMatches(owner, "feeding", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "feeding", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+    case "sleep":
+      if (!isEditEditorForDomain(prior, "sleep")) return null;
+      return ownerMatches(owner, "sleep", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "sleep", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+    case "diaper":
+      if (!isEditEditorForDomain(prior, "diaper")) return null;
+      return ownerMatches(owner, "diaper", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "diaper", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+    case "health":
+      if (!isEditEditorForDomain(prior, "health")) return null;
+      return ownerMatches(owner, "health", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "health", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+  }
+}
+
+function updateDecisionSnapshot(
+  prior: EditorSnapshot,
+  summary: TrackerUpdateSummary,
+  initiatingControlRef: TrackerUpdateDecision<"growth", unknown>["initiatingControlRef"],
+): UpdateDecision | null {
+  const shared = { kind: "update" as const, initiatingControlRef, presentationTimeZone: prior.capturedZone };
+  switch (prior.domain) {
+    case "growth": return isEditEditorForDomain(prior, "growth") && isUpdateSummaryForDomain(summary, "growth") ? createTrackerDecisionSnapshot({ ...shared, domain: "growth", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "feeding": return isEditEditorForDomain(prior, "feeding") && isUpdateSummaryForDomain(summary, "feeding") ? createTrackerDecisionSnapshot({ ...shared, domain: "feeding", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "sleep": return isEditEditorForDomain(prior, "sleep") && isUpdateSummaryForDomain(summary, "sleep") ? createTrackerDecisionSnapshot({ ...shared, domain: "sleep", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "diaper": return isEditEditorForDomain(prior, "diaper") && isUpdateSummaryForDomain(summary, "diaper") ? createTrackerDecisionSnapshot({ ...shared, domain: "diaper", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "health": return isEditEditorForDomain(prior, "health") && isUpdateSummaryForDomain(summary, "health") ? createTrackerDecisionSnapshot({ ...shared, domain: "health", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+  }
+}
+
+function deleteDecisionSnapshot(
+  prior: EditorSnapshot,
+  summary: TrackerDeleteSummary,
+  initiatingControlRef: TrackerDeleteDecision<"growth", unknown>["initiatingControlRef"],
+): DeleteDecision | null {
+  const shared = { kind: "delete" as const, initiatingControlRef, presentationTimeZone: prior.capturedZone };
+  switch (prior.domain) {
+    case "growth": return isEditEditorForDomain(prior, "growth") && isDeleteSummaryForDomain(summary, "growth") ? createTrackerDecisionSnapshot({ ...shared, domain: "growth", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "feeding": return isEditEditorForDomain(prior, "feeding") && isDeleteSummaryForDomain(summary, "feeding") ? createTrackerDecisionSnapshot({ ...shared, domain: "feeding", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "sleep": return isEditEditorForDomain(prior, "sleep") && isDeleteSummaryForDomain(summary, "sleep") ? createTrackerDecisionSnapshot({ ...shared, domain: "sleep", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "diaper": return isEditEditorForDomain(prior, "diaper") && isDeleteSummaryForDomain(summary, "diaper") ? createTrackerDecisionSnapshot({ ...shared, domain: "diaper", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "health": return isEditEditorForDomain(prior, "health") && isDeleteSummaryForDomain(summary, "health") ? createTrackerDecisionSnapshot({ ...shared, domain: "health", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+  }
+}
+
+function editDecisionAction(
+  owner: OperationOwner,
+  decision: EditDecision,
+  phase: "confirmation" | "confirmed",
+): CorrelatedTrackerScreenAction | null {
+  if (decision.kind === "update") {
+    switch (decision.domain) {
+      case "growth": return ownerMatches(owner, "growth", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+      case "feeding": return ownerMatches(owner, "feeding", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+      case "sleep": return ownerMatches(owner, "sleep", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+      case "diaper": return ownerMatches(owner, "diaper", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+      case "health": return ownerMatches(owner, "health", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+    }
+  }
+  switch (decision.domain) {
+    case "growth": return ownerMatches(owner, "growth", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+    case "feeding": return ownerMatches(owner, "feeding", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+    case "sleep": return ownerMatches(owner, "sleep", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+    case "diaper": return ownerMatches(owner, "diaper", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+    case "health": return ownerMatches(owner, "health", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+  }
+}
+
+function completedAction(
+  owner: OperationOwner,
+  completion: AnyMutationCompletion,
+): CorrelatedTrackerScreenAction | null {
+  if (owner.kind !== completion.kind) return null;
+  if (completion.kind === "delete") {
+    const { deletion } = completion;
+    switch (deletion.domain) {
+      case "growth": return ownerMatches(owner, "growth", "delete") && isDeletionForDomain(deletion, "growth") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+      case "feeding": return ownerMatches(owner, "feeding", "delete") && isDeletionForDomain(deletion, "feeding") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+      case "sleep": return ownerMatches(owner, "sleep", "delete") && isDeletionForDomain(deletion, "sleep") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+      case "diaper": return ownerMatches(owner, "diaper", "delete") && isDeletionForDomain(deletion, "diaper") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+      case "health": return ownerMatches(owner, "health", "delete") && isDeletionForDomain(deletion, "health") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+    }
+  }
+  const { record } = completion;
+  switch (owner.domain) {
+    case "growth":
+      if (!validRecordForDomain("growth", record.id, record)) return null;
+      return ownerMatches(owner, "growth", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "growth", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+    case "feeding":
+      if (!validRecordForDomain("feeding", record.id, record)) return null;
+      return ownerMatches(owner, "feeding", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "feeding", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+    case "sleep":
+      if (!validRecordForDomain("sleep", record.id, record)) return null;
+      return ownerMatches(owner, "sleep", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "sleep", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+    case "diaper":
+      if (!validRecordForDomain("diaper", record.id, record)) return null;
+      return ownerMatches(owner, "diaper", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "diaper", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+    case "health":
+      if (!validRecordForDomain("health", record.id, record)) return null;
+      return ownerMatches(owner, "health", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "health", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+  }
+}
+
+function refreshStartedAction(
+  owner: OperationOwner,
+  prior: ListFact<TrackerDomain>,
+  success: string,
+): CorrelatedTrackerScreenAction | null {
+  switch (prior.domain) {
+    case "growth":
+      if (!isListFactForDomain(prior, "growth")) return null;
+      return ownerMatches(owner, "growth", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "growth", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "growth", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+    case "feeding":
+      if (!isListFactForDomain(prior, "feeding")) return null;
+      return ownerMatches(owner, "feeding", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "feeding", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "feeding", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+    case "sleep":
+      if (!isListFactForDomain(prior, "sleep")) return null;
+      return ownerMatches(owner, "sleep", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "sleep", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "sleep", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+    case "diaper":
+      if (!isListFactForDomain(prior, "diaper")) return null;
+      return ownerMatches(owner, "diaper", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "diaper", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "diaper", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+    case "health":
+      if (!isListFactForDomain(prior, "health")) return null;
+      return ownerMatches(owner, "health", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "health", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "health", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+  }
+}
+
 function serviceValidationFailure(error: TrackerValidationError): Readonly<{ field: string; message: string }> {
   const messages: Readonly<Record<string, string>> = Object.freeze({
     measurements: "体重、身长、头围请至少填写一项。",
@@ -198,6 +458,11 @@ export function ManualTrackerScreen() {
   const [listFocusRequest, setListFocusRequest] = useState(0);
   const consumedListFocusRef = useRef(0);
   const listHeadingRef = useRef<Text>(null);
+  const saveActionRef = useRef<View>(null);
+  const deleteActionRef = useRef<View>(null);
+  const decisionHeadingRef = useRef<Text>(null);
+  const decisionCancelRef = useRef<View>(null);
+  const decisionAcceptRef = useRef<View>(null);
 
   const inputRefObjects = useMemo(() => ({
     measurementDate: { current: null as TextInput | null },
@@ -306,6 +571,29 @@ export function ManualTrackerScreen() {
     return current.tag === "list.loading"
       && current.source === "mutation-refresh"
       && sameOperationOwner(current.owner, owner);
+  }, []);
+
+  const ownsOperation = useCallback((owner: OperationOwner): boolean => {
+    if (!mountedRef.current || owner.mountEpoch !== mountEpochRef.current) return false;
+    const current = stateRef.current;
+    return (current.tag === "mutation.submitting"
+      || current.tag === "confirm.healthCreate"
+      || current.tag === "confirm.update"
+      || current.tag === "confirm.delete")
+      && sameOperationOwner(current.owner, owner);
+  }, []);
+
+  const makeOperationOwner = useCallback(<D extends TrackerDomain, K extends "create" | "update" | "delete">(
+    domain: D,
+    kind: K,
+  ): OperationOwner<D, K> => {
+    operationIdRef.current += 1;
+    return Object.freeze({
+      mountEpoch: mountEpochRef.current,
+      operationId: operationIdRef.current,
+      domain,
+      kind,
+    });
   }, []);
 
   const runOrdinaryList = useCallback(<D extends TrackerDomain,>(
@@ -515,19 +803,25 @@ export function ManualTrackerScreen() {
     if (target !== undefined) setFocusRequest((previous) => ({ id: (previous?.id ?? 0) + 1, field: target }));
   }, []);
 
-  const startOperationRefresh = useCallback(<D extends LowRiskDomain,>(
-    owner: OperationOwner<D, "create">,
-    prior: ListFact<D>,
+  const startOperationRefresh = useCallback((
+    owner: OperationOwner,
+    prior: ListFact<TrackerDomain>,
+    completion: AnyMutationCompletion,
   ) => {
-    const success = `${TRACKER_DOMAIN_LABELS[owner.domain]}记录已保存`;
-    const next = Object.freeze({
-      tag: "list.loading" as const,
-      source: "mutation-refresh" as const,
-      owner,
-      prior,
-      success,
-    });
-    send({ type: "OPERATION_REFRESH_STARTED", owner, next });
+    const verb = owner.kind === "create" ? "已保存" : owner.kind === "update" ? "已更新" : "已删除";
+    const success = `${TRACKER_DOMAIN_LABELS[owner.domain]}记录${verb}`;
+    const refreshPrior = completion.kind === "delete"
+      ? freezeListFact(
+        owner.domain,
+        Object.freeze(prior.rows.filter((row) => row.id !== completion.deletion.id)),
+        prior.presentationZone,
+      )
+      : prior;
+    const completionAction = completedAction(owner, completion);
+    const refreshAction = refreshStartedAction(owner, refreshPrior, success);
+    if (completionAction === null || refreshAction === null) return;
+    send(completionAction);
+    send(refreshAction);
     setListFocusRequest((value) => value + 1);
     void service.list(owner.domain, 100).then(
       (rows) => {
@@ -539,7 +833,7 @@ export function ManualTrackerScreen() {
         send({
           type: "OPERATION_REFRESH_SUCCEEDED",
           owner,
-          fact: freezeListFact(owner.domain, rows, prior.presentationZone),
+          fact: freezeListFact(owner.domain, rows, refreshPrior.presentationZone),
         });
       },
       () => {
@@ -557,14 +851,10 @@ export function ManualTrackerScreen() {
       requestFieldFocus(parsed.field);
       return;
     }
-    operationIdRef.current += 1;
-    const owner: OperationOwner<D, "create"> = Object.freeze({
-      mountEpoch: mountEpochRef.current,
-      operationId: operationIdRef.current,
-      domain: prior.domain,
-      kind: "create",
-    });
-    send({ type: "MUTATION_STARTED", owner, prior });
+    const owner = makeOperationOwner(prior.domain, "create");
+    const started = directCreateAction(owner, prior);
+    if (started === null) return;
+    send(started);
     try {
       const result = await service.create(prior.domain, parsed.input);
       const current = stateRef.current;
@@ -578,7 +868,11 @@ export function ManualTrackerScreen() {
         send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
         return;
       }
-      startOperationRefresh(owner, prior.prior);
+      if (!validRecordForDomain(owner.domain, result.record.id, result.record)) {
+        send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+        return;
+      }
+      startOperationRefresh(owner, prior.prior, Object.freeze({ kind: "create", record: result.record }));
     } catch (error) {
       const current = stateRef.current;
       if (
@@ -595,19 +889,234 @@ export function ManualTrackerScreen() {
         send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
       }
     }
-  }, [requestFieldFocus, send, service, startOperationRefresh]);
+  }, [makeOperationOwner, requestFieldFocus, send, service, startOperationRefresh]);
+
+  const submitHealthCreate = useCallback(async (prior: CreateEditorSnapshot<"health">) => {
+    const zoneResult = captureDeviceTimeZone();
+    const parsed = parseDraftToCreateInput("health", prior.draft, zoneResult.status === "available" ? zoneResult.zone : "");
+    if (parsed.status !== "valid") {
+      send({ type: "VALIDATION_FAILED", field: parsed.field, message: parsed.error });
+      requestFieldFocus(parsed.field);
+      return;
+    }
+    const owner = makeOperationOwner("health", "create");
+    send({ type: "MUTATION_STARTED", owner, prior, phase: "probe" });
+    try {
+      const result = await service.create("health", parsed.input);
+      if (!ownsOperation(owner)) return;
+      if (result.status !== "confirmation_required") {
+        send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+        return;
+      }
+      const decision = createTrackerDecisionSnapshot({
+        kind: "healthCreate",
+        domain: "health",
+        prior,
+        initiatingControlRef: saveActionRef,
+        serviceSummary: result.summary,
+        presentationTimeZone: prior.capturedZone,
+      });
+      send({
+        type: "CONFIRMATION_REQUIRED",
+        owner,
+        next: Object.freeze({ tag: "confirm.healthCreate", owner, decision }),
+      });
+    } catch (error) {
+      if (!ownsOperation(owner)) return;
+      if (error instanceof TrackerValidationError) {
+        const failure = serviceValidationFailure(error);
+        send({ type: "MUTATION_REJECTED", owner, field: failure.field, message: failure.message });
+        requestFieldFocus(failure.field);
+      } else send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+    }
+  }, [makeOperationOwner, ownsOperation, requestFieldFocus, send, service]);
+
+  const normalizedEditor = useCallback(<D extends TrackerDomain>(
+    prior: EditEditorSnapshot<D>,
+    input: TrackerUpdateInputByDomain[D],
+  ): EditEditorSnapshot<D> | null => {
+    const normalizedRecord = Object.freeze({ ...prior.baseline, ...input }) as TrackerRecordByDomain[D];
+    const built = recordToEditorDraft(prior.domain, normalizedRecord, prior.capturedZone);
+    return built.status === "ready"
+      ? editSnapshot(prior.domain, built.draft, prior.baseline, prior.capturedZone, prior.prior)
+      : null;
+  }, []);
+
+  const submitUpdate = useCallback(async <D extends TrackerDomain>(prior: EditEditorSnapshot<D>) => {
+    if (!isDraftDirty(prior.domain, prior.draft, prior.initialDraft)) {
+      send({ type: "NORMALIZED_NOOP", owner: makeOperationOwner(prior.domain, "update"), editor: prior });
+      return;
+    }
+    const zoneResult = captureDeviceTimeZone();
+    const parsed = parseDraftToUpdateInput(
+      prior.domain,
+      prior.draft,
+      prior.baseline,
+      zoneResult.status === "available" ? zoneResult.zone : "",
+    );
+    if (parsed.status !== "valid") {
+      send({ type: "VALIDATION_FAILED", field: parsed.field, message: parsed.error });
+      requestFieldFocus(parsed.field);
+      return;
+    }
+    const owner = makeOperationOwner(prior.domain, "update");
+    const started = editProbeAction(owner, prior);
+    if (started === null) return;
+    send(started);
+    try {
+      const result = await service.update(prior.domain, prior.baseline.id, parsed.input, prior.baseline.updatedAt);
+      if (!ownsOperation(owner)) return;
+      if (result.status !== "confirmation_required") {
+        send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+        return;
+      }
+      if (isNormalizedUpdateNoop(prior.domain, prior.baseline, result.summary.input)) {
+        const editor = normalizedEditor(prior, result.summary.input);
+        if (editor === null) send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+        else send({ type: "NORMALIZED_NOOP", owner, editor });
+        return;
+      }
+      const decision = updateDecisionSnapshot(prior, result.summary, saveActionRef);
+      const confirmation = decision === null ? null : editDecisionAction(owner, decision, "confirmation");
+      if (confirmation === null) {
+        send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+        return;
+      }
+      send(confirmation);
+    } catch (error) {
+      if (!ownsOperation(owner)) return;
+      if (error instanceof TrackerValidationError) {
+        const failure = serviceValidationFailure(error);
+        send({ type: "MUTATION_REJECTED", owner, field: failure.field, message: failure.message });
+        requestFieldFocus(failure.field);
+      } else send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+    }
+  }, [makeOperationOwner, normalizedEditor, ownsOperation, requestFieldFocus, send, service]);
+
+  const requestDelete = useCallback(async <D extends TrackerDomain>(prior: EditEditorSnapshot<D>) => {
+    const owner = makeOperationOwner(prior.domain, "delete");
+    const started = editProbeAction(owner, prior);
+    if (started === null) return;
+    send(started);
+    try {
+      const result = await service.delete(prior.domain, prior.baseline.id, prior.baseline.updatedAt);
+      if (!ownsOperation(owner)) return;
+      if (result.status !== "confirmation_required") {
+        send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+        return;
+      }
+      const decision = deleteDecisionSnapshot(prior, result.summary, deleteActionRef);
+      const confirmation = decision === null ? null : editDecisionAction(owner, decision, "confirmation");
+      if (confirmation === null) {
+        send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+        return;
+      }
+      send(confirmation);
+    } catch {
+      if (ownsOperation(owner)) send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+    }
+  }, [makeOperationOwner, ownsOperation, send, service]);
 
   const save = useCallback(() => {
     const current = stateRef.current;
-    if (current.tag !== "create.editing") return;
-    switch (current.editor.domain) {
-      case "growth": void submitLowRiskCreate(current.editor); break;
-      case "feeding": void submitLowRiskCreate(current.editor); break;
-      case "sleep": void submitLowRiskCreate(current.editor); break;
-      case "diaper": void submitLowRiskCreate(current.editor); break;
-      case "health": send({ type: "VALIDATION_FAILED", field: "form", message: SAVE_FAILURE }); break;
+    if (current.tag === "create.editing") {
+      switch (current.editor.domain) {
+        case "growth": void submitLowRiskCreate(current.editor); break;
+        case "feeding": void submitLowRiskCreate(current.editor); break;
+        case "sleep": void submitLowRiskCreate(current.editor); break;
+        case "diaper": void submitLowRiskCreate(current.editor); break;
+        case "health": void submitHealthCreate(current.editor); break;
+      }
+    } else if (current.tag === "edit.editing") {
+      switch (current.editor.domain) {
+        case "growth": void submitUpdate(current.editor); break;
+        case "feeding": void submitUpdate(current.editor); break;
+        case "sleep": void submitUpdate(current.editor); break;
+        case "diaper": void submitUpdate(current.editor); break;
+        case "health": void submitUpdate(current.editor); break;
+      }
     }
-  }, [send, submitLowRiskCreate]);
+  }, [submitHealthCreate, submitLowRiskCreate, submitUpdate]);
+
+  const deleteRecord = useCallback(() => {
+    const current = stateRef.current;
+    if (current.tag !== "edit.editing") return;
+    switch (current.editor.domain) {
+      case "growth": void requestDelete(current.editor); break;
+      case "feeding": void requestDelete(current.editor); break;
+      case "sleep": void requestDelete(current.editor); break;
+      case "diaper": void requestDelete(current.editor); break;
+      case "health": void requestDelete(current.editor); break;
+    }
+  }, [requestDelete]);
+
+  const cancelDecision = useCallback((decision: ScreenTrackerDecision) => {
+    send({ type: "CONFIRMATION_CANCELLED", decision });
+  }, [send]);
+
+  const acceptDecision = useCallback(async (decision: ScreenTrackerDecision) => {
+    const current = stateRef.current;
+    if (current.tag !== "confirm.healthCreate" && current.tag !== "confirm.update" && current.tag !== "confirm.delete") return;
+    if (current.decision !== decision) return;
+    if (current.tag === "confirm.healthCreate" && decision.kind === "healthCreate") {
+      const owner = current.owner;
+      send({ type: "MUTATION_STARTED", owner, prior: decision.prior, phase: "confirmed", decision });
+      try {
+        const summary = decision.serviceSummary;
+        const result = await service.create(summary.domain, summary.input, "confirmed");
+        if (!ownsOperation(owner)) return;
+        if (result.status !== "completed" || !validRecordForDomain("health", result.record.id, result.record)) {
+          send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+          return;
+        }
+        startOperationRefresh(owner, decision.prior.prior, Object.freeze({ kind: "create", record: result.record }));
+      } catch {
+        if (ownsOperation(owner)) send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+      }
+      return;
+    }
+    if (current.tag === "confirm.update" && decision.kind === "update" && current.decision === decision) {
+      const owner = current.owner;
+      const started = editDecisionAction(owner, decision, "confirmed");
+      if (started === null) return;
+      send(started);
+      try {
+        const summary = decision.serviceSummary;
+        const result = await service.update(summary.domain, summary.id, summary.input, summary.expectedUpdatedAt, "confirmed");
+        if (!ownsOperation(owner)) return;
+        if (result.status !== "completed" || !validRecordForDomain(summary.domain, summary.id, result.record)) {
+          send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+          return;
+        }
+        startOperationRefresh(owner, decision.prior.prior, Object.freeze({ kind: "update", record: result.record }));
+      } catch {
+        if (ownsOperation(owner)) send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+      }
+      return;
+    }
+    if (current.tag === "confirm.delete" && decision.kind === "delete" && current.decision === decision) {
+      const owner = current.owner;
+      const started = editDecisionAction(owner, decision, "confirmed");
+      if (started === null) return;
+      send(started);
+      try {
+        const summary = decision.serviceSummary;
+        const result = await service.delete(summary.domain, summary.id, summary.expectedUpdatedAt, "confirmed");
+        if (!ownsOperation(owner)) return;
+        if (
+          result.status !== "completed"
+          || result.deletion.domain !== summary.domain
+          || result.deletion.id !== summary.id
+        ) {
+          send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+          return;
+        }
+        startOperationRefresh(owner, decision.prior.prior, Object.freeze({ kind: "delete", deletion: result.deletion }));
+      } catch {
+        if (ownsOperation(owner)) send({ type: "MUTATION_REJECTED", owner, message: SAVE_FAILURE });
+      }
+    }
+  }, [ownsOperation, send, service, startOperationRefresh]);
 
   const renderList = useCallback((fact: AnyListFact, busy: boolean): ReactNode => {
     const shared = { busy, headingRef: listHeadingRef, onCreate: requestCreate };
@@ -627,29 +1136,35 @@ export function ManualTrackerScreen() {
       groupRefs,
       inputRefs,
       onBack: returnToList,
+      saveRef: saveActionRef,
     };
     switch (editor.domain) {
       case "growth": return editor.mode === "create"
         ? <TrackerEditor {...shared} domain="growth" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "growth", draft })} onSave={save} />
-        : <TrackerEditor {...shared} domain="growth" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "growth", draft })} onDelete={() => undefined} onSave={() => undefined} />;
+        : <TrackerEditor {...shared} domain="growth" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "growth", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
       case "feeding": return editor.mode === "create"
         ? <TrackerEditor {...shared} domain="feeding" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "feeding", draft })} onSave={save} />
-        : <TrackerEditor {...shared} domain="feeding" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "feeding", draft })} onDelete={() => undefined} onSave={() => undefined} />;
+        : <TrackerEditor {...shared} domain="feeding" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "feeding", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
       case "sleep": return editor.mode === "create"
         ? <TrackerEditor {...shared} domain="sleep" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "sleep", draft })} onSave={save} />
-        : <TrackerEditor {...shared} domain="sleep" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "sleep", draft })} onDelete={() => undefined} onSave={() => undefined} />;
+        : <TrackerEditor {...shared} domain="sleep" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "sleep", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
       case "diaper": return editor.mode === "create"
         ? <TrackerEditor {...shared} domain="diaper" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "diaper", draft })} onSave={save} />
-        : <TrackerEditor {...shared} domain="diaper" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "diaper", draft })} onDelete={() => undefined} onSave={() => undefined} />;
+        : <TrackerEditor {...shared} domain="diaper" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "diaper", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
       case "health": return editor.mode === "create"
         ? <TrackerEditor {...shared} domain="health" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "health", draft })} onSave={save} />
-        : <TrackerEditor {...shared} domain="health" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "health", draft })} onDelete={() => undefined} onSave={() => undefined} />;
+        : <TrackerEditor {...shared} domain="health" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "health", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
     }
-  }, [groupRefs, inputRefs, returnToList, save, send]);
+  }, [deleteRecord, groupRefs, inputRefs, returnToList, save, send]);
 
   const selectedDomain = stateDomain(state);
   const label = TRACKER_DOMAIN_LABELS[selectedDomain];
   const editing = stateEditor(state);
+  const activeDecision = state.tag === "confirm.healthCreate"
+    || state.tag === "confirm.update"
+    || state.tag === "confirm.delete"
+    ? state.decision
+    : state.tag === "mutation.submitting" && "decision" in state ? state.decision ?? null : null;
   let content: ReactNode;
 
   if (state.tag === "list.loading") {
@@ -679,7 +1194,7 @@ export function ManualTrackerScreen() {
         {state.kind === "refresh" && state.fact.rows.length > 0
           ? renderList(state.fact, false)
           : <Text accessibilityRole="header" allowFontScaling ref={listHeadingRef}>{label}记录</Text>}
-        {state.success ? <Text accessibilityLiveRegion="polite" allowFontScaling>{state.success}</Text> : null}
+        {state.kind === "refresh" ? <Text accessibilityLiveRegion="polite" allowFontScaling>{state.success}</Text> : null}
         <Text accessibilityLiveRegion="assertive" accessibilityRole="alert" allowFontScaling>
           {state.kind === "refresh" ? "记录可能不是最新内容。" : `暂时无法读取${label}记录。本机数据没有更改。`}
         </Text>
@@ -705,10 +1220,24 @@ export function ManualTrackerScreen() {
         <SecondaryAction label={`返回${label}列表`} onPress={returnToList} />
       </View>
     );
+  } else if (activeDecision !== null) {
+    content = (
+      <InlineTrackerConfirmation
+        acceptActionRef={decisionAcceptRef}
+        busy={state.tag === "mutation.submitting"}
+        cancelActionRef={decisionCancelRef}
+        decision={activeDecision}
+        headingRef={decisionHeadingRef}
+        onAccept={acceptDecision}
+        onCancel={cancelDecision}
+      />
+    );
   } else if (editing !== null) {
+    const notice = (state.tag === "create.editing" || state.tag === "edit.editing") ? state.notice : undefined;
     content = (
       <View style={{ gap: spacing.md }}>
         <TrackerDomainSwitcher busy={state.tag === "mutation.submitting"} onSelectDomain={selectDomain} selectedDomain={selectedDomain} />
+        {notice ? <Text accessibilityLiveRegion="polite" allowFontScaling>{notice}</Text> : null}
         {renderEditor(editing, state.tag === "mutation.submitting")}
       </View>
     );
