@@ -650,7 +650,7 @@ const exactSmokeFlow = `appId: com.luyao618.formobile
 - launchApp
 - assertVisible: "照护空间尚未设置"
 - tapOn: "记录"
-- assertVisible: "还没有照护记录"
+- assertVisible: "生长记录"
 - tapOn: "成长"
 - assertVisible: "还没有可展示的成长数据"
 - tapOn: "相册"
