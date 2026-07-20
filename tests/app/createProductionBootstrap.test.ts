@@ -19,7 +19,7 @@ function database(closeAsync: () => Promise<void>) {
     async withExclusiveTransactionAsync(operation: (transaction: unknown) => Promise<void>) {
       await operation({
         async getAllAsync(source: string) {
-          return source.includes("baby_profile") ? [] : [{ total: 0 }];
+          return source.includes("baby_profile") || source.includes("_records") ? [] : [{ total: 0 }];
         },
         async runAsync() { return { changes: 0, lastInsertRowId: 0 }; },
       });
@@ -56,7 +56,7 @@ test("production bootstrap does not classify an arbitrary marked-looking aggrega
   expect(isCleanupFailure(cleanupFailure([generic], "real cleanup"))).toBe(true);
 });
 
-test("production bootstrap exposes profile services only on its ready runtime and closes their lifetime", async () => {
+test("production bootstrap exposes profile and tracker services only on its ready runtime and closes their lifetime", async () => {
   const closeAsync = jest.fn(async () => {});
   mockOpenConfiguredDatabase.mockResolvedValue(database(closeAsync));
   const bootstrap = createProductionBootstrap();
@@ -66,10 +66,41 @@ test("production bootstrap exposes profile services only on its ready runtime an
     profile: null,
     exactAge: expect.objectContaining({ status: "unknown", reason: "birth_date_missing" }),
   });
+  const tracker = runtime.services.tracker;
+  await expect(tracker.list("feeding", 10)).resolves.toEqual([]);
+  await expect(tracker.create("health", {
+    recordDate: "2026-07-20",
+    recordType: "checkup",
+    title: "Synthetic checkup",
+    description: null,
+    sourceMessageId: null,
+  })).resolves.toEqual(expect.objectContaining({ status: "confirmation_required" }));
   const first = runtime.close();
   const second = runtime.close();
   expect(first).toBe(second);
   await expect(runtime.services.babyProfile.load()).rejects.toBeInstanceOf(RuntimeClosingError);
+  await expect(tracker.getById("feeding", "feeding-1")).rejects.toBeInstanceOf(RuntimeClosingError);
+  await expect(tracker.list("feeding", 10)).rejects.toBeInstanceOf(RuntimeClosingError);
+  await expect(tracker.create("feeding", {
+    feedTime: "2026-07-20T01:00:00.000Z",
+    feedType: "formula",
+    amountMl: 90,
+    durationMin: null,
+    notes: null,
+    sourceMessageId: null,
+  })).rejects.toBeInstanceOf(RuntimeClosingError);
+  await expect(tracker.update("feeding", "feeding-1", {
+    feedTime: "2026-07-20T01:00:00.000Z",
+    feedType: "formula",
+    amountMl: 100,
+    durationMin: null,
+    notes: null,
+  }, "2026-07-20T01:00:00.000Z")).rejects.toBeInstanceOf(RuntimeClosingError);
+  await expect(tracker.delete(
+    "feeding",
+    "feeding-1",
+    "2026-07-20T01:00:00.000Z",
+  )).rejects.toBeInstanceOf(RuntimeClosingError);
   await first;
   expect(closeAsync).toHaveBeenCalledTimes(1);
 });

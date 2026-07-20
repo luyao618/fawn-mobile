@@ -1,8 +1,13 @@
 import type { ExclusiveTransactionPort } from "../data/ExclusiveTransactionPort.ts";
 import type { BabyProfileServicePort } from "../profile/babyProfileService.ts";
+import type { ManualTrackerServicePort } from "../tracker/manualTrackerService.ts";
 
 export interface AppServices {
   readonly babyProfile: BabyProfileServicePort;
+}
+
+export interface ReadyAppServices extends AppServices {
+  readonly tracker: ManualTrackerServicePort;
 }
 
 export interface RuntimeOperationPort {
