@@ -96,9 +96,16 @@ jobs:
           xcodebuild -workspace ios/ForMobile.xcworkspace -scheme ForMobile -configuration Debug -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_udid" -derivedDataPath /tmp/g018-ios-e2e CODE_SIGNING_ALLOWED=NO build
           app_path=$(find /tmp/g018-ios-e2e/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' -print -quit)
           test -n "$app_path"
+          xcodebuild -workspace ios/ForMobile.xcworkspace -scheme ForMobile -configuration Release -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_udid" -derivedDataPath /tmp/g031-ios-e2e-release CODE_SIGNING_ALLOWED=NO build
+          release_app_path=$(find /tmp/g031-ios-e2e-release/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$release_app_path"
+          test -x "$release_app_path/ForMobile"
+          test -s "$release_app_path/main.jsbundle"
           xcrun simctl install "$simulator_udid" "$app_path"
+          set -m
           CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &
           metro_pid=$!
+          set +m
           cleanup() {
             status=$?
             trap - EXIT
@@ -107,7 +114,10 @@ jobs:
               xcrun simctl io "$simulator_udid" screenshot .artifacts/launch/simulator/ios-failure.png
               xcrun simctl spawn "$simulator_udid" log show --style compact --last 15m --predicate 'process == "ForMobile" OR process == "SpringBoard"' > .artifacts/launch/simulator/ios-simulator-app.log 2>&1
             fi
-            kill "$metro_pid" 2>/dev/null
+            if [ -n "$metro_pid" ]; then
+              kill -- "-$metro_pid" 2>/dev/null
+              wait "$metro_pid" 2>/dev/null
+            fi
             cat /tmp/metro.log
             exit "$status"
           }
@@ -124,6 +134,18 @@ jobs:
           maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-smoke e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log
           mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log
           bash scripts/e2e/run-persistence-ios.sh "$simulator_udid" "${{ inputs.expected_sha }}"
+          kill -- "-$metro_pid"
+          set +e
+          wait "$metro_pid"
+          metro_status=$?
+          set -e
+          test "$metro_status" -eq 0 -o "$metro_status" -eq 143
+          metro_pid=
+          if curl --silent --fail http://127.0.0.1:8081/status >/dev/null; then
+            echo "Metro remained reachable after teardown" >&2
+            exit 1
+          fi
+          bash scripts/e2e/run-profile-restart-ios.sh "$simulator_udid" "${{ inputs.expected_sha }}" "$release_app_path"
       - name: Collect same-SHA evidence
         run: |
           node tools/collect-ci-evidence.mjs \
@@ -134,6 +156,7 @@ jobs:
             --scheme-report-production .artifacts/schemes/ios-production.json \
             --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
             --persistence-report .artifacts/ios-persistence.json \
+            --profile-restart-report .artifacts/ios-profile-restart.json \
             --output .artifacts/ios-e2e.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -146,6 +169,7 @@ jobs:
             .artifacts/launch/ios-dev-client.log
             .artifacts/test-results/ios-maestro.log
             .artifacts/ios-persistence.json
+            .artifacts/ios-profile-restart.json
             .artifacts/persistence/ios/*.json
           if-no-files-found: error
       - name: Retain Ios launch and Maestro diagnostics

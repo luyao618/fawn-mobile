@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
   assertCleanTrackedStatus,
+  CI_EVIDENCE_SCHEMA_VERSION,
   CLEAN_REPOSITORY_STATUS_ARGS,
   collectFaultBundleEvidence,
+  collectProfileRestartEvidence,
+  collectProfilePrivacyProof,
   validateNativeReports,
+  validateProfileRestartReport,
   validateTestResultInput,
   validatePersistenceReport,
 } from "../../../tools/collect-ci-evidence.mjs";
@@ -187,6 +191,16 @@ test("schema-v4 fault bundle collector preserves established sentinel leaves exa
   }
 });
 
+test("schema-v5 aggregate binds profile restart only through its validated report leaf", () => {
+  assert.equal(CI_EVIDENCE_SCHEMA_VERSION, 5);
+  assert.deepEqual(collectProfileRestartEvidence(".artifacts/android-profile-restart.json", "a".repeat(64)), {
+    path: ".artifacts/android-profile-restart.json",
+    sha256: "a".repeat(64),
+  });
+  assert.throws(() => collectProfileRestartEvidence("", "a".repeat(64)), /path/);
+  assert.throws(() => collectProfileRestartEvidence("profile.json", "not-a-hash"), /SHA/);
+});
+
 function poisonSnapshot() {
   const column = (cid: number, name: string, notnull = 0, pk = 0) => ({ cid, name, type: "TEXT", notnull, dflt_value: null, pk });
   return {
@@ -264,5 +278,104 @@ test("native persistence evidence requires exact nested same-SHA startup facts",
     const hostile = structuredClone(report);
     mutate(hostile);
     assert.throws(() => validatePersistenceReport(hostile, "android", sha, migrationSha));
+  }
+});
+
+async function profileReport(platform: "android" | "ios") {
+  const valueSha256 = "6bfb59d6996bf798923420d4ffb334430f3b1c6cd0c87988d29e353c06a7f6db";
+  const row = {
+    singleton_id: 1, name: "G031LeapBaby", sex: "female", birth_date: "2024-02-29",
+    birth_weight_g: 3200, birth_height_cm: 50.5, birth_head_cm: 34.2, is_premature: 1,
+    gestational_weeks: 36, created_at: "2026-07-18T01:02:03.000Z", updated_at: "2026-07-18T01:02:03.000Z",
+  };
+  const rowSha256 = hash(JSON.stringify(row));
+  const savePath = "e2e/maestro/profile-save.yaml";
+  const restartPath = "e2e/maestro/profile-restart.yaml";
+  const binary = platform === "android"
+    ? {
+        kind: "apk",
+        embeddedJsBundle: true,
+        localBeforeSha256: "1".repeat(64), installedBeforeSha256: "1".repeat(64),
+        localAfterSha256: "1".repeat(64), installedAfterSha256: "1".repeat(64),
+      }
+    : {
+        kind: "ios-app",
+        embeddedJsBundle: true,
+        before: { executableSha256: "1".repeat(64), mainJsBundleSha256: "2".repeat(64), infoPlistSha256: "3".repeat(64) },
+        after: { executableSha256: "1".repeat(64), mainJsBundleSha256: "2".repeat(64), infoPlistSha256: "3".repeat(64) },
+      };
+  const populated = { babyProfileCount: 1, modelConfigCount: 0, modelCapabilitiesCount: 0, row, valueSha256, rowSha256 };
+  return {
+    schemaVersion: 1,
+    reportType: "baby-profile-offline-restart",
+    platform,
+    flavor: "e2e-release",
+    checkedOutSha: sha,
+    expectedSha: sha,
+    testId: "E2E-001/profile",
+    fixture: {
+      id: "synthetic-leap-day-v1",
+      values: { birthDate: "2024-02-29", birthHeadCm: 34.2, birthHeightCm: 50.5, birthWeightG: 3200, gestationalWeeks: 36, isPremature: true, name: "G031LeapBaby", sex: "female" },
+      valueSha256,
+    },
+    calendar: { source: "device-local-date", beforeSave: "2026-07-18", afterSave: "2026-07-18", afterRelaunch: "2026-07-18", timeZone: "Asia/Shanghai", stable: true },
+    ageOracle: { algorithm: "independent-gregorian-v1", birthDate: "2024-02-29", localDate: "2026-07-18", ageDays: 870, completedMonths: 28, remainingDays: 19, display: "28个月19天" },
+    binary,
+    database: {
+      preSave: { babyProfileCount: 0, modelConfigCount: 0, modelCapabilitiesCount: 0, row: null, valueSha256: null, rowSha256: null },
+      postSave: structuredClone(populated),
+      postRelaunch: structuredClone(populated),
+    },
+    lifecycle: {
+      releaseInstalledFresh: true,
+      metro: { killCount: 1, waitCount: 1, pidCleared: true, androidReverseRemoved: platform === "android", negativeProbe: true },
+      directLaunches: { preSavePid: "101", savePid: "202", relaunchPid: "303" },
+      terminatedBeforeEmptySnapshot: true,
+      savePidGone: true,
+      relaunchPidDifferent: true,
+      postInstallMutations: { install: 0, clear: 0, seed: 0, databasePush: 0, rebuild: 0, metroRestart: 0 },
+    },
+    privacy: await collectProfilePrivacyProof(),
+    migration: {
+      recordedSha256: "f7dfa123b82ca6bb8f6ef6220c31f1d80fc987ea6435609d0e649367fc669cec",
+      sourceSha256: "c45896b3eb02762c0cf8f62c584889951a15fadc13fd34b9183bfa717ec75975",
+      sqlBytes: 10526,
+      inventory: { tables: 26, indexes: 14, triggers: 3 },
+    },
+    evidence: {
+      saveFlow: { path: savePath, sha256: hash(await readFile(savePath, "utf8")) },
+      restartFlow: { path: restartPath, sha256: hash(await readFile(restartPath, "utf8")) },
+    },
+    status: "pass",
+    skipped: [],
+  };
+}
+
+test("schema-v5 profile evidence independently binds the exact offline Release restart proof", async () => {
+  for (const platform of ["android", "ios"] as const) {
+    const report = await profileReport(platform);
+    assert.deepEqual(await validateProfileRestartReport(report, platform, sha), {
+      testId: "E2E-001/profile",
+      fixtureId: "synthetic-leap-day-v1",
+      valueSha256: "6bfb59d6996bf798923420d4ffb334430f3b1c6cd0c87988d29e353c06a7f6db",
+    });
+    const mutations = [
+      (value: any) => { value.database.preSave.babyProfileCount = 1; },
+      (value: any) => { value.database.postRelaunch.row.updated_at = "2026-07-18T01:02:04.000Z"; },
+      (value: any) => { value.calendar.afterRelaunch = "2026-07-19"; },
+      (value: any) => { value.ageOracle.display = "app-reported"; },
+      (value: any) => { value.lifecycle.directLaunches.relaunchPid = value.lifecycle.directLaunches.savePid; },
+      (value: any) => { value.lifecycle.metro.negativeProbe = false; },
+      (value: any) => { value.lifecycle.postInstallMutations.metroRestart = 1; },
+      (value: any) => { value.privacy.requestPrimitiveMatches = ["src/hostile.ts:fetch("]; },
+      (value: any) => { value.binary.embeddedJsBundle = false; },
+      (value: any) => { value.evidence.saveFlow.sha256 = "0".repeat(64); },
+      (value: any) => { value.skipped = ["profile"]; },
+    ];
+    for (const mutate of mutations) {
+      const hostile = structuredClone(report);
+      mutate(hostile);
+      await assert.rejects(validateProfileRestartReport(hostile, platform, sha));
+    }
   }
 });

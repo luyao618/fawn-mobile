@@ -14,7 +14,11 @@ pull_db() {
   cp "$device_db" "$local_db"; test -s "$local_db"
   for suffix in -wal -shm; do [ ! -f "$device_db$suffix" ] || cp "$device_db$suffix" "$local_db$suffix"; done
 }
-push_db() { test ! -s "$local_db-wal"; cp "$local_db" "$device_db"; rm -f "$device_db-wal" "$device_db-shm"; }
+push_db() {
+  test ! -s "$local_db-wal"
+  sqlite3 "$device_db" ".restore '$local_db'"
+  sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);"
+}
 launch() { xcrun simctl launch "$udid" "$app_id" >/dev/null; }
 ready() { maestro --device "$udid" test e2e/maestro/persistence-readiness.yaml; }
 error_screen() { maestro --device "$udid" test e2e/maestro/bootstrap-error.yaml; }

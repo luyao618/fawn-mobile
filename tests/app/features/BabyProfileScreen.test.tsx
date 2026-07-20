@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
-import { AppState, type AppStateStatus, StyleSheet, Text } from "react-native";
+import { AppState, type AppStateStatus, ScrollView, StyleSheet, Text } from "react-native";
 
 import type {
   BabyProfileServicePort,
@@ -188,6 +188,11 @@ test("我的 exposes every partial profile field with scalable, accessible contr
   const view = renderProfile(service());
   await waitFor(() => expect(screen.getByRole("header", { name: "宝宝资料" })).toBeTruthy());
 
+  expect(view.UNSAFE_getByType(ScrollView).props).toMatchObject({
+    keyboardDismissMode: "on-drag",
+    keyboardShouldPersistTaps: "handled",
+  });
+
   for (const label of ["宝宝姓名", "出生日期", "出生体重（克）", "出生身长（厘米）", "出生头围（厘米）", "出生孕周（周）"]) {
     expect(screen.getByLabelText(label)).toBeTruthy();
   }
@@ -218,6 +223,26 @@ test("我的 requires an explicit prematurity choice before the first save", asy
   expect(fieldError.props.accessibilityLiveRegion).toBe("assertive");
   expect(screen.getByText("请检查标出的资料后再保存。")).toBeTruthy();
   expect(save).not.toHaveBeenCalled();
+});
+
+test("我的 derives stable ASCII radio IDs from the current React selection state", async () => {
+  renderProfile(service());
+  await waitFor(() => expect(screen.getByLabelText("宝宝姓名")).toBeTruthy());
+
+  expect(screen.getByTestId("baby-profile-sex-unspecified-selected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-sex-male-unselected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-sex-female-unselected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-prematurity-term-unselected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-prematurity-preterm-unselected")).toBeTruthy();
+
+  fireEvent.press(screen.getByRole("radio", { name: "性别女孩" }));
+  fireEvent.press(screen.getByRole("radio", { name: "足月" }));
+
+  expect(screen.queryByTestId("baby-profile-sex-unspecified-selected")).toBeNull();
+  expect(screen.getByTestId("baby-profile-sex-unspecified-unselected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-sex-female-selected")).toBeTruthy();
+  expect(screen.queryByTestId("baby-profile-prematurity-term-unselected")).toBeNull();
+  expect(screen.getByTestId("baby-profile-prematurity-term-selected")).toBeTruthy();
 });
 
 test("我的 permits a partial first save after choosing 足月", async () => {
@@ -255,6 +280,9 @@ test("我的 hydrates every persisted field including the prematurity boolean", 
   expect(screen.getByRole("radio", { name: "性别女孩" }).props.accessibilityState.checked).toBe(true);
   expect(screen.getByRole("radio", { name: "早产" }).props.accessibilityState.checked).toBe(true);
   expect(screen.getByRole("radio", { name: "足月" }).props.accessibilityState.checked).toBe(false);
+  expect(screen.getByTestId("baby-profile-sex-female-selected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-prematurity-preterm-selected")).toBeTruthy();
+  expect(screen.getByTestId("baby-profile-prematurity-term-unselected")).toBeTruthy();
 });
 
 test("我的 saves canonical field values only after the service commits", async () => {

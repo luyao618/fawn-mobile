@@ -1,0 +1,58 @@
+appId: com.luyao618.formobile
+---
+- extendedWaitUntil:
+    visible: "宝宝资料已保存在本机"
+    timeout: 120000
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
+      - runFlow:
+          when:
+            visible: "宝宝资料已保存在本机"
+          commands:
+            - tapOn:
+                id: "tab-MeTab"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
+- extendedWaitUntil:
+    visible: "宝宝姓名"
+    timeout: 120000
+- assertNotVisible: "宝宝资料已保存"
+- assertVisible: "G031LeapBaby"
+- assertVisible: "${AGE_DISPLAY}"
+- assertVisible: "2024-02-29"
+- assertVisible:
+    id: "baby-profile-sex-female-selected"
+- scrollUntilVisible:
+    element:
+      text: '^3200$'
+    direction: DOWN
+- assertVisible: '^3200$'
+- scrollUntilVisible:
+    element:
+      text: '^50\.5$'
+    direction: DOWN
+- assertVisible: '^50\.5$'
+- scrollUntilVisible:
+    element:
+      text: '^34\.2$'
+    direction: DOWN
+- assertVisible: '^34\.2$'
+- scrollUntilVisible:
+    element:
+      id: "baby-profile-prematurity-preterm-selected"
+    direction: DOWN
+- assertVisible:
+    id: "baby-profile-prematurity-preterm-selected"
+- scrollUntilVisible:
+    element:
+      text: '^36$'
+    direction: DOWN
+- assertVisible: '^36$'

@@ -85,11 +85,11 @@ const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
 const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/android/production/**/*.js\n.artifacts/fault-bundles/android/production/metadata.json\n.artifacts/fault-bundles/android/e2e/**/*.js\n.artifacts/fault-bundles/android/e2e/metadata.json\n.artifacts/fault-bundles/ios/production/**/*.js\n.artifacts/fault-bundles/ios/production/metadata.json\n.artifacts/fault-bundles/ios/e2e/**/*.js\n.artifacts/fault-bundles/ios/e2e/metadata.json\n";
 const exactChildPrimaryUploadPaths = {
-  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n.artifacts/android-persistence.json\n.artifacts/persistence/android/*.json\n",
-  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/persistence/ios/*.json\n",
+  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n.artifacts/android-persistence.json\n.artifacts/android-profile-restart.json\n.artifacts/persistence/android/*.json\n",
+  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/ios-profile-restart.json\n.artifacts/persistence/ios/*.json\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "bfdb3d0495949c188658078f7e80fe7f0b11747866ffd0acc95b0320e3db3549";
+const exactAndroidRunnerSha256 = "52236399b43c99f85a9820351612e0228b835ad8f67c15eee23e9025b803fcb9";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -161,6 +161,7 @@ const exactChildCollectorRuns = {
   --scheme-report-production .artifacts/schemes/android-production.json \
   --scheme-report-e2e .artifacts/schemes/android-e2e.json \
   --persistence-report .artifacts/android-persistence.json \
+  --profile-restart-report .artifacts/android-profile-restart.json \
   --output .artifacts/android-e2e.json` + "\n",
   ios: String.raw`node tools/collect-ci-evidence.mjs \
   --expected-sha "${expectedShaInput}" --platform ios --flavor e2e \
@@ -170,6 +171,7 @@ const exactChildCollectorRuns = {
   --scheme-report-production .artifacts/schemes/ios-production.json \
   --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
   --persistence-report .artifacts/ios-persistence.json \
+  --profile-restart-report .artifacts/ios-profile-restart.json \
   --output .artifacts/ios-e2e.json` + "\n",
 } as const;
 
@@ -541,8 +543,12 @@ const exactMetroStatusLines = [
   "for attempt in $(seq 1 60); do curl --silent --fail http://127.0.0.1:8081/status >/dev/null && break; sleep 2; done",
   "curl --silent --fail http://127.0.0.1:8081/status",
 ] as const;
+const exactMetroNegativeProbeLines: Record<NativePlatform, string> = {
+  Android: "  if curl --silent --fail http://127.0.0.1:8081/status >/dev/null; then",
+  iOS: "if curl --silent --fail http://127.0.0.1:8081/status >/dev/null; then",
+};
 const exactDevClientUrlAssignment = `dev_client_url='${encodedDevClientUrl}'`;
-const exactAndroidBuildCommand = "(cd android && ./gradlew :app:assembleDebug -PreactNativeArchitectures=x86_64 --no-daemon)";
+const exactAndroidBuildCommand = "(cd android && ./gradlew :app:assembleDebug :app:assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon)";
 const exactAndroidInstallCommand = '  install_output=$(adb -s "$emulator_serial" install --no-streaming -r android/app/build/outputs/apk/debug/app-debug.apk 2>&1)';
 const exactAndroidPackageServiceLines = [
   "  for attempt in $(seq 1 60); do adb -s \"$emulator_serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found' && break; sleep 2; done",
@@ -668,8 +674,8 @@ function assertExactMetroStatusProbes(script: string, platform: NativePlatform):
   const statusLines = script.split(/\r\n|\n|\r/).filter((line) => line.includes("/status"));
   assert.deepEqual(
     statusLines,
-    exactMetroStatusLines,
-    `${platform} Metro status probes must remain exactly the bounded retry loop and final IPv4 probe in order`,
+    [...exactMetroStatusLines, exactMetroNegativeProbeLines[platform]],
+    `${platform} Metro status probes must remain exactly the bounded retry loop, final IPv4 probe, and offline negative probe in order`,
   );
 }
 
@@ -690,6 +696,22 @@ function assertExactMetroStartupPolicy(script: string, platform: NativePlatform)
   assert.ok(
     launchIndex < retryIndex && retryIndex < finalProbeIndex && finalProbeIndex < devClientUrlIndex,
     `${platform} Metro startup must preserve exact launch, retry loop, final probe, and dev-client URL assignment order`,
+  );
+}
+
+function assertMetroProcessGroupPolicy(script: string, platform: NativePlatform): void {
+  const lines = script.split(/\r\n|\n|\r/);
+  const launchIndex = lines.indexOf(exactHeadlessMetroCommands[platform]);
+  assert.ok(launchIndex > 0, `${platform} Metro launch is absent`);
+  assert.deepEqual(
+    lines.slice(launchIndex - 1, launchIndex + 3),
+    ["set -m", exactHeadlessMetroCommands[platform], "metro_pid=$!", "set +m"],
+    `${platform} Metro must start as a monitored Bash process group`,
+  );
+  assert.deepEqual(
+    lines.filter((line) => line.trim().startsWith("kill ")).map((line) => line.trim()),
+    ['kill -- "-$metro_pid" 2>/dev/null', 'kill -- "-$metro_pid"'],
+    `${platform} Metro teardown must signal the complete process group in cleanup and the offline transition`,
   );
 }
 
@@ -837,7 +859,7 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
     "    fi",
     "  fi",
     '  if [ -n "$metro_pid" ]; then',
-    '    kill "$metro_pid" 2>/dev/null',
+    '    kill -- "-$metro_pid" 2>/dev/null',
     '    wait "$metro_pid" 2>/dev/null',
     "  fi",
     '  if [ -f "$metro_log" ]; then',
@@ -913,15 +935,20 @@ function assertIosFailureDiagnosticsPolicy(script: string, workflow: Workflow): 
     exactIosFailureScreenshotCommand,
     exactIosFailureLogCommand,
     "  fi",
-    '  kill "$metro_pid" 2>/dev/null',
+    '  if [ -n "$metro_pid" ]; then',
+    '    kill -- "-$metro_pid" 2>/dev/null',
+    '    wait "$metro_pid" 2>/dev/null',
+    "  fi",
     "  cat /tmp/metro.log",
     '  exit "$status"',
     "}",
     "trap cleanup EXIT",
   ];
-  const cleanupIndexes = cleanupLines.map((line) => lines.indexOf(line));
-  assert.ok(
-    cleanupIndexes.every((index, position) => index >= 0 && (position === 0 || index > cleanupIndexes[position - 1])),
+  const cleanupStart = lines.indexOf("cleanup() {");
+  const cleanupEnd = lines.indexOf("trap cleanup EXIT", cleanupStart + 1);
+  assert.deepEqual(
+    lines.slice(cleanupStart, cleanupEnd + 1),
+    cleanupLines,
     "iOS cleanup must preserve exact status-preserving diagnostic and teardown order",
   );
   const steps = requiredSteps(requiredJob(workflow, "ios"), "ios");
@@ -958,6 +985,7 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assert.match(runner, /^#!\/usr\/bin\/env bash\nset -euo pipefail\n/);
   assertExactAndroidRunnerSha256(runner);
   assertExactMetroStartupPolicy(runner, "Android");
+  assertMetroProcessGroupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
   assertExactAndroidUrlHandoff(runner);
   assertExactAndroidPackageServicePolicy(runner);
@@ -1497,7 +1525,7 @@ exit ${status}
     const success = await runCleanup(0);
     assert.equal(success.status, 0, success.stderr);
     assert.equal(success.stdout, "metro-sentinel\n");
-    assert.match(await readFile(adbLog, "utf8"), /^kill 424242$/m);
+    assert.match(await readFile(adbLog, "utf8"), /^kill -- -424242$/m);
     assert.match(await readFile(adbLog, "utf8"), /^wait 424242$/m);
     for (const path of exactAndroidFailureDiagnosticPaths) {
       await assert.rejects(readFile(join(root, path)), `${path} must remain absent after success`);
@@ -1572,7 +1600,7 @@ exit ${status}
       "ls -la /data/anr; cat /data/anr/*",
       "pidof -s com.luyao618.formobile",
       "logcat -d --pid=1234",
-      "kill 424242",
+      "kill -- -424242",
       "wait 424242",
     );
 
@@ -1636,6 +1664,7 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
   const smokeRun = iosSteps[smokeIndex].run;
   assert.ok(typeof smokeRun === "string", "iOS device smoke must have an enabled run script");
   assertExactMetroStartupPolicy(smokeRun, "iOS");
+  assertMetroProcessGroupPolicy(smokeRun, "iOS");
   assertExactReadinessCommand(smokeRun, "iOS");
   assertExactIosUrlHandoff(smokeRun);
   assertIosFailureDiagnosticsPolicy(smokeRun, parsedWorkflow);
@@ -1728,6 +1757,22 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
       /exact loopback-only fail-closed headless command/,
     );
 
+    const processGroupMutations = [
+      script.replace("set -m\n", ""),
+      script.replaceAll('kill -- "-$metro_pid"', 'kill "$metro_pid"'),
+      script.replace(
+        `set -m\n${exactHeadlessMetroCommands[platform]}\nmetro_pid=$!\nset +m`,
+        `set +m\n${exactHeadlessMetroCommands[platform]}\nmetro_pid=$!`,
+      ),
+    ];
+    for (const mutation of processGroupMutations) {
+      assert.notEqual(mutation, script);
+      assert.throws(
+        () => assertMetroProcessGroupPolicy(mutation, platform),
+        /monitored Bash process group|signal the complete process group/,
+      );
+    }
+
     const localhostStatusProbes = script.replaceAll(
       "http://127.0.0.1:8081/status",
       "http://localhost:8081/status",
@@ -1735,7 +1780,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.notEqual(localhostStatusProbes, script);
     assert.throws(
       () => assertExactMetroStatusProbes(localhostStatusProbes, platform),
-      /exactly the bounded retry loop and final IPv4 probe in order/,
+      /exactly the bounded retry loop, final IPv4 probe, and offline negative probe in order/,
     );
 
     const withoutFinalStatusProbe = script
@@ -1745,7 +1790,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.notEqual(withoutFinalStatusProbe, script);
     assert.throws(
       () => assertExactMetroStatusProbes(withoutFinalStatusProbe, platform),
-      /exactly the bounded retry loop and final IPv4 probe in order/,
+      /exactly the bounded retry loop, final IPv4 probe, and offline negative probe in order/,
     );
 
     const withoutApprovedStatusLines = script
@@ -2167,6 +2212,42 @@ printf 'next-line-ran'`], { encoding: "utf8" });
     () => assertIosFailureDiagnosticsPolicy(extraIosDiagnostic, iosWorkflow),
     /executable simctl io\/spawn command inventory must exactly match/,
   );
+});
+
+test("Metro monitor-mode teardown terminates a wrapper and its child on host Bash", () => {
+  const result = spawnSync("bash", ["-c", `set -euo pipefail
+directory=$(mktemp -d)
+child_file="$directory/child"
+cleanup_harness() {
+  set +e
+  [ -z "\${metro_pid:-}" ] || kill -- "-$metro_pid" 2>/dev/null
+  rm -rf "$directory"
+}
+trap cleanup_harness EXIT
+set -m
+bash -c 'sleep 30 & echo $! > "$1"; wait' _ "$child_file" &
+metro_pid=$!
+set +m
+for _ in $(seq 1 100); do [ -s "$child_file" ] && break; sleep 0.01; done
+child_pid=$(cat "$child_file")
+test "$(jobs -p)" = "$metro_pid"
+kill -0 -- "-$metro_pid"
+kill -- "-$metro_pid"
+set +e
+wait "$metro_pid"
+metro_status=$?
+set -e
+case "$metro_status" in
+  0|143) ;;
+  *) exit 1 ;;
+esac
+for _ in $(seq 1 100); do ! kill -0 "$child_pid" 2>/dev/null && break; sleep 0.01; done
+! kill -0 "$child_pid" 2>/dev/null
+metro_pid=
+printf '%s\n' group-teardown-pass
+`], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "group-teardown-pass\n");
 });
 
 test("native workflows enforce the parsed Intel runner, exact SHA boundaries, and frozen tool preflight", async () => {
@@ -2633,6 +2714,11 @@ test("static evidence is recorded only after all gates and requires explicit has
 
 
 const exactIosPersistenceStopHelper = 'stop() { xcrun simctl terminate "$udid" "$app_id"; }';
+const exactIosPersistencePushHelper = `push_db() {
+  test ! -s "$local_db-wal"
+  sqlite3 "$device_db" ".restore '$local_db'"
+  sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);"
+}`;
 
 function assertIosPersistenceTerminatePolicy(wrapper: string): string {
   const terminateLines = wrapper
@@ -2646,13 +2732,27 @@ function assertIosPersistenceTerminatePolicy(wrapper: string): string {
   return terminateLines[0];
 }
 
+function assertIosPersistencePushPolicy(wrapper: string): void {
+  const start = wrapper.indexOf("push_db() {");
+  const end = wrapper.indexOf("\n}", start);
+  assert.ok(start >= 0 && end > start, "iOS persistence push helper is absent");
+  assert.equal(
+    wrapper.slice(start, end + 2),
+    exactIosPersistencePushHelper,
+    "iOS persistence push must restore through SQLite and checkpoint without deleting live sidecars",
+  );
+}
+
 function assertPersistenceWrapper(wrapper: string, platform: "android" | "ios") {
   assert.match(wrapper, /set -euo pipefail/);
   assert.match(wrapper, /-wal/);
   assert.match(wrapper, /-shm/);
   assert.match(wrapper, /recovered-noop\.json/);
   assert.match(wrapper, /bootstrap-retry\.yaml/);
-  if (platform === "ios") assertIosPersistenceTerminatePolicy(wrapper);
+  if (platform === "ios") {
+    assertIosPersistenceTerminatePolicy(wrapper);
+    assertIosPersistencePushPolicy(wrapper);
+  }
   ordered(
     wrapper,
     'node tools/persistence-evidence.mjs --action corrupt-hash --database "$local_db"',
@@ -2751,6 +2851,45 @@ printf '%s\\n' evidence-collected
   }
 });
 
+test("iOS persistence replacement uses SQLite restore and rejects live sidecar deletion", async () => {
+  const wrapper = await readFile("scripts/e2e/run-persistence-ios.sh", "utf8");
+  assertIosPersistencePushPolicy(wrapper);
+  for (const [label, mutation] of [
+    ["raw overwrite", wrapper.replace(exactIosPersistencePushHelper, 'push_db() { cp "$local_db" "$device_db"; }')],
+    ["sidecar deletion", wrapper.replace("  sqlite3 \"$device_db\" \"PRAGMA wal_checkpoint(TRUNCATE);\"", '  rm -f "$device_db-wal" "$device_db-shm"')],
+    ["missing checkpoint", wrapper.replace('  sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);"\n', "")],
+  ] as const) {
+    assert.notEqual(mutation, wrapper, `${label} fixture must change the iOS persistence wrapper`);
+    assert.throws(
+      () => assertIosPersistencePushPolicy(mutation),
+      /push helper is absent|restore through SQLite and checkpoint/,
+      `${label} must be rejected`,
+    );
+  }
+
+  const result = spawnSync("bash", ["-c", `set -euo pipefail
+directory=$(mktemp -d)
+trap 'rm -rf "$directory"' EXIT
+local_db="$directory/local.db"
+device_db="$directory/device.db"
+: > "$local_db"
+sqlite3() { printf '<%s>\\n' "$@"; }
+${exactIosPersistencePushHelper}
+push_db
+`], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const calls = result.stdout.trimEnd().split("\n");
+  assert.equal(calls.length, 4);
+  assert.match(calls[0]!, /^<.*\/device\.db>$/);
+  const devicePath = calls[0]!.slice(1, -1);
+  assert.deepEqual(calls, [
+    `<${devicePath}>`,
+    `<.restore '${devicePath.replace("device.db", "local.db")}'>`,
+    `<${devicePath}>`,
+    "<PRAGMA wal_checkpoint(TRUNCATE);>",
+  ]);
+});
+
 test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only uploads", async () => {
   const [android, ios, androidWorkflow, iosWorkflow, errorFlow] = await Promise.all([
     readFile("scripts/e2e/run-persistence-android.sh", "utf8"),
@@ -2790,4 +2929,1141 @@ test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only
     assert.doesNotMatch(workflow, /\.artifacts\/persistence\/.*\.db/);
     assert.match(workflow, new RegExp(`--persistence-report \\.artifacts/${platform}-persistence\\.json`));
   }
+});
+
+const exactProfileReadinessCommands = {
+  android: 'maestro --device "$serial" test --debug-output .artifacts/launch/maestro/android-profile-pre-save-readiness e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/test-results/android-profile-pre-save-readiness.log',
+  ios: 'maestro --device "$udid" test --debug-output .artifacts/launch/maestro/ios-profile-pre-save-readiness e2e/maestro/shell-readiness.yaml 2>&1 | tee .artifacts/test-results/ios-profile-pre-save-readiness.log',
+} as const;
+
+const exactAndroidProfileRootHelper = `ensure_adb_root() {
+  local root_output root_status wait_output wait_status uid_output uid_status
+  if root_output=$(adb -s "$serial" root 2>&1); then root_status=0; else root_status=$?; fi
+  root_output=\${root_output%$'\\r'}
+  case "$root_status:$root_output" in
+    '0:'|'0:restarting adbd as root'|'0:adbd is already running as root'|'1:adb: unable to connect for root: closed') ;;
+    *)
+      printf 'Unexpected adb root result (status %s): %s\\n' "$root_status" "$root_output" >&2
+      [ "$root_status" -ne 0 ] && return "$root_status"
+      return 1
+      ;;
+  esac
+  if wait_output=$(timeout 30s adb -s "$serial" wait-for-device 2>&1); then wait_status=0; else wait_status=$?; fi
+  if [ "$wait_status" -ne 0 ]; then
+    printf 'adb root wait failed (status %s): %s\\n' "$wait_status" "$wait_output" >&2
+    return "$wait_status"
+  fi
+  if uid_output=$(adb -s "$serial" shell id -u 2>&1); then uid_status=0; else uid_status=$?; fi
+  uid_output=\${uid_output%$'\\r'}
+  if [ "$uid_status" -ne 0 ] || [ "$uid_output" != 0 ]; then
+    printf 'adb root postcondition failed (status %s): %s\\n' "$uid_status" "$uid_output" >&2
+    [ "$uid_status" -ne 0 ] && return "$uid_status"
+    return 1
+  fi
+}`;
+
+const exactAndroidProfilePidofHelper = `pidof_app() {
+  local observation adb_status remote_status
+  set +e
+  observation=$(adb -s "$serial" shell "pidof -s '$app_id'; remote_status=\\$?; printf '__PIDOF_STATUS__=%s\\\\n' \\"\\$remote_status\\"" 2>&1)
+  adb_status=$?
+  set -e
+  if [ "$adb_status" -ne 0 ]; then
+    printf '%s\\n' "$observation" >&2
+    return "$adb_status"
+  fi
+  observation=\${observation//$'\\r'/}
+  if [ "$observation" = '__PIDOF_STATUS__=1' ]; then
+    return 0
+  fi
+  if [[ "$observation" =~ ^([0-9]+)$'\\n'__PIDOF_STATUS__=0$ ]]; then
+    printf '%s' "\${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$observation" =~ (^|$'\\n')__PIDOF_STATUS__=([0-9]+)$ ]]; then
+    remote_status=\${BASH_REMATCH[2]}
+    if [ "$remote_status" -gt 0 ] && [ "$remote_status" -lt 256 ]; then
+      printf '%s\\n' "$observation" >&2
+      return "$remote_status"
+    fi
+  fi
+  printf 'Malformed remote pidof observation: %s\\n' "$observation" >&2
+  return 1
+}`;
+
+const exactIosDeviceCalendarSource = `import Foundation
+
+@main
+struct IOSDeviceCalendar {
+  static func main() {
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = .current
+    formatter.dateFormat = "yyyy-MM-dd"
+    print("\\(formatter.string(from: Date()))\\t\\(TimeZone.current.identifier)")
+  }
+}
+`;
+
+function assertIosDeviceCalendarPolicy(profile: string, query: string, source: string) {
+  assert.equal(source, exactIosDeviceCalendarSource, "iOS calendar probe must use device-local Foundation date and time zone");
+  assert.doesNotMatch(profile, /simctl spawn[^\n]*\bdate\b/);
+  assert.doesNotMatch(query, /simctl spawn[^\n]*\bdate\b/);
+  assert.match(query, /simulator_arch=\$\(uname -m\)\ncase "\$simulator_arch" in\n  arm64\|x86_64\)/);
+  assert.match(query, /-target "\$\{simulator_arch\}-apple-ios13\.0-simulator"/);
+  assert.match(query, /xcrun simctl spawn "\$udid" "\$probe"/);
+  assert.match(query, /\[0-9\]\[0-9\]\[0-9\]\[0-9\]-\[0-9\]\[0-9\]-\[0-9\]\[0-9\]\) ;;/);
+  assert.match(query, /Simulator calendar probe returned multiple lines/);
+  assert.equal((profile.match(/device_calendar\)/g) ?? []).length, 3, "All iOS profile calendar reads must use the probe");
+  ordered(
+    profile,
+    "save_pid=$(launch)",
+    "read -r before_save_date time_zone < <(device_calendar)",
+    "profile-save.yaml",
+    "read -r after_save_date _ < <(device_calendar)",
+    'terminate "$save_pid"',
+    "relaunch_pid=$(launch)",
+    "read -r after_relaunch_date _ < <(device_calendar)",
+    "profile-restart.yaml",
+  );
+}
+
+function assertProfileBootstrapReadiness(script: string, platform: "android" | "ios") {
+  const readiness = exactProfileReadinessCommands[platform];
+  assert.deepEqual(
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes("profile-pre-save-readiness")),
+    [readiness],
+    `${platform} profile bootstrap readiness must run exactly once`,
+  );
+  ordered(
+    script,
+    "pre_save_pid=$(launch)",
+    readiness,
+    'terminate "$pre_save_pid"',
+    'pull_db "$artifacts/pre-save.db"',
+    'profile-snapshot --database "$artifacts/pre-save.db"',
+  );
+}
+
+function assertAndroidProfilePackageReadiness(script: string) {
+  const lines = script.split(/\r\n|\n|\r/);
+  assert.deepEqual(
+    lines.filter((line) => line.includes("service check package")),
+    [
+      "  for _ in $(seq 1 60); do adb -s \"$serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found' && break; sleep 2; done",
+      "  adb -s \"$serial\" shell service check package 2>/dev/null | tr -d '\\r' | grep -Fxq 'Service package: found'",
+    ],
+    "Release install package-service readiness must be bounded and fail closed",
+  );
+  assert.deepEqual(
+    lines.filter((line) => line.trim() === "wait_for_package_service"),
+    ["wait_for_package_service", "    wait_for_package_service"],
+    "Release install must wait after adb root and again before its sole transient retry",
+  );
+  ordered(
+    script,
+    "ensure_adb_root\nwait_for_package_service",
+    "wait_for_package_service\nadb",
+    'uninstall "$app_id"',
+    "if ! install_apk; then",
+    "    wait_for_package_service",
+    "    install_apk",
+  );
+}
+
+function assertAndroidProfileRootPolicy(script: string) {
+  assert.equal(
+    script.split(exactAndroidProfileRootHelper).length - 1,
+    1,
+    "Android profile root transition must use the exact bounded fail-closed helper once",
+  );
+  assert.deepEqual(
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes('adb -s "$serial" root')),
+    ['  if root_output=$(adb -s "$serial" root 2>&1); then root_status=0; else root_status=$?; fi'],
+    "Android profile root transition must issue exactly one captured adb root command",
+  );
+  assert.deepEqual(
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes('adb -s "$serial" wait-for-device')),
+    ['  if wait_output=$(timeout 30s adb -s "$serial" wait-for-device 2>&1); then wait_status=0; else wait_status=$?; fi'],
+    "Android profile root transition must wait for the exact serial with one bounded captured command",
+  );
+  assert.deepEqual(
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes('adb -s "$serial" shell id -u')),
+    ['  if uid_output=$(adb -s "$serial" shell id -u 2>&1); then uid_status=0; else uid_status=$?; fi'],
+    "Android profile root transition must prove the exact remote UID before data access",
+  );
+  assert.equal((script.match(/^ensure_adb_root$/gm) ?? []).length, 1, "Android profile root helper must run exactly once");
+  ordered(
+    script,
+    "trap cleanup EXIT",
+    "ensure_adb_root\nwait_for_package_service",
+    'adb -s "$serial" uninstall "$app_id"',
+    'pull_db() {',
+  );
+}
+
+type AndroidProfileRootHarnessOptions = {
+  rootOutput: string;
+  rootStatus: number;
+  waitStatus?: number;
+  uidOutput?: string;
+  uidStatus?: number;
+  repetitions?: number;
+};
+
+async function runAndroidProfileRootHarness(options: AndroidProfileRootHarnessOptions) {
+  const root = await mkdtemp(join(tmpdir(), "g031-android-root-"));
+  const callsPath = join(root, "calls.log");
+  const result = spawnSync("bash", ["-c", `set -euo pipefail
+adb() {
+  printf 'adb %s\\n' "$*" >> "$CALLS_PATH"
+  if [ "$#" -eq 3 ] && [ "$1" = -s ] && [ "$2" = emulator-5554 ] && [ "$3" = root ]; then
+    printf '%s' "$ROOT_OUTPUT"
+    return "$ROOT_STATUS"
+  fi
+  if [ "$#" -eq 3 ] && [ "$1" = -s ] && [ "$2" = emulator-5554 ] && [ "$3" = wait-for-device ]; then
+    return "$WAIT_STATUS"
+  fi
+  if [ "$#" -eq 5 ] && [ "$1" = -s ] && [ "$2" = emulator-5554 ] && [ "$3" = shell ] && [ "$4" = id ] && [ "$5" = -u ]; then
+    printf '%s' "$UID_OUTPUT"
+    return "$UID_STATUS"
+  fi
+  return 99
+}
+timeout() {
+  printf 'timeout %s\\n' "$*" >> "$CALLS_PATH"
+  [ "$#" -eq 5 ] && [ "$1" = 30s ] && [ "$2" = adb ] && [ "$3" = -s ] && [ "$4" = emulator-5554 ] && [ "$5" = wait-for-device ] || return 98
+  shift
+  "$@"
+}
+serial=emulator-5554
+${exactAndroidProfileRootHelper}
+for _ in $(seq 1 "$REPETITIONS"); do ensure_adb_root; done
+`], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CALLS_PATH: callsPath,
+      REPETITIONS: String(options.repetitions ?? 2),
+      ROOT_OUTPUT: options.rootOutput,
+      ROOT_STATUS: String(options.rootStatus),
+      UID_OUTPUT: options.uidOutput ?? "0",
+      UID_STATUS: String(options.uidStatus ?? 0),
+      WAIT_STATUS: String(options.waitStatus ?? 0),
+    },
+  });
+  const calls = (await readFile(callsPath, "utf8").catch(() => "")).trimEnd().split("\n").filter(Boolean);
+  await rm(root, { recursive: true, force: true });
+  return { result, calls };
+}
+
+function assertAndroidProfilePidofPolicy(script: string) {
+  assert.equal(
+    script.split(exactAndroidProfilePidofHelper).length - 1,
+    1,
+    "Android profile PID lookup must use the exact status-aware helper once",
+  );
+  assert.deepEqual(
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes("pidof -s")),
+    ['  observation=$(adb -s "$serial" shell "pidof -s \'$app_id\'; remote_status=\\$?; printf \'__PIDOF_STATUS__=%s\\\\n\' \\"\\$remote_status\\"" 2>&1)'],
+    "Android profile PID lookup must capture one status-marked remote observation without a pipefail-sensitive pipeline",
+  );
+  assert.equal((script.match(/\$\(pidof_app\)/g) ?? []).length, 3, "All Android profile PID probes must use the helper");
+  assert.match(
+    script,
+    /stopped_pid=\$\(pidof_app\)\ntest -z "\$stopped_pid"/,
+    "Android profile PID absence must preserve helper failure before checking for empty output",
+  );
+}
+
+function assertNonPipelinedApkInspection(androidWorkflow: string, androidProfile: string) {
+  assert.doesNotMatch(androidWorkflow, /unzip[^\n]*\|/);
+  assert.doesNotMatch(androidProfile, /unzip[^\n]*\|/);
+  ordered(
+    androidWorkflow,
+    "unzip -Z1 android/app/build/outputs/apk/release/app-release.apk > /tmp/g031-release-apk.entries",
+    "grep -Eq '^assets/(index\\.android\\.bundle|index\\.bundle)$' /tmp/g031-release-apk.entries",
+  );
+  ordered(
+    androidProfile,
+    'apk_entries=$(unzip -Z1 "$release_apk")',
+    "grep -Eq '^assets/(index\\.android\\.bundle|index\\.bundle)$' <<< \"$apk_entries\"",
+  );
+}
+
+const exactProfileSourceStates = {
+  save: "照护空间尚未设置",
+  restart: "宝宝资料已保存在本机",
+} as const;
+
+type ProfileSourceState = typeof exactProfileSourceStates[keyof typeof exactProfileSourceStates];
+
+function exactIosConditionalSecondProfileTabTap(sourceState: ProfileSourceState): string {
+  return `      - runFlow:
+          when:
+            visible: "${sourceState}"
+          commands:
+            - tapOn:
+                id: "tab-MeTab"`;
+}
+
+function exactProfileTabNavigation(sourceState: ProfileSourceState): string {
+  return `- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
+${exactIosConditionalSecondProfileTabTap(sourceState)}
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
+- extendedWaitUntil:
+    visible: "宝宝姓名"
+    timeout: 120000`;
+}
+
+function assertProfileTabNavigation(flow: string, sourceState: ProfileSourceState) {
+  const exactNavigation = exactProfileTabNavigation(sourceState);
+  assert.equal(
+    flow.split(exactNavigation).length - 1,
+    1,
+    "Profile navigation must use one exact iOS tab tap, one source-state-conditional iOS second tap, one exact Android tap, and unique ready-form evidence",
+  );
+  assert.equal((flow.match(/id: "tab-MeTab"/g) ?? []).length, 3, "Profile navigation must contain exactly three exact tab identifiers");
+  assert.equal(flow.includes('- tapOn: "我的"'), false, "Profile navigation must not use the ambiguous tab text");
+  assert.equal(flow.includes('text: "我的"'), false, "Profile navigation must not use a text selector for the tab");
+  assert.equal(flow.includes('visible: "宝宝资料"'), false, "Profile readiness must not accept the StewardScreen label");
+  assert.equal((flow.match(/^\s+visible: "宝宝姓名"$/gm) ?? []).length, 1, "Profile navigation must retain one unique ready-form wait");
+  assert.doesNotMatch(flow, /retryTapIfNoChange|\b(?:optional|retry|sleep)\b/i, "Profile navigation must not mask failures");
+  assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile navigation must not use coordinates");
+}
+
+function assertProfileRestartFlowOrder(flow: string) {
+  const exactNavigation = exactProfileTabNavigation(exactProfileSourceStates.restart);
+  assert.equal((flow.match(/G031LeapBaby/g) ?? []).length, 1, "Restart must require the synthetic name exactly once");
+  ordered(
+    flow,
+    'visible: "宝宝资料已保存在本机"',
+    exactNavigation,
+    'assertNotVisible: "宝宝资料已保存"',
+    'assertVisible: "G031LeapBaby"',
+    'assertVisible: "${AGE_DISPLAY}"',
+  );
+}
+
+const exactProfileTextInputs = [
+  { label: "宝宝姓名", placeholder: "可暂不填", value: "G031LeapBaby" },
+  { label: "出生日期", placeholder: "例如 2024-02-29", value: "2024-02-29" },
+] as const;
+
+const exactProfileNumericInputs = [
+  { label: "出生体重（克）", placeholder: "100–10000", value: "3200", dismissDirection: "DOWN" },
+  { label: "出生身长（厘米）", placeholder: "10–100", value: "50.5", dismissDirection: "DOWN" },
+  { label: "出生头围（厘米）", placeholder: "10–80", value: "34.2", dismissDirection: "DOWN" },
+  { label: "出生孕周（周）", placeholder: "20–45，可暂不填", value: "36", dismissDirection: "DOWN" },
+] as const;
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function exactProfileTextKeyboardDismissal(label: string): string {
+  return `- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "${label}"`;
+}
+
+function exactProfileNumericKeyboardDismissal({ value, dismissDirection }: typeof exactProfileNumericInputs[number]): string {
+  const selector = `^${escapeRegex(value)}$`;
+  return `- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '${selector}'
+          direction: ${dismissDirection}`;
+}
+
+function assertProfileKeyboardDismissalPolicy(flow: string): void {
+  assert.doesNotMatch(flow, /^- hideKeyboard(?:\s*:.*)?\s*$/m, "Profile save must not use universal hideKeyboard");
+  assert.doesNotMatch(flow, /\b(?:optional|retry|sleep)\b/i, "Profile save must not mask dismissal failures");
+  assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile save must not use coordinate taps");
+  assert.equal(
+    (flow.match(/^\s+- swipe:\s*$/gm) ?? []).length,
+    exactProfileNumericInputs.length,
+    "Profile save must use exactly one forced swipe for each numeric iOS keyboard dismissal",
+  );
+  for (const { label } of exactProfileTextInputs) {
+    assert.equal(
+      flow.split(exactProfileTextKeyboardDismissal(label)).length - 1,
+      1,
+      `${label} must use one exact Android hideKeyboard then iOS static-label dismissal block`,
+    );
+    assert.equal(
+      flow.split(`- tapOn: "${label}"`).length - 1,
+      1,
+      `${label} static label must be tapped only by its iOS dismissal branch`,
+    );
+  }
+  for (const input of exactProfileNumericInputs) {
+    const { label, value } = input;
+    const selector = `^${escapeRegex(value)}$`;
+    assert.equal(
+      flow.split(exactProfileNumericKeyboardDismissal(input)).length - 1,
+      1,
+      `${label} must use one exact Android hideKeyboard then iOS anchored entered-value scroll dismissal block`,
+    );
+    assert.equal(flow.split(`- tapOn: "${label}"`).length - 1, 0, `${label} must never be tapped to dismiss the iOS numeric keyboard`);
+    assert.equal(flow.split(`text: '${selector}'`).length - 1, 1, `${label} entered value must be the unique regex-literal anchored iOS dismissal scroll target`);
+  }
+}
+
+function assertProfileOnDragKeyboardDismissal(appFrameSource: string, profileSource: string): void {
+  assert.match(appFrameSource, /keyboardDismissMode\?: ScrollViewProps\["keyboardDismissMode"\]/, "AppFrame must expose the native ScrollView keyboardDismissMode type as optional");
+  assert.equal(
+    appFrameSource.split("keyboardDismissMode={keyboardDismissMode}").length - 1,
+    1,
+    "AppFrame must forward keyboardDismissMode to its ScrollView exactly once",
+  );
+  assert.equal(
+    appFrameSource.split('keyboardShouldPersistTaps="handled"').length - 1,
+    1,
+    "AppFrame must preserve handled keyboard taps exactly once",
+  );
+  assert.equal(
+    profileSource.split('<AppFrame keyboardDismissMode="on-drag" localOnly title="我的">').length - 1,
+    1,
+    "BabyProfileScreen must be the exact on-drag AppFrame opt-in",
+  );
+  assert.equal(
+    (profileSource.match(/keyboardDismissMode=/g) ?? []).length,
+    1,
+    "BabyProfileScreen must contain exactly one keyboard dismissal mode opt-in",
+  );
+}
+
+function assertProfileNameToBirthDateTransition(flow: string) {
+  const [name, birthDate] = exactProfileTextInputs;
+  const nameSelector = `^${name.placeholder}$`;
+  const birthDateSelector = `^${birthDate.placeholder}$`;
+  const transition = `- tapOn: "${nameSelector}"
+- inputText: "${name.value}"
+- assertVisible: "${name.value}"
+${exactProfileTextKeyboardDismissal(name.label)}
+- tapOn: "${birthDateSelector}"
+- inputText: "${birthDate.value}"
+${exactProfileTextKeyboardDismissal(birthDate.label)}
+- assertVisible: "${birthDate.value}"`;
+  assert.equal(
+    flow.split(transition).length - 1,
+    1,
+    "Profile save must preserve anchored name-before-date entry with exact platform keyboard dismissal",
+  );
+  for (const { label, placeholder } of exactProfileTextInputs) {
+    const selector = `^${placeholder}$`;
+    assert.equal(flow.split(`- tapOn: "${selector}"`).length - 1, 1, `${label} exact placeholder must be tapped once`);
+    assert.equal(flow.includes(`- tapOn: "${placeholder}"`), false, `${label} placeholder selector must stay anchored`);
+  }
+}
+
+const exactProfileRadioSelections = [
+  {
+    targetLabel: "性别女孩",
+    targetID: "baby-profile-sex-female",
+    sourceLabel: "性别暂不填",
+    sourceID: "baby-profile-sex-unspecified",
+  },
+  {
+    targetLabel: "早产",
+    targetID: "baby-profile-prematurity-preterm",
+    sourceLabel: "足月",
+    sourceID: "baby-profile-prematurity-term",
+  },
+] as const;
+
+type ProfileRadioSelection = {
+  readonly targetLabel: string;
+  readonly targetID: string;
+  readonly sourceLabel: string;
+  readonly sourceID: string;
+};
+
+function exactIosConditionalSecondProfileRadioTap({ targetID, sourceID }: ProfileRadioSelection): string {
+  return `      - runFlow:
+          when:
+            visible:
+              id: "${sourceID}-selected"
+          commands:
+            - tapOn:
+                id: "${targetID}-unselected"`;
+}
+
+function exactProfileRadioSelection(selection: ProfileRadioSelection): string {
+  const { targetID } = selection;
+  return `- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: "${targetID}-unselected"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: "${targetID}-unselected"
+${exactIosConditionalSecondProfileRadioTap(selection)}
+- assertVisible:
+    id: "${targetID}-selected"`;
+}
+
+function exactProfileRestartRadioAssertion({ targetID }: ProfileRadioSelection): string {
+  return `- assertVisible:
+    id: "${targetID}-selected"`;
+}
+
+function assertProfileRadioSelectionPolicy(saveFlow: string, restartFlow: string): void {
+  for (const flow of [saveFlow, restartFlow]) {
+    assert.doesNotMatch(flow, /retryTapIfNoChange|\b(?:optional|retry|sleep)\b/i, "Profile radio selection must not mask failures");
+    assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile radio selection must not use coordinates");
+    assert.doesNotMatch(flow, /\bchecked\s*:/, "Profile radio proof must use React-derived exact IDs instead of Maestro checked state");
+  }
+  for (const selection of exactProfileRadioSelections) {
+    const { targetID, targetLabel, sourceID } = selection;
+    assert.equal(
+      saveFlow.split(exactProfileRadioSelection(selection)).length - 1,
+      1,
+      `${targetLabel} must use one exact Android ID tap and one exact iOS ID tap followed by one source-selected conditional second tap and a target-selected ID assertion`,
+    );
+    assert.equal(
+      (saveFlow.match(new RegExp(`- tapOn:\\n\\s+id: "${targetID}-unselected"`, "g")) ?? []).length,
+      3,
+      `${targetLabel} must use its exact unselected ID once on Android and at most twice on iOS`,
+    );
+    assert.equal(
+      saveFlow.split(`id: "${sourceID}-selected"`).length - 1,
+      1,
+      `${targetLabel} must use the exact source-selected ID once for the iOS second-tap condition`,
+    );
+    assert.equal(
+      saveFlow.split(`id: "${targetID}-selected"`).length - 1,
+      1,
+      `${targetLabel} save proof must assert its exact selected ID once`,
+    );
+    assert.equal(
+      restartFlow.split(exactProfileRestartRadioAssertion(selection)).length - 1,
+      1,
+      `${targetLabel} restart proof must assert its exact selected ID once`,
+    );
+  }
+}
+
+function assertProfileNumericInputTargeting(flow: string) {
+  for (const input of exactProfileNumericInputs) {
+    const { label, placeholder, value } = input;
+    const selector = `^${placeholder}$`;
+    const exactInputSequence = `- scrollUntilVisible:
+    element:
+      text: "${selector}"
+    direction: DOWN
+- tapOn: "${selector}"
+- inputText: "${value}"
+${exactProfileNumericKeyboardDismissal(input)}
+- assertVisible: "${value}"`;
+    assert.equal(
+      flow.split(exactInputSequence).length - 1,
+      1,
+      `${label} must preserve anchored entry, platform dismissal, and value assertion order`,
+    );
+    assert.equal(
+      flow.split(selector).length - 1,
+      2,
+      `${label} anchored placeholder must appear only in its scroll and tap selectors`,
+    );
+    assert.equal(flow.includes(`- tapOn: "${placeholder}"`), false, `${label} tap selector must stay anchored`);
+    assert.equal(flow.includes(`      text: "${placeholder}"`), false, `${label} scroll selector must stay anchored`);
+    assert.equal(flow.includes(`      text: "${label}"`), false, `${label} must not be used as the scroll target`);
+  }
+}
+
+function exactProfileRestartNumericValueProof(value: string): string {
+  const selector = `^${escapeRegex(value)}$`;
+  return `- scrollUntilVisible:
+    element:
+      text: '${selector}'
+    direction: DOWN
+- assertVisible: '${selector}'`;
+}
+
+function assertProfileRestartNumericValueProof(flow: string): void {
+  const proofs = exactProfileNumericInputs.map(({ value }) => exactProfileRestartNumericValueProof(value));
+  ordered(flow, ...proofs);
+  for (const { label, value } of exactProfileNumericInputs) {
+    const selector = `^${escapeRegex(value)}$`;
+    assert.equal(
+      flow.split(exactProfileRestartNumericValueProof(value)).length - 1,
+      1,
+      `${label} restart proof must scroll DOWN to and assert the exact anchored value once`,
+    );
+    assert.equal(flow.split(selector).length - 1, 2, `${label} restart proof must use its anchored value only for scroll and assertion`);
+    assert.equal(flow.includes(`text: "${label}"`), false, `${label} must not be a restart scroll target`);
+    assert.equal(flow.includes(`assertVisible: "${value}"`), false, `${label} restart assertion must stay anchored`);
+  }
+  assert.doesNotMatch(flow, /\b(?:optional|retry|sleep)\b/i, "Profile restart numeric proof must not mask failures");
+  assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile restart numeric proof must not use coordinates");
+}
+
+const exactProfileSaveVisibilitySequence = `- tapOn: "保存宝宝资料"
+- scrollUntilVisible:
+    element:
+      text: "^宝宝资料已保存$"
+    direction: DOWN
+- assertVisible: "^宝宝资料已保存$"
+- scrollUntilVisible:
+    element:
+      text: "G031LeapBaby"
+    direction: UP`;
+
+function assertProfileSaveVisibilityPolicy(flow: string): void {
+  assert.equal(
+    flow.split(exactProfileSaveVisibilitySequence).length - 1,
+    1,
+    "Profile save must scroll DOWN to the exact success message, assert it, then scroll UP to the saved name",
+  );
+  assert.equal(
+    (flow.match(/\^宝宝资料已保存\$/g) ?? []).length,
+    2,
+    "Profile save must use the exact anchored success message only for its scroll and visible assertion",
+  );
+  assert.doesNotMatch(flow, /\boptional\s*:/i, "Profile save visibility commands must remain mandatory");
+  assert.doesNotMatch(flow, /^\s*(?:point|coordinates):/m, "Profile save visibility must not use coordinates");
+  assert.doesNotMatch(flow, /\bsleep\s*(?:\(|:|\d)/i, "Profile save visibility must not use sleeps");
+  assert.doesNotMatch(flow, /^- retry\s*:/m, "Profile save visibility must not use broad retries");
+}
+
+test("G031 native policy preserves Debug evidence before one-way offline Release profile proof", async () => {
+  const [androidWorkflow, iosWorkflow, androidRunner, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, appFrameSource, profileSource, saveFlow, restartFlow] = await Promise.all([
+    readFile(".github/workflows/e2e-android.yml", "utf8"),
+    readFile(".github/workflows/e2e-ios.yml", "utf8"),
+    readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
+    readFile("scripts/e2e/run-profile-restart-android.sh", "utf8"),
+    readFile("scripts/e2e/run-profile-restart-ios.sh", "utf8"),
+    readFile("scripts/e2e/query-ios-device-calendar.sh", "utf8"),
+    readFile("scripts/e2e/ios-device-calendar.swift", "utf8"),
+    readFile("src/shared/ui/AppFrame.tsx", "utf8"),
+    readFile("src/features/profile/BabyProfileScreen.tsx", "utf8"),
+    readFile("e2e/maestro/profile-save.yaml", "utf8"),
+    readFile("e2e/maestro/profile-restart.yaml", "utf8"),
+  ]);
+  for (const script of ["scripts/e2e/run-android-emulator.sh", "scripts/e2e/run-profile-restart-android.sh", "scripts/e2e/run-profile-restart-ios.sh", "scripts/e2e/query-ios-device-calendar.sh"]) {
+    assert.equal(spawnSync("bash", ["-n", script]).status, 0, `${script} must be valid Bash`);
+  }
+  assert.equal((androidWorkflow.match(/:app:assembleRelease/g) ?? []).length, 1, "Android Release must build exactly once");
+  assert.equal((iosWorkflow.match(/-configuration Release/g) ?? []).length, 1, "iOS Release must build exactly once");
+  ordered(androidRunner,
+    "bash scripts/e2e/run-persistence-android.sh",
+    'kill -- "-$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    'adb -s "$emulator_serial" reverse --remove tcp:8081',
+    "curl --silent --fail http://127.0.0.1:8081/status",
+    "bash scripts/e2e/run-profile-restart-android.sh",
+  );
+  ordered(iosWorkflow,
+    "bash scripts/e2e/run-persistence-ios.sh",
+    'kill -- "-$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    "curl --silent --fail http://127.0.0.1:8081/status",
+    "bash scripts/e2e/run-profile-restart-ios.sh",
+  );
+  for (const [platform, script] of [["android", androidProfile], ["ios", iosProfile]] as const) {
+    assert.match(script, /profile-snapshot/);
+    assert.match(script, /age-oracle/);
+    assert.match(script, /profile-report/);
+    assert.match(script, /profile-save\.yaml/);
+    assert.match(script, /profile-restart\.yaml/);
+    assert.doesNotMatch(script, /run-persistence|seed-recovery|push_db|openurl|android\.intent\.action\.VIEW|expo start/);
+    assert.match(script, new RegExp(`\\.artifacts/${platform}-profile-restart\\.json`));
+  }
+  assert.equal((androidProfile.match(/shell am start -a android\.intent\.action\.MAIN -c android\.intent\.category\.LAUNCHER/g) ?? []).length, 1);
+  assert.equal((androidProfile.match(/ install --no-streaming /g) ?? []).length, 1);
+  assert.equal((androidProfile.match(/ uninstall /g) ?? []).length, 1);
+  assert.equal((iosProfile.match(/xcrun simctl launch /g) ?? []).length, 1);
+  assert.equal((iosProfile.match(/xcrun simctl install /g) ?? []).length, 1);
+  assert.equal((iosProfile.match(/xcrun simctl uninstall /g) ?? []).length, 1);
+  assertAndroidProfileRootPolicy(androidProfile);
+  assertAndroidProfilePackageReadiness(androidProfile);
+  assertAndroidProfilePidofPolicy(androidProfile);
+  assertNonPipelinedApkInspection(androidWorkflow, androidProfile);
+  assertProfileBootstrapReadiness(androidProfile, "android");
+  assertProfileBootstrapReadiness(iosProfile, "ios");
+  assertIosDeviceCalendarPolicy(iosProfile, iosCalendarQuery, iosCalendarSource);
+  assertProfileTabNavigation(saveFlow, exactProfileSourceStates.save);
+  assertProfileTabNavigation(restartFlow, exactProfileSourceStates.restart);
+  assertProfileKeyboardDismissalPolicy(saveFlow);
+  assertProfileOnDragKeyboardDismissal(appFrameSource, profileSource);
+  assertProfileNameToBirthDateTransition(saveFlow);
+  assertProfileRadioSelectionPolicy(saveFlow, restartFlow);
+  assertProfileNumericInputTargeting(saveFlow);
+  assertProfileRestartNumericValueProof(restartFlow);
+  assertProfileSaveVisibilityPolicy(saveFlow);
+  assertProfileRestartFlowOrder(restartFlow);
+  for (const flow of [saveFlow, restartFlow]) {
+    for (const value of ["G031LeapBaby", "2024-02-29", "${AGE_DISPLAY}"]) assert.match(flow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(flow, /baby-profile-sex-female-selected/);
+    assert.match(flow, /baby-profile-prematurity-preterm-selected/);
+  }
+  assert.match(saveFlow, /宝宝资料已保存/);
+  assert.match(restartFlow, /assertNotVisible: "宝宝资料已保存"/);
+});
+
+test("G031 Android root transition accepts only exact outcomes and proves root after a bounded serial wait", async () => {
+  const repeatedSuccessCalls = [
+    "adb -s emulator-5554 root",
+    "timeout 30s adb -s emulator-5554 wait-for-device",
+    "adb -s emulator-5554 wait-for-device",
+    "adb -s emulator-5554 shell id -u",
+    "adb -s emulator-5554 root",
+    "timeout 30s adb -s emulator-5554 wait-for-device",
+    "adb -s emulator-5554 wait-for-device",
+    "adb -s emulator-5554 shell id -u",
+  ];
+  for (const accepted of [
+    { label: "silent success", rootOutput: "", rootStatus: 0 },
+    { label: "already root", rootOutput: "adbd is already running as root", rootStatus: 0 },
+    { label: "normal restart", rootOutput: "restarting adbd as root", rootStatus: 0 },
+    { label: "exact closed transition", rootOutput: "adb: unable to connect for root: closed", rootStatus: 1 },
+  ]) {
+    const harness = await runAndroidProfileRootHarness(accepted);
+    assert.equal(harness.result.status, 0, `${accepted.label}: ${harness.result.stderr}`);
+    assert.deepEqual(harness.calls, repeatedSuccessCalls, `${accepted.label} must pass the complete helper twice`);
+  }
+
+  for (const rejected of [
+    { label: "status-zero unknown output", rootOutput: "adbd cannot run as root in production builds", rootStatus: 0 },
+    { label: "generic offline", rootOutput: "error: device offline", rootStatus: 1 },
+    { label: "generic broken pipe", rootOutput: "error: write failed: Broken pipe", rootStatus: 1 },
+    { label: "embedded carriage return", rootOutput: "adb:\r unable to connect for root: closed", rootStatus: 1 },
+    { label: "closed transition with extra output", rootOutput: "adb: unable to connect for root: closed\ndiagnostic", rootStatus: 1 },
+    { label: "closed transition with wrong status", rootOutput: "adb: unable to connect for root: closed", rootStatus: 2 },
+  ]) {
+    const harness = await runAndroidProfileRootHarness(rejected);
+    assert.notEqual(harness.result.status, 0, `${rejected.label} must fail closed`);
+    assert.deepEqual(harness.calls, ["adb -s emulator-5554 root"], `${rejected.label} must stop before waiting or data access`);
+    assert.match(harness.result.stderr, /Unexpected adb root result/);
+  }
+
+  const waitFailure = await runAndroidProfileRootHarness({
+    rootOutput: "restarting adbd as root",
+    rootStatus: 0,
+    waitStatus: 124,
+  });
+  assert.equal(waitFailure.result.status, 124);
+  assert.deepEqual(waitFailure.calls, [
+    "adb -s emulator-5554 root",
+    "timeout 30s adb -s emulator-5554 wait-for-device",
+    "adb -s emulator-5554 wait-for-device",
+  ]);
+  assert.match(waitFailure.result.stderr, /adb root wait failed \(status 124\)/);
+
+  const nonRootPostcondition = await runAndroidProfileRootHarness({
+    rootOutput: "adb: unable to connect for root: closed",
+    rootStatus: 1,
+    uidOutput: "2000",
+  });
+  assert.equal(nonRootPostcondition.result.status, 1);
+  assert.deepEqual(nonRootPostcondition.calls, repeatedSuccessCalls.slice(0, 4));
+  assert.match(nonRootPostcondition.result.stderr, /adb root postcondition failed \(status 0\): 2000/);
+});
+
+test("G031 hostile policy rejects Release readiness, pipefail, APK inspection, keyboard, save visibility, and restart-order regressions", async () => {
+  const [androidWorkflow, androidProfile, iosProfile, iosCalendarQuery, iosCalendarSource, appFrameSource, profileSource, saveFlow, restartFlow] = await Promise.all([
+    readFile(".github/workflows/e2e-android.yml", "utf8"),
+    readFile("scripts/e2e/run-profile-restart-android.sh", "utf8"),
+    readFile("scripts/e2e/run-profile-restart-ios.sh", "utf8"),
+    readFile("scripts/e2e/query-ios-device-calendar.sh", "utf8"),
+    readFile("scripts/e2e/ios-device-calendar.swift", "utf8"),
+    readFile("src/shared/ui/AppFrame.tsx", "utf8"),
+    readFile("src/features/profile/BabyProfileScreen.tsx", "utf8"),
+    readFile("e2e/maestro/profile-save.yaml", "utf8"),
+    readFile("e2e/maestro/profile-restart.yaml", "utf8"),
+  ]);
+
+  for (const mutation of [
+    androidProfile.replace("'0:'|'0:restarting adbd as root'", "0:*|'0:restarting adbd as root'"),
+    androidProfile.replace("|'1:adb: unable to connect for root: closed'", "|'1:adb: unable to connect for root: '*"),
+    androidProfile.replace('timeout 30s adb -s "$serial" wait-for-device', 'adb -s "$serial" wait-for-device'),
+    androidProfile.replace('[ "$uid_status" -ne 0 ] || [ "$uid_output" != 0 ]', '[ "$uid_status" -ne 0 ]'),
+  ]) {
+    assert.notEqual(mutation, androidProfile, "root policy mutation must change the wrapper");
+    assert.throws(() => assertAndroidProfileRootPolicy(mutation));
+  }
+
+  const packageMutations = [
+    androidProfile.replace("wait_for_package_service\nadb", "adb"),
+    androidProfile.replace('adb -s "$serial" uninstall "$app_id" >/dev/null\nif ! install_apk; then', 'if ! install_apk; then\nadb -s "$serial" uninstall "$app_id" >/dev/null'),
+    androidProfile.replace("    wait_for_package_service\n    install_apk", "    install_apk"),
+  ];
+  for (const mutation of packageMutations) {
+    assert.notEqual(mutation, androidProfile, "package readiness mutation must change the wrapper");
+    assert.throws(() => assertAndroidProfilePackageReadiness(mutation));
+  }
+
+  for (const [platform, script] of [["android", androidProfile], ["ios", iosProfile]] as const) {
+    const readiness = exactProfileReadinessCommands[platform];
+    const mutation = script.replace(`${readiness}\nterminate "$pre_save_pid"`, `terminate "$pre_save_pid"\n${readiness}`);
+    assert.notEqual(mutation, script, `${platform} bootstrap mutation must change the wrapper`);
+    assert.throws(() => assertProfileBootstrapReadiness(mutation, platform));
+  }
+
+  for (const [label, profile, query, source] of [
+    ["bare date", iosProfile.replace("bash scripts/e2e/query-ios-device-calendar.sh \"$udid\"", 'xcrun simctl spawn "$udid" date +%Y-%m-%d'), iosCalendarQuery, iosCalendarSource],
+    ["host target", iosProfile, iosCalendarQuery.replace('-target "${simulator_arch}-apple-ios13.0-simulator"', '-target "arm64-apple-macos15.0"'), iosCalendarSource],
+    ["missing multiline guard", iosProfile, iosCalendarQuery.replace('case "$output" in *$\'\\n\'*) echo "Simulator calendar probe returned multiple lines" >&2; exit 1 ;; esac\n', ""), iosCalendarSource],
+    ["host time zone", iosProfile, iosCalendarQuery, iosCalendarSource.replace("TimeZone.current.identifier", "ProcessInfo.processInfo.environment[\"TZ\"] ?? \"UTC\"")],
+  ] as const) {
+    assert.throws(() => assertIosDeviceCalendarPolicy(profile, query, source), label);
+  }
+
+  const calendarHarness = async (output: string, architecture = "arm64") => {
+    const root = await mkdtemp(join(tmpdir(), "g031-ios-calendar-"));
+    const bin = join(root, "bin");
+    const log = join(root, "calls.log");
+    await mkdir(bin);
+    await writeFile(join(bin, "uname"), `#!/usr/bin/env bash\nprintf '%s\\n' ${JSON.stringify(architecture)}\n`);
+    await writeFile(join(bin, "xcrun"), `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = "--sdk" ]; then
+  probe=; previous=
+  for argument in "$@"; do [ "$previous" != "-o" ] || probe=$argument; previous=$argument; done
+  : > "$probe"
+  exit 0
+fi
+printf '%b' ${JSON.stringify(output)}
+`);
+    await chmod(join(bin, "uname"), 0o755);
+    await chmod(join(bin, "xcrun"), 0o755);
+    const result = spawnSync("bash", ["scripts/e2e/query-ios-device-calendar.sh", "simulator-udid"], {
+      cwd: resolve("."),
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, TMPDIR: root },
+    });
+    const calls = await readFile(log, "utf8").catch(() => "");
+    await rm(root, { recursive: true, force: true });
+    return { ...result, calls };
+  };
+  const validCalendar = await calendarHarness("2026-07-18\\tAsia/Shanghai\\r\\n");
+  assert.equal(validCalendar.status, 0, validCalendar.stderr);
+  assert.equal(validCalendar.stdout, "2026-07-18\tAsia/Shanghai\n");
+  assert.match(validCalendar.calls, /--sdk iphonesimulator swiftc -parse-as-library -target arm64-apple-ios13\.0-simulator/);
+  assert.match(validCalendar.calls, /simctl spawn simulator-udid .*\/device-calendar/);
+  for (const hostile of [
+    await calendarHarness("2026-7-18\\tAsia/Shanghai\\n"),
+    await calendarHarness("2026-07-18\\tAsia/Shanghai\\textra\\n"),
+    await calendarHarness("2026-07-18\\tAsia/Shanghai\\n2026-07-19\\tUTC\\n"),
+    await calendarHarness("2026-07-18\\t\\n"),
+    await calendarHarness("2026-07-18\\tUTC\\n", "riscv64"),
+  ]) assert.notEqual(hostile.status, 0, `hostile calendar output survived: ${hostile.stdout}`);
+
+  const pidPipelineMutation = androidProfile.replace(
+    exactAndroidProfilePidofHelper,
+    'pidof_app() { adb -s "$serial" shell pidof -s "$app_id" 2>/dev/null | tr -d \'\\r\'; }',
+  );
+  assert.notEqual(pidPipelineMutation, androidProfile);
+  assert.throws(() => assertAndroidProfilePidofPolicy(pidPipelineMutation));
+
+  const pidTransportFailure = spawnSync("bash", ["-c", `set -euo pipefail
+adb() { printf '%s\\n' 'adb transport unavailable' >&2; return 1; }
+serial=emulator-5554
+app_id=com.luyao618.formobile
+${exactAndroidProfilePidofHelper}
+pid=$(pidof_app)
+test -z "$pid"
+`], { encoding: "utf8" });
+  assert.equal(pidTransportFailure.status, 1);
+  assert.match(pidTransportFailure.stderr, /adb transport unavailable/);
+
+  const pidRemoteNoProcess = spawnSync("bash", ["-c", `set -euo pipefail
+adb() { printf '%s\\n' '__PIDOF_STATUS__=1'; return 0; }
+serial=emulator-5554
+app_id=com.luyao618.formobile
+${exactAndroidProfilePidofHelper}
+pid=$(pidof_app)
+test -z "$pid"
+printf '%s\\n' accepted-remote-no-process
+`], { encoding: "utf8" });
+  assert.equal(pidRemoteNoProcess.status, 0, pidRemoteNoProcess.stderr);
+  assert.equal(pidRemoteNoProcess.stdout, "accepted-remote-no-process\n");
+
+  for (const output of ["", "123", "abc\\n__PIDOF_STATUS__=0", "123\\n__PIDOF_STATUS__=1", "123\\n__PIDOF_STATUS__=999"]) {
+    const malformedPid = spawnSync("bash", ["-c", `set -euo pipefail
+adb() { printf '%b' ${JSON.stringify(output)}; return 0; }
+serial=emulator-5554
+app_id=com.luyao618.formobile
+${exactAndroidProfilePidofHelper}
+pid=$(pidof_app)
+`], { encoding: "utf8" });
+    assert.notEqual(malformedPid.status, 0, `malformed pidof observation survived: ${JSON.stringify(output)}`);
+  }
+
+  const workflowPipelineMutation = androidWorkflow.replace(
+    "unzip -Z1 android/app/build/outputs/apk/release/app-release.apk > /tmp/g031-release-apk.entries\n          grep -Eq '^assets/(index\\.android\\.bundle|index\\.bundle)$' /tmp/g031-release-apk.entries",
+    "unzip -l android/app/build/outputs/apk/release/app-release.apk | grep -Eq 'assets/(index\\.android\\.bundle|index\\.bundle)'",
+  );
+  const profilePipelineMutation = androidProfile.replace(
+    'apk_entries=$(unzip -Z1 "$release_apk")\ngrep -Eq \'^assets/(index\\.android\\.bundle|index\\.bundle)$\' <<< "$apk_entries"',
+    'unzip -l "$release_apk" | grep -Eq \'assets/(index\\.android\\.bundle|index\\.bundle)\'',
+  );
+  assert.notEqual(workflowPipelineMutation, androidWorkflow);
+  assert.notEqual(profilePipelineMutation, androidProfile);
+  assert.throws(() => assertNonPipelinedApkInspection(workflowPipelineMutation, androidProfile));
+  assert.throws(() => assertNonPipelinedApkInspection(androidWorkflow, profilePipelineMutation));
+
+  const nameDismissal = exactProfileTextKeyboardDismissal("宝宝姓名");
+  const androidDismissal = `- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard`;
+  const iosDismissal = `- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "宝宝姓名"`;
+  const keyboardMutations = [
+    ["missing Android branch", saveFlow.replace(nameDismissal, iosDismissal)],
+    ["missing iOS branch", saveFlow.replace(nameDismissal, androidDismissal)],
+    ["wrong Android platform", saveFlow.replace(nameDismissal, nameDismissal.replace("platform: Android", "platform: Web"))],
+    ["wrong iOS platform", saveFlow.replace(nameDismissal, nameDismissal.replace("platform: iOS", "platform: Web"))],
+    ["reordered platform branches", saveFlow.replace(nameDismissal, `${iosDismissal}\n${androidDismissal}`)],
+    ["universal hideKeyboard", saveFlow.replace(nameDismissal, "- hideKeyboard")],
+    ["wrong iOS label", saveFlow.replace(nameDismissal, nameDismissal.replace('tapOn: "宝宝姓名"', 'tapOn: "出生日期"'))],
+    ["retry", `${saveFlow}\n- retry: 2\n`],
+    ["sleep", `${saveFlow}\n- evalScript: "sleep(1000)"\n`],
+    ["optional command", `${saveFlow}\n- tapOn:\n    text: "宝宝姓名"\n    optional: true\n`],
+    ["coordinate tap", `${saveFlow}\n- tapOn:\n    point: "50%,50%"\n`],
+  ] as const;
+  for (const [label, mutation] of keyboardMutations) {
+    assert.notEqual(mutation, saveFlow, `${label} mutation must change the flow`);
+    assert.throws(() => assertProfileKeyboardDismissalPolicy(mutation), label);
+  }
+
+  const onDragMutations = [
+    ["missing AppFrame forwarding", appFrameSource.replace(" keyboardDismissMode={keyboardDismissMode}", ""), profileSource],
+    ["missing handled tap policy", appFrameSource.replace(' keyboardShouldPersistTaps="handled"', ""), profileSource],
+    ["missing profile on-drag", appFrameSource, profileSource.replace(' keyboardDismissMode="on-drag"', "")],
+    ["wrong profile dismissal mode", appFrameSource, profileSource.replace('keyboardDismissMode="on-drag"', 'keyboardDismissMode="none"')],
+  ] as const;
+  for (const [label, appFrameMutation, profileMutation] of onDragMutations) {
+    assert.ok(appFrameMutation !== appFrameSource || profileMutation !== profileSource, `${label} mutation must change component source`);
+    assert.throws(() => assertProfileOnDragKeyboardDismissal(appFrameMutation, profileMutation), label);
+  }
+
+  for (const { label, placeholder } of exactProfileTextInputs) {
+    const selector = `^${placeholder}$`;
+    const labelTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${label}"`);
+    assert.notEqual(labelTapMutation, saveFlow, `${label} label-tap mutation must change the flow`);
+    assert.throws(() => assertProfileNameToBirthDateTransition(labelTapMutation));
+
+    const unanchoredTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${placeholder}"`);
+    assert.notEqual(unanchoredTapMutation, saveFlow, `${label} unanchored-tap mutation must change the flow`);
+    assert.throws(() => assertProfileNameToBirthDateTransition(unanchoredTapMutation));
+  }
+
+  for (const [index, input] of exactProfileNumericInputs.entries()) {
+    const { label, placeholder, value } = input;
+    const otherInput = exactProfileNumericInputs[(index + 1) % exactProfileNumericInputs.length]!;
+    const selector = `^${placeholder}$`;
+    const labelTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${label}"`);
+    assert.notEqual(labelTapMutation, saveFlow, `${label} label-tap mutation must change the flow`);
+    assert.throws(() => assertProfileNumericInputTargeting(labelTapMutation));
+
+    const labelScrollMutation = saveFlow.replace(`      text: "${selector}"`, `      text: "${label}"`);
+    assert.notEqual(labelScrollMutation, saveFlow, `${label} label-scroll mutation must change the flow`);
+    assert.throws(() => assertProfileNumericInputTargeting(labelScrollMutation));
+
+    const unanchoredTapMutation = saveFlow.replace(`- tapOn: "${selector}"`, `- tapOn: "${placeholder}"`);
+    assert.notEqual(unanchoredTapMutation, saveFlow, `${label} unanchored-tap mutation must change the flow`);
+    assert.throws(() => assertProfileNumericInputTargeting(unanchoredTapMutation));
+
+    const unanchoredScrollMutation = saveFlow.replace(`      text: "${selector}"`, `      text: "${placeholder}"`);
+    assert.notEqual(unanchoredScrollMutation, saveFlow, `${label} unanchored-scroll mutation must change the flow`);
+    assert.throws(() => assertProfileNumericInputTargeting(unanchoredScrollMutation));
+
+    const exactDismissal = exactProfileNumericKeyboardDismissal(input);
+    const enteredValueSelector = `^${escapeRegex(value)}$`;
+    const otherEnteredValueSelector = `^${escapeRegex(otherInput.value)}$`;
+    const forcedSwipe = `      - swipe:
+          direction: DOWN`;
+    const valueScroll = `      - scrollUntilVisible:
+          element:
+            text: '${enteredValueSelector}'
+          direction: ${input.dismissDirection}`;
+    const dismissalMutations = [
+      ["missing forced DOWN swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(`${forcedSwipe}\n`, ""))],
+      ["UP forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, forcedSwipe.replace("direction: DOWN", "direction: UP")))],
+      ["coordinate forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, `      - swipe:
+          start: "50%,75%"
+          end: "50%,25%"`))],
+      ["reordered forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(`${forcedSwipe}\n${valueScroll}`, `${valueScroll}\n${forcedSwipe}`))],
+      ["optional forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, `${forcedSwipe}\n        optional: true`))],
+      ["retried forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, `${forcedSwipe}\n        retry: 2`))],
+      ["sleep after forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(`${forcedSwipe}\n`, `${forcedSwipe}\n      - evalScript: "sleep(1000)"\n`))],
+      ["label tap instead of forced swipe", saveFlow.replace(exactDismissal, exactDismissal.replace(forcedSwipe, `      - tapOn: "${label}"`))],
+      ["iOS label tap dismissal", saveFlow.replace(exactDismissal, exactProfileTextKeyboardDismissal(label))],
+      ["wrong entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(enteredValueSelector, otherEnteredValueSelector))],
+      ["wrong search direction", saveFlow.replace(exactDismissal, exactDismissal.replace(`direction: ${input.dismissDirection}`, "direction: UP"))],
+      ["unanchored entered-value dismissal target", saveFlow.replace(exactDismissal, exactDismissal.replace(enteredValueSelector, escapeRegex(value)))],
+      ["missing iOS value-scroll dismissal", saveFlow.replace(exactDismissal, androidDismissal)],
+    ] as const;
+    for (const [mutationLabel, mutation] of dismissalMutations) {
+      assert.notEqual(mutation, saveFlow, `${label} ${mutationLabel} mutation must change the flow`);
+      assert.throws(() => assertProfileKeyboardDismissalPolicy(mutation), `${label} ${mutationLabel}`);
+    }
+  }
+
+  for (const [index, input] of exactProfileNumericInputs.entries()) {
+    const { label, value } = input;
+    const otherInput = exactProfileNumericInputs[(index + 1) % exactProfileNumericInputs.length]!;
+    const exactProof = exactProfileRestartNumericValueProof(value);
+    const selector = `^${escapeRegex(value)}$`;
+    const otherSelector = `^${escapeRegex(otherInput.value)}$`;
+    const scroll = `- scrollUntilVisible:
+    element:
+      text: '${selector}'
+    direction: DOWN`;
+    const restartMutations = [
+      ["label target", restartFlow.replace(exactProof, exactProof.replace(`text: '${selector}'`, `text: "${label}"`))],
+      ["unanchored value", restartFlow.replace(exactProof, exactProof.replaceAll(selector, escapeRegex(value)))],
+      ["mismatched assertion", restartFlow.replace(exactProof, exactProof.replace(`assertVisible: '${selector}'`, `assertVisible: '${otherSelector}'`))],
+      ["UP direction", restartFlow.replace(exactProof, exactProof.replace("direction: DOWN", "direction: UP"))],
+      ["missing scroll", restartFlow.replace(exactProof, `- assertVisible: '${selector}'`)],
+      ["optional fallback", restartFlow.replace(exactProof, exactProof.replace(scroll, `${scroll}\n    optional: true`))],
+      ["retry fallback", restartFlow.replace(exactProof, exactProof.replace(scroll, `${scroll}\n    retry: 2`))],
+      ["sleep fallback", restartFlow.replace(exactProof, exactProof.replace(`${scroll}\n`, `${scroll}\n- evalScript: "sleep(1000)"\n`))],
+      ["coordinate fallback", restartFlow.replace(exactProof, `${exactProof}\n- tapOn:\n    point: "50%,50%"`)],
+    ] as const;
+    for (const [mutationLabel, mutation] of restartMutations) {
+      assert.notEqual(mutation, restartFlow, `${label} restart ${mutationLabel} mutation must change the flow`);
+      assert.throws(() => assertProfileRestartNumericValueProof(mutation), `${label} restart ${mutationLabel}`);
+    }
+  }
+
+  for (const [index, selection] of exactProfileRadioSelections.entries()) {
+    const otherSelection = exactProfileRadioSelections[1 - index]!;
+    const exactSelection = exactProfileRadioSelection(selection);
+    const conditionalSecondTap = exactIosConditionalSecondProfileRadioTap(selection);
+    const unconditionalSecondTap = `      - tapOn:
+          id: "${selection.targetID}-unselected"`;
+    const radioMutations = [
+      ["missing conditional second tap", saveFlow.replace(`${conditionalSecondTap}\n`, "")],
+      ["extra conditional second tap", saveFlow.replace(conditionalSecondTap, `${conditionalSecondTap}\n${conditionalSecondTap}`)],
+      ["unconditional second tap", saveFlow.replace(conditionalSecondTap, unconditionalSecondTap)],
+      ["wrong source radio ID", saveFlow.replace(conditionalSecondTap, exactIosConditionalSecondProfileRadioTap({ ...selection, sourceID: otherSelection.sourceID }))],
+      ["wrong second-tap target ID", saveFlow.replace(conditionalSecondTap, exactIosConditionalSecondProfileRadioTap({ ...selection, targetID: otherSelection.targetID }))],
+      ["source unselected condition", saveFlow.replace(conditionalSecondTap, conditionalSecondTap.replace(`${selection.sourceID}-selected`, `${selection.sourceID}-unselected`))],
+      ["source text and checked fallback", saveFlow.replace(conditionalSecondTap, conditionalSecondTap.replace(`id: "${selection.sourceID}-selected"`, `text: "${selection.sourceLabel}"\n              checked: true`))],
+      ["target selected tap", saveFlow.replace(exactSelection, exactSelection.replace(`${selection.targetID}-unselected`, `${selection.targetID}-selected`))],
+      ["target unselected assertion", saveFlow.replace(exactSelection, exactSelection.replace(`${selection.targetID}-selected`, `${selection.targetID}-unselected`))],
+      ["text and checked fallback", saveFlow.replace(exactSelection, exactSelection.replace(`id: "${selection.targetID}-selected"`, `text: "${selection.targetLabel}"\n    checked: true`))],
+      ["Android platform drift", saveFlow.replace(exactSelection, exactSelection.replace("platform: Android", "platform: iOS"))],
+      ["iOS platform drift", saveFlow.replace(exactSelection, exactSelection.replace("platform: iOS", "platform: Android"))],
+      ["retryTapIfNoChange", saveFlow.replace(exactSelection, exactSelection.replace(`          id: "${selection.targetID}-unselected"`, `          id: "${selection.targetID}-unselected"\n        retryTapIfNoChange: true`))],
+      ["optional tap", `${saveFlow}\n- tapOn:\n    id: "${selection.targetID}-unselected"\n    optional: true\n`],
+      ["coordinate tap", `${saveFlow}\n- tapOn:\n    point: "50%,50%"\n`],
+      ["sleep", `${saveFlow}\n- evalScript: "sleep(1000)"\n`],
+      ["broad retry", `${saveFlow}\n- retry: 2\n`],
+    ] as const;
+    for (const [label, mutation] of radioMutations) {
+      assert.notEqual(mutation, saveFlow, `${selection.targetLabel} ${label} mutation must change the flow`);
+      assert.throws(() => assertProfileRadioSelectionPolicy(mutation, restartFlow), `${selection.targetLabel} ${label}`);
+    }
+
+    const restartAssertion = exactProfileRestartRadioAssertion(selection);
+    const restartMutations = [
+      ["missing restart ID assertion", restartFlow.replace(`${restartAssertion}\n`, "")],
+      ["duplicate restart ID assertion", restartFlow.replace(restartAssertion, `${restartAssertion}\n${restartAssertion}`)],
+      ["restart unselected assertion", restartFlow.replace(restartAssertion, restartAssertion.replace(`${selection.targetID}-selected`, `${selection.targetID}-unselected`))],
+      ["wrong restart radio ID", restartFlow.replace(restartAssertion, exactProfileRestartRadioAssertion({ ...selection, targetID: otherSelection.targetID }))],
+      ["restart text and checked fallback", restartFlow.replace(restartAssertion, `- assertVisible:\n    text: "${selection.targetLabel}"\n    checked: true`)],
+    ] as const;
+    for (const [label, mutation] of restartMutations) {
+      assert.notEqual(mutation, restartFlow, `${selection.targetLabel} ${label} mutation must change the flow`);
+      assert.throws(() => assertProfileRadioSelectionPolicy(saveFlow, mutation), `${selection.targetLabel} ${label}`);
+    }
+  }
+
+  const exactSuccessScroll = `- scrollUntilVisible:
+    element:
+      text: "^宝宝资料已保存$"
+    direction: DOWN`;
+  const exactSuccessAssertion = '- assertVisible: "^宝宝资料已保存$"';
+  const saveVisibilityMutations = [
+    ["direct off-screen wait", saveFlow.replace(
+      `${exactSuccessScroll}\n${exactSuccessAssertion}`,
+      `- extendedWaitUntil:\n    visible: "^宝宝资料已保存$"\n    timeout: 30000`,
+    )],
+    ["missing success scroll", saveFlow.replace(`${exactSuccessScroll}\n`, "")],
+    ["ambiguous success message", saveFlow.replaceAll("^宝宝资料已保存$", "宝宝资料已保存")],
+    ["wrong success scroll direction", saveFlow.replace(exactSuccessScroll, exactSuccessScroll.replace("direction: DOWN", "direction: UP"))],
+    ["optional success assertion", saveFlow.replace(exactSuccessAssertion, '- assertVisible:\n    text: "^宝宝资料已保存$"\n    optional: true')],
+    ["coordinate fallback", saveFlow.replace('- tapOn: "保存宝宝资料"', '- tapOn: "保存宝宝资料"\n- tapOn:\n    point: "50%,90%"')],
+    ["sleep fallback", saveFlow.replace('- tapOn: "保存宝宝资料"', '- tapOn: "保存宝宝资料"\n- evalScript: "sleep(1000)"')],
+    ["broad retry fallback", saveFlow.replace('- tapOn: "保存宝宝资料"', '- tapOn: "保存宝宝资料"\n- retry: 2')],
+  ] as const;
+  for (const [label, mutation] of saveVisibilityMutations) {
+    assert.notEqual(mutation, saveFlow, `${label} mutation must change the flow`);
+    assert.throws(() => assertProfileSaveVisibilityPolicy(mutation), label);
+  }
+
+  for (const [label, flow, sourceState, wrongSourceState] of [
+    ["save", saveFlow, exactProfileSourceStates.save, exactProfileSourceStates.restart],
+    ["restart", restartFlow, exactProfileSourceStates.restart, exactProfileSourceStates.save],
+  ] as const) {
+    const exactNavigation = exactProfileTabNavigation(sourceState);
+    const conditionalSecondTap = exactIosConditionalSecondProfileTabTap(sourceState);
+    const unconditionalSecondTap = `      - tapOn:
+          id: "tab-MeTab"`;
+    const navigationMutations = [
+      ["missing conditional second tap", flow.replace(`${conditionalSecondTap}\n`, "")],
+      ["extra conditional second tap", flow.replace(conditionalSecondTap, `${conditionalSecondTap}\n${conditionalSecondTap}`)],
+      ["unconditional second tap", flow.replace(conditionalSecondTap, unconditionalSecondTap)],
+      ["wrong source-state condition", flow.replace(conditionalSecondTap, exactIosConditionalSecondProfileTabTap(wrongSourceState))],
+      ["retryTapIfNoChange", flow.replace('      - tapOn:\n          id: "tab-MeTab"', '      - tapOn:\n          id: "tab-MeTab"\n          retryTapIfNoChange: true')],
+      ["text selector", flow.replace('id: "tab-MeTab"', 'text: "我的"')],
+      ["iOS platform drift", flow.replace(exactNavigation, exactNavigation.replace("platform: iOS", "platform: Android"))],
+      ["Android platform drift", flow.replace(exactNavigation, exactNavigation.replace("platform: Android", "platform: iOS"))],
+      ["ambiguous readiness", flow.replace(exactNavigation, exactNavigation.replace('visible: "宝宝姓名"', 'visible: "宝宝资料"'))],
+      ["optional command", `${flow}\n- tapOn:\n    id: "tab-MeTab"\n    optional: true\n`],
+      ["coordinate tap", `${flow}\n- tapOn:\n    point: "50%,50%"\n`],
+      ["sleep", `${flow}\n- evalScript: "sleep(1000)"\n`],
+      ["broad retry", `${flow}\n- retry: 2\n`],
+    ] as const;
+    for (const [mutationLabel, mutation] of navigationMutations) {
+      assert.notEqual(mutation, flow, `${label} ${mutationLabel} mutation must change the flow`);
+      assert.throws(() => assertProfileTabNavigation(mutation, sourceState), `${label} ${mutationLabel}`);
+    }
+  }
+
+  const exactRestartNavigation = exactProfileTabNavigation(exactProfileSourceStates.restart);
+  const restartOrderMutation = restartFlow.replace(exactRestartNavigation, `- assertVisible: "G031LeapBaby"\n${exactRestartNavigation}`);
+  assert.notEqual(restartOrderMutation, restartFlow);
+  assert.throws(() => assertProfileRestartFlowOrder(restartOrderMutation));
 });

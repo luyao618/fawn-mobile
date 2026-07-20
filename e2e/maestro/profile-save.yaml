@@ -1,0 +1,202 @@
+appId: com.luyao618.formobile
+---
+- extendedWaitUntil:
+    visible: "照护空间尚未设置"
+    timeout: 120000
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
+      - runFlow:
+          when:
+            visible: "照护空间尚未设置"
+          commands:
+            - tapOn:
+                id: "tab-MeTab"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: "tab-MeTab"
+- extendedWaitUntil:
+    visible: "宝宝姓名"
+    timeout: 120000
+- tapOn: "^可暂不填$"
+- inputText: "G031LeapBaby"
+- assertVisible: "G031LeapBaby"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "宝宝姓名"
+- tapOn: "^例如 2024-02-29$"
+- inputText: "2024-02-29"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "出生日期"
+- assertVisible: "2024-02-29"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: "baby-profile-sex-female-unselected"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: "baby-profile-sex-female-unselected"
+      - runFlow:
+          when:
+            visible:
+              id: "baby-profile-sex-unspecified-selected"
+          commands:
+            - tapOn:
+                id: "baby-profile-sex-female-unselected"
+- assertVisible:
+    id: "baby-profile-sex-female-selected"
+- scrollUntilVisible:
+    element:
+      text: "^100–10000$"
+    direction: DOWN
+- tapOn: "^100–10000$"
+- inputText: "3200"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^3200$'
+          direction: DOWN
+- assertVisible: "3200"
+- scrollUntilVisible:
+    element:
+      text: "^10–100$"
+    direction: DOWN
+- tapOn: "^10–100$"
+- inputText: "50.5"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^50\.5$'
+          direction: DOWN
+- assertVisible: "50.5"
+- scrollUntilVisible:
+    element:
+      text: "^10–80$"
+    direction: DOWN
+- tapOn: "^10–80$"
+- inputText: "34.2"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^34\.2$'
+          direction: DOWN
+- assertVisible: "34.2"
+- scrollUntilVisible:
+    element:
+      id: "baby-profile-prematurity-preterm-unselected"
+    direction: DOWN
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: "baby-profile-prematurity-preterm-unselected"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: "baby-profile-prematurity-preterm-unselected"
+      - runFlow:
+          when:
+            visible:
+              id: "baby-profile-prematurity-term-selected"
+          commands:
+            - tapOn:
+                id: "baby-profile-prematurity-preterm-unselected"
+- assertVisible:
+    id: "baby-profile-prematurity-preterm-selected"
+- scrollUntilVisible:
+    element:
+      text: "^20–45，可暂不填$"
+    direction: DOWN
+- tapOn: "^20–45，可暂不填$"
+- inputText: "36"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^36$'
+          direction: DOWN
+- assertVisible: "36"
+- scrollUntilVisible:
+    element:
+      text: "保存宝宝资料"
+    direction: DOWN
+- tapOn: "保存宝宝资料"
+- scrollUntilVisible:
+    element:
+      text: "^宝宝资料已保存$"
+    direction: DOWN
+- assertVisible: "^宝宝资料已保存$"
+- scrollUntilVisible:
+    element:
+      text: "G031LeapBaby"
+    direction: UP
+- assertVisible: "G031LeapBaby"
+- assertVisible: "${AGE_DISPLAY}"
