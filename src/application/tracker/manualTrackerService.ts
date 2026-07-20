@@ -19,6 +19,23 @@ import {
   TrackerValidationError,
 } from "../../domain/tracker/validation.ts";
 
+export type ManualTrackerConflictCode = "stale_write" | "not_found";
+
+export interface ManualTrackerConflictClassifierPort {
+  classify(error: unknown): ManualTrackerConflictCode | null;
+}
+
+export class ManualTrackerConflictError extends Error {
+  constructor(readonly code: ManualTrackerConflictCode) {
+    super(`Manual tracker operation conflicted (${code})`);
+    this.name = "ManualTrackerConflictError";
+  }
+}
+
+export function isManualTrackerConflictError(value: unknown): value is ManualTrackerConflictError {
+  return value instanceof ManualTrackerConflictError;
+}
+
 export interface TrackerStore {
   getById<D extends TrackerDomain>(
     transaction: QueryRunHandle,
@@ -142,10 +159,21 @@ export class ManualTrackerService implements ManualTrackerServicePort {
     private readonly coordinator: DataMutationCoordinator,
     private readonly store: TrackerStore,
     private readonly writer: TrackerWriter,
+    private readonly conflicts: ManualTrackerConflictClassifierPort,
     private readonly clock: ClockPort,
     private readonly ids: LocalIdGenerator,
     private readonly operations: RuntimeOperationPort,
   ) {}
+
+  private async translatePersistenceConflict<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      const code = this.conflicts.classify(error);
+      if (code !== null) throw new ManualTrackerConflictError(code);
+      throw error;
+    }
+  }
 
   getById<D extends TrackerDomain>(domain: D, id: string): Promise<TrackerRecordByDomain[D] | null> {
     return this.operations.run(async () => {
@@ -214,13 +242,15 @@ export class ManualTrackerService implements ManualTrackerServicePort {
       }
       return this.coordinator.runUserWrite(async () => this.transactions.runExclusive(async (transaction) => {
         const now = canonicalTrackerInstant(domain, "updatedAt", this.clock.now());
-        const record = await this.writer.update(
-          transaction,
-          domain,
-          normalizedId,
-          normalized,
-          normalizedExpected,
-          now,
+        const record = await this.translatePersistenceConflict(
+          () => this.writer.update(
+            transaction,
+            domain,
+            normalizedId,
+            normalized,
+            normalizedExpected,
+            now,
+          ),
         );
         return Object.freeze({ status: "completed" as const, summary, record });
       }));
@@ -248,12 +278,14 @@ export class ManualTrackerService implements ManualTrackerServicePort {
       }
       return this.coordinator.runUserWrite(async () => this.transactions.runExclusive(async (transaction) => {
         const now = canonicalTrackerInstant(domain, "updatedAt", this.clock.now());
-        const deletion = await this.writer.softDelete(
-          transaction,
-          domain,
-          normalizedId,
-          normalizedExpected,
-          now,
+        const deletion = await this.translatePersistenceConflict(
+          () => this.writer.softDelete(
+            transaction,
+            domain,
+            normalizedId,
+            normalizedExpected,
+            now,
+          ),
         );
         return Object.freeze({ status: "completed" as const, summary, deletion });
       }));

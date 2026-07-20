@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import {
+  isManualTrackerConflictError,
+  ManualTrackerConflictError,
+} from "../../../src/application/tracker/manualTrackerService.ts";
 import type {
   TrackerCreateInputByDomain,
   TrackerDomain,
@@ -53,6 +57,43 @@ test("manual service composes confirmation policy with real SQLite persistence",
     );
     assert.equal(deleted.status, "completed");
     assert.equal(await service.getById("feeding", original.id), null);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("manual service translates real SQLite stale and missing mutations without leaking repository detail", async () => {
+  const harness = await createTrackerTestHarness();
+  const { fixture, service } = harness;
+  try {
+    const entry = fixture.domains.feeding;
+    const created = await service.create("feeding", createInput("feeding", entry.create, null));
+    assert.equal(created.status, "completed");
+    if (created.status !== "completed") assert.fail("Low-risk feeding create must complete");
+
+    await assert.rejects(
+      service.update("feeding", created.record.id, entry.update, fixture.updatedAt, "confirmed"),
+      (error) => {
+        assert(error instanceof ManualTrackerConflictError);
+        assert.equal(isManualTrackerConflictError(error), true);
+        assert.equal(error.code, "stale_write");
+        assert.equal("currentState" in error, false);
+        assert.equal("entity" in error, false);
+        assert.equal("entityId" in error, false);
+        return true;
+      },
+    );
+    await assert.rejects(
+      service.delete("feeding", "missing-feeding", fixture.createdAt, "confirmed"),
+      (error) => {
+        assert(error instanceof ManualTrackerConflictError);
+        assert.equal(error.code, "not_found");
+        assert.equal("currentState" in error, false);
+        assert.equal("entity" in error, false);
+        assert.equal("entityId" in error, false);
+        return true;
+      },
+    );
   } finally {
     await harness.cleanup();
   }

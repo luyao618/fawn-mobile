@@ -5,6 +5,65 @@ import test from "node:test";
 
 const eslint = new ESLint({ overrideConfigFile: "eslint.config.js" });
 const sourceExtensions = ["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"] as const;
+const trackerSourceGlob = `src/features/tracker/**/*.{${sourceExtensions.join(",")}}`;
+const trackerConflictSyntax = [
+  {
+    selector: "Literal[value='RepositoryConflictError']",
+    message: "Tracker features must not mention an infrastructure error class name.",
+  },
+  {
+    selector: "TemplateElement[value.raw='RepositoryConflictError']",
+    message: "Tracker features must not mention an infrastructure error class name in a template.",
+  },
+  {
+    selector: ":matches(TSPropertySignature[key.name='code'], TSPropertySignature[computed=true][key.value='code'])",
+    message: "Tracker features must not declare structural conflict-code shapes.",
+  },
+  {
+    selector: "TSLiteralType > Literal[value='code']",
+    message: "Tracker features must not declare structural conflict-code keys.",
+  },
+  {
+    selector: ":matches(TSAsExpression, TSTypeAssertion) > TSTypeReference[typeName.name=/^(Record|ManualTrackerConflictError)$/]",
+    message: "Tracker features must not assert unknown errors to structural or nominal conflict types.",
+  },
+  {
+    selector: ":matches(MemberExpression[property.name='code'], MemberExpression[computed=true][property.value='code'])[object.type=/^(TSAsExpression|TSTypeAssertion)$/]",
+    message: "Tracker features must not cast unknown errors to guess conflict codes.",
+  },
+  {
+    selector: "BinaryExpression[operator='in'][left.value='code']",
+    message: "Tracker features must not structurally probe unknown errors for conflict codes.",
+  },
+  {
+    selector: "MemberExpression[computed=true][property.value='code']",
+    message: "Tracker features must not inspect conflict codes through computed properties.",
+  },
+  {
+    selector: "CallExpression[callee.object.name='Object'][callee.property.name='hasOwn'][arguments.1.value='code']",
+    message: "Tracker features must not use Object.hasOwn to guess conflict-code shapes.",
+  },
+  {
+    selector: "CallExpression[callee.property.name='hasOwnProperty'][arguments.0.value='code']",
+    message: "Tracker features must not use hasOwnProperty to guess conflict-code shapes.",
+  },
+  {
+    selector: "CallExpression[callee.property.name='call'][callee.object.property.name='hasOwnProperty'][arguments.1.value='code']",
+    message: "Tracker features must not call hasOwnProperty to guess conflict-code shapes.",
+  },
+  {
+    selector: "CallExpression[callee.object.name='Reflect'][callee.property.name='has'][arguments.1.value='code']",
+    message: "Tracker features must not use Reflect.has to guess conflict-code shapes.",
+  },
+] as const;
+const trackerConflictEslint = new ESLint({
+  errorOnUnmatchedPattern: false,
+  overrideConfigFile: "eslint.config.js",
+  overrideConfig: [{
+    files: [trackerSourceGlob],
+    rules: { "no-restricted-syntax": ["error", ...trackerConflictSyntax] },
+  }],
+});
 
 const sourceProbes = [
   "App.tsx",
@@ -37,6 +96,11 @@ async function assertRestrictedImport(filePath: string, specifier: string) {
 
 async function assertAllowedImport(filePath: string, specifier: string) {
   assert.equal((await restrictedImport(filePath, specifier)).length, 0, `${filePath} rejected ${specifier}`);
+}
+
+async function trackerConflictMessages(source: string) {
+  const [result] = await trackerConflictEslint.lintText(source, { filePath: "src/features/tracker/probe.ts" });
+  return result.messages.filter((message) => message.ruleId === "no-restricted-syntax");
 }
 
 function categorySpecifiers(segment: string) {
@@ -216,6 +280,57 @@ test("features cannot import navigation while navigation can compose features", 
   for (const specifier of ["../features", "../../features/deep/screen", "@/features/deep/screen"]) {
     await assertAllowedImport("src/navigation/nested/probe.ts", specifier);
   }
+});
+
+test("application and features cannot import repository conflict details", async () => {
+  for (const filePath of ["src/application/nested/probe.ts", "src/features/nested/probe.ts"]) {
+    for (const specifier of [
+      "../../infrastructure/db/repositories/conflicts",
+      "@/infrastructure/db/repositories/conflicts",
+      "src/infrastructure/db/repositories/conflicts",
+    ]) {
+      await assertRestrictedImport(filePath, specifier);
+    }
+  }
+});
+
+test("tracker features classify conflicts only through the application guard", async () => {
+  const rejected = [
+    'if (error instanceof Error && error.name === "RepositoryConflictError") {}',
+    'if (error["name"] === "RepositoryConflictError") {}',
+    'if ("RepositoryConflictError" === error.name) {}',
+    'if ("RepositoryConflictError" === error["name"]) {}',
+    'if ((error as { code?: string }).code === "stale_write") {}',
+    'if (typeof error === "object" && error !== null && "code" in error && error.code === "not_found") {}',
+    'const candidate = error as { code?: string }; candidate.code === "stale_write";',
+    'const { code } = error as { code?: string }; code === "stale_write";',
+    'const { name } = error as Error; name === "RepositoryConflictError";',
+    'const className = `RepositoryConflictError`; error.name === className;',
+    'type ConflictLike = { code?: string }; const candidate = error as ConflictLike; candidate.code === "stale_write";',
+    'const candidate = error as Record<string, unknown>; candidate["code"] === "stale_write";',
+    'const candidate = error as Record<"code", string>; candidate.code === "stale_write";',
+    'Object.hasOwn(error as object, "code");',
+    'error.hasOwnProperty("code");',
+    'Object.prototype.hasOwnProperty.call(error, "code");',
+    'Reflect.has(error as object, "code");',
+    'const candidate = error as ManualTrackerConflictError; candidate.code === "stale_write";',
+  ];
+  for (const source of rejected) {
+    assert((await trackerConflictMessages(source)).length >= 1, `tracker feature policy allowed ${source}`);
+  }
+
+  const approved = `function handle(value: unknown) {
+    if (isManualTrackerConflictError(value)) {
+      void (value.code === "stale_write" || value.code === "not_found");
+    }
+  }`;
+  assert.equal((await trackerConflictMessages(approved)).length, 0);
+
+  const sourceResults = await trackerConflictEslint.lintFiles([trackerSourceGlob]);
+  const violations = sourceResults.flatMap((result) => result.messages
+    .filter((message) => message.ruleId === "no-restricted-syntax")
+    .map((message) => `${result.filePath}:${message.line}:${message.column} ${message.message}`));
+  assert.deepEqual(violations, []);
 });
 
 test("all production layers reject testing leakage while composition roots retain static composition access", async () => {

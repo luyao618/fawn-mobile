@@ -11,6 +11,7 @@ import type {
   TrackerUpdateInputByDomain,
 } from "../../src/domain/tracker/types.ts";
 import { ExpoSqliteExclusiveTransactionAdapter } from "../../src/infrastructure/db/exclusiveTransaction.ts";
+import { RepositoryTrackerConflictClassifier } from "../../src/infrastructure/db/repositories/trackerConflictClassifier.ts";
 import { TrackerRepository } from "../../src/infrastructure/db/repositories/trackerRepository.ts";
 import { SQLiteTestDatabase } from "./sqliteTestDatabase.ts";
 
@@ -104,6 +105,7 @@ export async function createTrackerTestHarness(): Promise<Readonly<{
     new DataMutationCoordinator(),
     repository,
     repository,
+    new RepositoryTrackerConflictClassifier(),
     new QueuedClock(Array(20).fill(fixture.createdAt)),
     new QueuedLocalIdGenerator(Object.values(fixture.domains).map((entry) => entry.id)),
     operations,
