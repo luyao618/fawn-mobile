@@ -1,0 +1,2110 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Text, TextInput, View } from "react-native";
+import { useFocusEffect } from "@react-navigation/native";
+
+import type {
+  TrackerDeletion,
+  TrackerDomain,
+  TrackerRecordByDomain,
+  TrackerUpdateInputByDomain,
+} from "../../domain/tracker/types";
+import { normalizePersistedTrackerRecord, TrackerValidationError } from "../../domain/tracker/validation";
+import { colors, spacing } from "../../shared/theme/tokens";
+import { AppFrame } from "../../shared/ui/AppFrame";
+import { focusRefIfAvailable } from "./trackerAccessibility";
+import {
+  createInitialDraft,
+  isDraftDirty,
+  isNormalizedUpdateNoop,
+  parseDraftToCreateInput,
+  parseDraftToUpdateInput,
+  recordToEditorDraft,
+  type TrackerEditorDraftByDomain,
+} from "./trackerEditorModel";
+import { captureDeviceTimeZone } from "./trackerLocalTime";
+import { useManualTrackerService } from "./ManualTrackerServiceContext";
+import type {
+  TrackerDeleteSummary,
+  TrackerUpdateSummary,
+} from "../../application/tracker/manualTrackerService";
+import { isManualTrackerConflictError } from "../../application/tracker/manualTrackerService";
+import { RuntimeClosingError } from "../../application/bootstrap/appRuntime";
+import {
+  type AnyEditorSnapshot,
+  type AnyListFact,
+  type CorrelatedTrackerScreenAction,
+  type CreateEditorSnapshot,
+  type DomainRows,
+  type DecisionlessZoneGetSource,
+  type EditEditorSnapshot,
+  type EditorSnapshot,
+  type ExactEditableState,
+  type ListFact,
+  type InstantDomain,
+  type MutationCompletion,
+  type OperationOwner,
+  type OrdinaryListLoading,
+  type ReadOwner,
+  type ScreenTrackerDecision,
+  type ScreenDiscardDecision,
+  type TrackerScreenAction,
+  type TrackerScreenState,
+  type ZoneBlockedSave,
+  backDiscardDecision,
+  acceptedDiscardGetStartedAction,
+  acceptedDiscardListStartedAction,
+  conflictDiscardDecision,
+  createRequestedAction,
+  deleteConfirmationRequiredAction,
+  deleteConfirmedStartedAction,
+  deleteProbeStartedAction,
+  discardRequestedAction,
+  directCreateStartedAction,
+  domainDiscardDecision,
+  getFailedAction,
+  getEntryAuthorized,
+  getMissingReloadStartedAction,
+  getStartedAction,
+  isGetDiscardDecisionForDestination,
+  isListDiscardDecisionForDestination,
+  getSucceededAction,
+  listFailedAction,
+  listEntryAuthorized,
+  listStartedAction,
+  listSucceededAction,
+  mutationCompletedAction,
+  mutationRejectedAction,
+  normalizedNoopAction,
+  operationRefreshFailedAction,
+  operationRefreshStartedAction,
+  operationRefreshSucceededAction,
+  sameOperationOwner,
+  sameReadOwner,
+  stateDomain,
+  trackerScreenReducer,
+  updateConfirmationRequiredAction,
+  updateConfirmedStartedAction,
+  updateProbeStartedAction,
+  zoneCreateBlockedAction,
+  zoneGetBlockedAction,
+  zoneListLoadBlockedAction,
+  zoneListRestoreBlockedAction,
+  zoneSaveBlockedAction,
+  zoneSaveRestoredAction,
+} from "./trackerScreenState";
+import {
+  createTrackerDecisionSnapshot,
+  InlineTrackerConfirmation,
+  type TrackerDeleteDecision,
+  type TrackerUpdateDecision,
+} from "./InlineTrackerConfirmation";
+import { TrackerDomainSwitcher, TRACKER_DOMAIN_LABELS } from "./TrackerDomainSwitcher";
+import {
+  TrackerEditor,
+  type TrackerGroupRefs,
+  type TrackerInputRefs,
+} from "./TrackerEditor";
+import {
+  PrimaryAction,
+  SecondaryAction,
+  TrackerErrorAnnouncementScope,
+} from "./TrackerFormPrimitives";
+import { TrackerRecordList } from "./TrackerRecordList";
+
+const EMPTY_GROWTH_ROWS: DomainRows<"growth"> = Object.freeze([]);
+const READ_FAILURE = "暂时无法读取这条记录。本机数据没有更改。";
+const SAVE_FAILURE = "保存失败，本机记录没有更改。";
+type ZoneBlockedEntryState = Extract<TrackerScreenState, { tag: "zone.blocked.entry" }>;
+type GetRetryFocusCapability = Readonly<{
+  source: ZoneBlockedEntryState;
+  owner: ReadOwner<InstantDomain, "get">;
+  destination: Extract<TrackerScreenState, { tag: "edit.editing" | "edit.error" }>;
+}>;
+type ListRetryFocusCapability = Readonly<{
+  source: ZoneBlockedEntryState;
+  owner: ReadOwner<InstantDomain, "list">;
+  destination: Extract<TrackerScreenState, { tag: "list.ready.empty" | "list.ready.rows" | "list.error" }>;
+}>;
+type ListRetryFocusAttempt = Omit<ListRetryFocusCapability, "destination">;
+type PendingCancelFocusCapability = Readonly<{
+  decision: ScreenTrackerDecision;
+  destination: TrackerScreenState;
+}>;
+type MutationSuccessCapability = Readonly<{
+  id: number;
+  owner: OperationOwner;
+  destination: TrackerScreenState;
+  success: string;
+}>;
+type MutationIssueFocusTarget =
+  | Readonly<{ kind: "list-heading" }>
+  | Readonly<{ kind: "editor-heading" }>
+  | Readonly<{ kind: "conflict-heading" }>
+  | Readonly<{ field: FocusField; kind: "validation-field" }>;
+type MutationIssueCapability = Readonly<{
+  destination: TrackerScreenState;
+  focusTarget: MutationIssueFocusTarget;
+  id: number;
+  message: string;
+  owner?: OperationOwner;
+}>;
+const DELETE_FAILURE = "删除失败，本机记录没有更改。";
+const RUNTIME_FAILURE = "本机记录服务暂不可用，请返回后重试。";
+const INVALID_ZONE = "无法确认本机时区，暂不能显示或编辑这类记录。";
+const CHANGED_ZONE = "本机时区已变化，请重新打开记录后再保存。";
+
+function restoredSaveState<D extends InstantDomain>(source: ZoneBlockedSave<D>, currentZone: string): ExactEditableState<D> {
+  const retained = source.source;
+  if (currentZone === retained.editor.capturedZone) return retained;
+  const editor = Object.freeze({
+    ...retained.editor,
+    errors: Object.freeze({ ...retained.editor.errors, form: CHANGED_ZONE }),
+  });
+  return (editor.mode === "create"
+    ? Object.freeze({ tag: "create.editing" as const, editor })
+    : Object.freeze({ tag: "edit.editing" as const, editor })) as ExactEditableState<D>;
+}
+
+type FocusField = keyof TrackerInputRefs | keyof TrackerGroupRefs;
+type LowRiskDomain = Exclude<TrackerDomain, "health">;
+type EditDecision = Extract<ScreenTrackerDecision, Readonly<{ kind: "update" | "delete" }>>;
+type UpdateDecision = Extract<ScreenTrackerDecision, Readonly<{ kind: "update" }>>;
+type DeleteDecision = Extract<ScreenTrackerDecision, Readonly<{ kind: "delete" }>>;
+type DiscardDecision = ScreenDiscardDecision;
+type AnyMutationCompletion = MutationCompletion<TrackerDomain>;
+
+function isInstantDomain(domain: TrackerDomain): domain is InstantDomain {
+  return domain === "feeding" || domain === "sleep" || domain === "diaper";
+}
+
+function freezeListFact<D extends TrackerDomain>(
+  domain: D,
+  rows: DomainRows<D>,
+  presentationZone: string,
+): ListFact<D> {
+  return Object.freeze({ domain, rows, presentationZone });
+}
+
+function emptyListFact(domain: TrackerDomain, presentationZone: string): AnyListFact {
+  const rows = Object.freeze([]);
+  switch (domain) {
+    case "growth": return freezeListFact("growth", rows, presentationZone);
+    case "feeding": return freezeListFact("feeding", rows, presentationZone);
+    case "sleep": return freezeListFact("sleep", rows, presentationZone);
+    case "diaper": return freezeListFact("diaper", rows, presentationZone);
+    case "health": return freezeListFact("health", rows, presentationZone);
+  }
+}
+
+function editorIsDirty(editor: AnyEditorSnapshot): boolean {
+  switch (editor.domain) {
+    case "growth": return isDraftDirty("growth", editor.draft, editor.initialDraft);
+    case "feeding": return isDraftDirty("feeding", editor.draft, editor.initialDraft);
+    case "sleep": return isDraftDirty("sleep", editor.draft, editor.initialDraft);
+    case "diaper": return isDraftDirty("diaper", editor.draft, editor.initialDraft);
+    case "health": return isDraftDirty("health", editor.draft, editor.initialDraft);
+  }
+}
+
+function initialState(): TrackerScreenState {
+  const prior = freezeListFact("growth", EMPTY_GROWTH_ROWS, "");
+  return Object.freeze({
+    tag: "list.loading",
+    source: "ordinary",
+    owner: Object.freeze({
+      mountEpoch: 0,
+      generation: 0,
+      domain: "growth",
+      focusSession: 0,
+      kind: "list",
+      recordId: undefined,
+    }),
+    prior,
+  });
+}
+
+function stateListFact(state: TrackerScreenState): AnyListFact {
+  switch (state.tag) {
+    case "list.loading": return state.prior;
+    case "list.ready.empty":
+    case "list.ready.rows":
+    case "list.error": return state.fact;
+    case "create.editing":
+    case "edit.editing": return state.editor.prior;
+    case "confirm.healthCreate":
+    case "confirm.update":
+    case "confirm.delete": return state.decision.prior.prior;
+    case "confirm.discard": return "kind" in state.decision.destination
+      ? state.decision.destination.kind === "reload-record"
+        ? state.decision.destination.prior
+        : state.decision.destination.fact
+      : state.decision.destination;
+    case "edit.loading":
+    case "edit.error": return state.prior;
+    case "read.suspended": return state.request.prior;
+    case "mutation.submitting": return state.prior.prior;
+    case "mutation.completed": return state.prior.prior;
+    case "conflict.stale":
+    case "conflict.notFound":
+    case "mutation.error": return state.source.prior.prior;
+    case "zone.blocked.entry": return state.intent.fact;
+    case "zone.blocked.save": return state.source.editor.prior;
+  }
+}
+
+function stateEditor(state: TrackerScreenState): AnyEditorSnapshot | null {
+  if (state.tag === "create.editing" || state.tag === "edit.editing") return state.editor;
+  if (state.tag === "mutation.submitting") return state.prior;
+  if (state.tag === "conflict.stale" || state.tag === "conflict.notFound" || state.tag === "mutation.error") {
+    return state.source.prior;
+  }
+  if (state.tag === "confirm.healthCreate" || state.tag === "confirm.update" || state.tag === "confirm.delete") {
+    return state.decision.prior;
+  }
+  if (state.tag === "zone.blocked.save") return state.source.editor;
+  return null;
+}
+
+function freezeDraft<D extends TrackerDomain>(
+  draft: TrackerEditorDraftByDomain[D],
+): TrackerEditorDraftByDomain[D] {
+  return Object.freeze({ ...draft }) as TrackerEditorDraftByDomain[D];
+}
+
+function createSnapshot<D extends TrackerDomain>(
+  domain: D,
+  draft: TrackerEditorDraftByDomain[D],
+  capturedZone: string,
+  prior: ListFact<D>,
+): CreateEditorSnapshot<D> {
+  return Object.freeze({
+    mode: "create",
+    domain,
+    draft: freezeDraft(draft),
+    initialDraft: freezeDraft(draft),
+    baseline: null,
+    capturedZone,
+    errors: Object.freeze({}),
+    prior,
+  });
+}
+
+function editSnapshot<D extends TrackerDomain>(
+  domain: D,
+  draft: TrackerEditorDraftByDomain[D],
+  baseline: TrackerRecordByDomain[D],
+  capturedZone: string,
+  prior: ListFact<D>,
+): EditEditorSnapshot<D> {
+  return Object.freeze({
+    mode: "edit",
+    domain,
+    draft: freezeDraft(draft),
+    initialDraft: freezeDraft(draft),
+    baseline,
+    capturedZone,
+    errors: Object.freeze({}),
+    prior,
+  });
+}
+
+function validRowsForDomain<D extends TrackerDomain>(
+  domain: D,
+  value: unknown,
+): value is DomainRows<D> {
+  if (!Array.isArray(value)) return false;
+  try {
+    for (const row of value) normalizePersistedTrackerRecord(domain, row);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function listFactForRows(
+  domain: TrackerDomain,
+  rows: unknown,
+  presentationZone: string,
+): AnyListFact | null {
+  switch (domain) {
+    case "growth": return validRowsForDomain("growth", rows) ? freezeListFact("growth", rows, presentationZone) : null;
+    case "feeding": return validRowsForDomain("feeding", rows) ? freezeListFact("feeding", rows, presentationZone) : null;
+    case "sleep": return validRowsForDomain("sleep", rows) ? freezeListFact("sleep", rows, presentationZone) : null;
+    case "diaper": return validRowsForDomain("diaper", rows) ? freezeListFact("diaper", rows, presentationZone) : null;
+    case "health": return validRowsForDomain("health", rows) ? freezeListFact("health", rows, presentationZone) : null;
+  }
+}
+
+function validRecordForDomain<D extends TrackerDomain>(
+  domain: D,
+  id: string,
+  value: unknown,
+): value is TrackerRecordByDomain[D] {
+  if (value === null || typeof value !== "object") return false;
+  try {
+    const normalized = normalizePersistedTrackerRecord(domain, value as TrackerRecordByDomain[D]);
+    return normalized.id === id;
+  } catch {
+    return false;
+  }
+}
+
+function ownerMatches<D extends TrackerDomain, K extends "create" | "update" | "delete">(
+  owner: OperationOwner,
+  domain: D,
+  kind: K,
+): owner is OperationOwner<D, K> {
+  return owner.domain === domain && owner.kind === kind;
+}
+
+function isCreateEditorForDomain<D extends TrackerDomain>(
+  editor: EditorSnapshot,
+  domain: D,
+): editor is CreateEditorSnapshot<D> {
+  return editor.mode === "create" && editor.domain === domain;
+}
+
+function isEditEditorForDomain<D extends TrackerDomain>(
+  editor: EditorSnapshot,
+  domain: D,
+): editor is EditEditorSnapshot<D> {
+  return editor.mode === "edit" && editor.domain === domain;
+}
+
+function isUpdateSummaryForDomain<D extends TrackerDomain>(
+  summary: TrackerUpdateSummary,
+  domain: D,
+): summary is TrackerUpdateSummary<D> {
+  return summary.domain === domain;
+}
+
+function isDeleteSummaryForDomain<D extends TrackerDomain>(
+  summary: TrackerDeleteSummary,
+  domain: D,
+): summary is TrackerDeleteSummary<D> {
+  return summary.domain === domain;
+}
+
+function isDeletionForDomain<D extends TrackerDomain>(
+  deletion: TrackerDeletion,
+  domain: D,
+): deletion is Omit<TrackerDeletion, "domain"> & Readonly<{ domain: D }> {
+  return deletion.domain === domain;
+}
+
+function directCreateAction(
+  owner: OperationOwner,
+  prior: EditorSnapshot,
+): CorrelatedTrackerScreenAction | null {
+  switch (prior.domain) {
+    case "growth": return ownerMatches(owner, "growth", "create") && isCreateEditorForDomain(prior, "growth") ? directCreateStartedAction(owner, prior) : null;
+    case "feeding": return ownerMatches(owner, "feeding", "create") && isCreateEditorForDomain(prior, "feeding") ? directCreateStartedAction(owner, prior) : null;
+    case "sleep": return ownerMatches(owner, "sleep", "create") && isCreateEditorForDomain(prior, "sleep") ? directCreateStartedAction(owner, prior) : null;
+    case "diaper": return ownerMatches(owner, "diaper", "create") && isCreateEditorForDomain(prior, "diaper") ? directCreateStartedAction(owner, prior) : null;
+    case "health": return null;
+  }
+}
+
+function editProbeAction(
+  owner: OperationOwner,
+  prior: EditorSnapshot,
+): CorrelatedTrackerScreenAction | null {
+  switch (prior.domain) {
+    case "growth":
+      if (!isEditEditorForDomain(prior, "growth")) return null;
+      return ownerMatches(owner, "growth", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "growth", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+    case "feeding":
+      if (!isEditEditorForDomain(prior, "feeding")) return null;
+      return ownerMatches(owner, "feeding", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "feeding", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+    case "sleep":
+      if (!isEditEditorForDomain(prior, "sleep")) return null;
+      return ownerMatches(owner, "sleep", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "sleep", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+    case "diaper":
+      if (!isEditEditorForDomain(prior, "diaper")) return null;
+      return ownerMatches(owner, "diaper", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "diaper", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+    case "health":
+      if (!isEditEditorForDomain(prior, "health")) return null;
+      return ownerMatches(owner, "health", "update") ? updateProbeStartedAction(owner, prior)
+        : ownerMatches(owner, "health", "delete") ? deleteProbeStartedAction(owner, prior) : null;
+  }
+}
+
+function updateDecisionSnapshot(
+  prior: EditorSnapshot,
+  summary: TrackerUpdateSummary,
+  initiatingControlRef: TrackerUpdateDecision<"growth", unknown>["initiatingControlRef"],
+): UpdateDecision | null {
+  const shared = { kind: "update" as const, initiatingControlRef, presentationTimeZone: prior.capturedZone };
+  switch (prior.domain) {
+    case "growth": return isEditEditorForDomain(prior, "growth") && isUpdateSummaryForDomain(summary, "growth") ? createTrackerDecisionSnapshot({ ...shared, domain: "growth", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "feeding": return isEditEditorForDomain(prior, "feeding") && isUpdateSummaryForDomain(summary, "feeding") ? createTrackerDecisionSnapshot({ ...shared, domain: "feeding", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "sleep": return isEditEditorForDomain(prior, "sleep") && isUpdateSummaryForDomain(summary, "sleep") ? createTrackerDecisionSnapshot({ ...shared, domain: "sleep", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "diaper": return isEditEditorForDomain(prior, "diaper") && isUpdateSummaryForDomain(summary, "diaper") ? createTrackerDecisionSnapshot({ ...shared, domain: "diaper", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "health": return isEditEditorForDomain(prior, "health") && isUpdateSummaryForDomain(summary, "health") ? createTrackerDecisionSnapshot({ ...shared, domain: "health", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+  }
+}
+
+function deleteDecisionSnapshot(
+  prior: EditorSnapshot,
+  summary: TrackerDeleteSummary,
+  initiatingControlRef: TrackerDeleteDecision<"growth", unknown>["initiatingControlRef"],
+): DeleteDecision | null {
+  const shared = { kind: "delete" as const, initiatingControlRef, presentationTimeZone: prior.capturedZone };
+  switch (prior.domain) {
+    case "growth": return isEditEditorForDomain(prior, "growth") && isDeleteSummaryForDomain(summary, "growth") ? createTrackerDecisionSnapshot({ ...shared, domain: "growth", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "feeding": return isEditEditorForDomain(prior, "feeding") && isDeleteSummaryForDomain(summary, "feeding") ? createTrackerDecisionSnapshot({ ...shared, domain: "feeding", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "sleep": return isEditEditorForDomain(prior, "sleep") && isDeleteSummaryForDomain(summary, "sleep") ? createTrackerDecisionSnapshot({ ...shared, domain: "sleep", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "diaper": return isEditEditorForDomain(prior, "diaper") && isDeleteSummaryForDomain(summary, "diaper") ? createTrackerDecisionSnapshot({ ...shared, domain: "diaper", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+    case "health": return isEditEditorForDomain(prior, "health") && isDeleteSummaryForDomain(summary, "health") ? createTrackerDecisionSnapshot({ ...shared, domain: "health", prior, baseline: prior.baseline, serviceSummary: summary }) : null;
+  }
+}
+
+function editDecisionAction(
+  owner: OperationOwner,
+  decision: EditDecision,
+  phase: "confirmation" | "confirmed",
+): CorrelatedTrackerScreenAction | null {
+  if (decision.kind === "update") {
+    switch (decision.domain) {
+      case "growth": return ownerMatches(owner, "growth", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+      case "feeding": return ownerMatches(owner, "feeding", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+      case "sleep": return ownerMatches(owner, "sleep", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+      case "diaper": return ownerMatches(owner, "diaper", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+      case "health": return ownerMatches(owner, "health", "update") ? (phase === "confirmation" ? updateConfirmationRequiredAction(owner, decision) : updateConfirmedStartedAction(owner, decision)) : null;
+    }
+  }
+  switch (decision.domain) {
+    case "growth": return ownerMatches(owner, "growth", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+    case "feeding": return ownerMatches(owner, "feeding", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+    case "sleep": return ownerMatches(owner, "sleep", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+    case "diaper": return ownerMatches(owner, "diaper", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+    case "health": return ownerMatches(owner, "health", "delete") ? (phase === "confirmation" ? deleteConfirmationRequiredAction(owner, decision) : deleteConfirmedStartedAction(owner, decision)) : null;
+  }
+}
+
+function completedAction(
+  owner: OperationOwner,
+  completion: AnyMutationCompletion,
+): CorrelatedTrackerScreenAction | null {
+  if (owner.kind !== completion.kind) return null;
+  if (completion.kind === "delete") {
+    const { deletion } = completion;
+    switch (deletion.domain) {
+      case "growth": return ownerMatches(owner, "growth", "delete") && isDeletionForDomain(deletion, "growth") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+      case "feeding": return ownerMatches(owner, "feeding", "delete") && isDeletionForDomain(deletion, "feeding") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+      case "sleep": return ownerMatches(owner, "sleep", "delete") && isDeletionForDomain(deletion, "sleep") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+      case "diaper": return ownerMatches(owner, "diaper", "delete") && isDeletionForDomain(deletion, "diaper") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+      case "health": return ownerMatches(owner, "health", "delete") && isDeletionForDomain(deletion, "health") ? mutationCompletedAction(owner, Object.freeze({ kind: "delete", deletion })) : null;
+    }
+  }
+  const { record } = completion;
+  switch (owner.domain) {
+    case "growth":
+      if (!validRecordForDomain("growth", record.id, record)) return null;
+      return ownerMatches(owner, "growth", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "growth", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+    case "feeding":
+      if (!validRecordForDomain("feeding", record.id, record)) return null;
+      return ownerMatches(owner, "feeding", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "feeding", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+    case "sleep":
+      if (!validRecordForDomain("sleep", record.id, record)) return null;
+      return ownerMatches(owner, "sleep", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "sleep", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+    case "diaper":
+      if (!validRecordForDomain("diaper", record.id, record)) return null;
+      return ownerMatches(owner, "diaper", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "diaper", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+    case "health":
+      if (!validRecordForDomain("health", record.id, record)) return null;
+      return ownerMatches(owner, "health", "create") && completion.kind === "create" ? mutationCompletedAction(owner, Object.freeze({ kind: "create", record }))
+        : ownerMatches(owner, "health", "update") && completion.kind === "update" ? mutationCompletedAction(owner, Object.freeze({ kind: "update", record })) : null;
+  }
+}
+
+function refreshStartedAction(
+  owner: OperationOwner,
+  prior: AnyListFact,
+  success: string,
+): CorrelatedTrackerScreenAction | null {
+  switch (prior.domain) {
+    case "growth":
+      return ownerMatches(owner, "growth", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "growth", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "growth", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+    case "feeding":
+      return ownerMatches(owner, "feeding", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "feeding", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "feeding", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+    case "sleep":
+      return ownerMatches(owner, "sleep", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "sleep", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "sleep", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+    case "diaper":
+      return ownerMatches(owner, "diaper", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "diaper", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "diaper", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+    case "health":
+      return ownerMatches(owner, "health", "create") ? operationRefreshStartedAction(owner, prior, success)
+        : ownerMatches(owner, "health", "update") ? operationRefreshStartedAction(owner, prior, success)
+          : ownerMatches(owner, "health", "delete") ? operationRefreshStartedAction(owner, prior, success) : null;
+  }
+}
+
+function reconciledDeletePrior(owner: OperationOwner, prior: AnyListFact, id: string): AnyListFact | null {
+  switch (prior.domain) {
+    case "growth": return ownerMatches(owner, "growth", "delete") ? freezeListFact("growth", Object.freeze(prior.rows.filter((row) => row.id !== id)), prior.presentationZone) : null;
+    case "feeding": return ownerMatches(owner, "feeding", "delete") ? freezeListFact("feeding", Object.freeze(prior.rows.filter((row) => row.id !== id)), prior.presentationZone) : null;
+    case "sleep": return ownerMatches(owner, "sleep", "delete") ? freezeListFact("sleep", Object.freeze(prior.rows.filter((row) => row.id !== id)), prior.presentationZone) : null;
+    case "diaper": return ownerMatches(owner, "diaper", "delete") ? freezeListFact("diaper", Object.freeze(prior.rows.filter((row) => row.id !== id)), prior.presentationZone) : null;
+    case "health": return ownerMatches(owner, "health", "delete") ? freezeListFact("health", Object.freeze(prior.rows.filter((row) => row.id !== id)), prior.presentationZone) : null;
+  }
+}
+
+function serviceValidationFailure(error: TrackerValidationError): Readonly<{ field: string; message: string }> {
+  const messages: Readonly<Record<string, string>> = Object.freeze({
+    measurements: "体重、身长、头围请至少填写一项。",
+    amountMl: "配方奶需要填写量。",
+    durationMin: "母乳需要填写时长。",
+    sleepEnd: "结束时间需要晚于开始时间。",
+    title: "标题需要填写，且最多 200 个字符。",
+  });
+  const knownFields = new Set([
+    "measurementDate", "measurements", "weightG", "heightCm", "headCm", "feedTime",
+    "feedType", "amountMl", "durationMin", "sleepStart", "sleepEnd", "sleepType",
+    "nightWakings", "diaperTime", "diaperType", "recordDate", "recordType", "title",
+    "notes", "description",
+  ]);
+  return knownFields.has(error.field)
+    ? Object.freeze({ field: error.field, message: messages[error.field] ?? "请检查标出的内容后再保存。" })
+    : Object.freeze({ field: "form", message: "请检查标出的内容后再保存。" });
+}
+
+function focusableDecision(state: TrackerScreenState): ScreenTrackerDecision | null {
+  return state.tag === "confirm.healthCreate"
+    || state.tag === "confirm.update"
+    || state.tag === "confirm.delete"
+    || state.tag === "confirm.discard"
+    ? state.decision
+    : null;
+}
+
+function reconcileMutationSuccessCapability(
+  capability: MutationSuccessCapability,
+  previous: TrackerScreenState,
+  state: TrackerScreenState,
+  action: TrackerScreenAction,
+): MutationSuccessCapability | null {
+  if (state === capability.destination) return capability;
+  if (previous !== capability.destination
+    || previous.tag !== "list.loading"
+    || previous.source !== "mutation-refresh"
+    || !sameOperationOwner(previous.owner, capability.owner)
+    || (action.type !== "OPERATION_REFRESH_SUCCEEDED" && action.type !== "OPERATION_REFRESH_FAILED")
+    || !sameOperationOwner(action.owner, capability.owner)
+    || (state.tag !== "list.ready.empty" && state.tag !== "list.ready.rows"
+      && !(state.tag === "list.error" && state.kind === "refresh"))) return null;
+  return Object.freeze({ ...capability, destination: state });
+}
+
+function mutationFocusField(field: string): FocusField | undefined {
+  const aliases: Readonly<Record<string, FocusField>> = Object.freeze({
+    measurementDate: "measurementDate", weightG: "weightG", heightCm: "heightCm", headCm: "headCm",
+    measurements: "weightG", feedTime: "feedTime", feedType: "feedType", amountMl: "amountMl",
+    durationMin: "durationMin", sleepStart: "sleepStart", sleepEnd: "sleepEnd", sleepType: "sleepType",
+    nightWakings: "nightWakings", diaperTime: "diaperTime", diaperType: "diaperType",
+    recordDate: "recordDate", recordType: "recordType", title: "title", notes: "notes", description: "description",
+  });
+  return aliases[field];
+}
+
+function mutationIssueForDestination(id: number, state: TrackerScreenState): MutationIssueCapability | null {
+  if (state.tag === "list.error" && state.kind === "refresh") {
+    return Object.freeze({
+      destination: state,
+      focusTarget: Object.freeze({ kind: "list-heading" }),
+      id,
+      message: "记录可能不是最新内容。",
+    });
+  }
+  if (state.tag === "mutation.error") {
+    const field = state.field === undefined ? undefined : mutationFocusField(state.field);
+    return Object.freeze({
+      destination: state,
+      focusTarget: field === undefined
+        ? Object.freeze({ kind: "editor-heading" })
+        : Object.freeze({ field, kind: "validation-field" }),
+      id,
+      message: state.message,
+    });
+  }
+  if (state.tag === "conflict.stale" || state.tag === "conflict.notFound") {
+    return Object.freeze({
+      destination: state,
+      focusTarget: Object.freeze({ kind: "conflict-heading" }),
+      id,
+      message: state.tag === "conflict.stale"
+        ? "这条记录已在其他位置更新。为避免覆盖，请重新读取后再修改。"
+        : "这条记录已不存在，不能继续保存或删除。",
+    });
+  }
+  return null;
+}
+
+export function ManualTrackerScreen() {
+  const service = useManualTrackerService();
+  const [state, setState] = useState(initialState);
+  const stateRef = useRef(state);
+  const mountedRef = useRef(true);
+  const mountEpochRef = useRef(1);
+  const generationRef = useRef(0);
+  const focusSessionRef = useRef(0);
+  const operationIdRef = useRef(0);
+  const [focusRequest, setFocusRequest] = useState<Readonly<{ id: number; field: FocusField }> | null>(null);
+  const [listFocusRequest, setListFocusRequest] = useState(0);
+  const [accessibilityDeliveryRequest, setAccessibilityDeliveryRequest] = useState(0);
+  const [recordsFocused, setRecordsFocused] = useState(false);
+  const [activeSuccessAnnouncement, setActiveSuccessAnnouncement] = useState<MutationSuccessCapability | null>(null);
+  const [activeMutationIssue, setActiveMutationIssue] = useState<MutationIssueCapability | null>(null);
+  const [getRetryFocusRequest, setGetRetryFocusRequest] = useState(0);
+  const [listRetryFocusRequest, setListRetryFocusRequest] = useState(0);
+  const pendingGetRetryFocusRef = useRef<GetRetryFocusCapability | null>(null);
+  const pendingListRetryFocusRef = useRef<ListRetryFocusCapability | null>(null);
+  const successCapabilityIdRef = useRef(0);
+  const pendingMutationSuccessRef = useRef<MutationSuccessCapability | null>(null);
+  const activeSuccessAnnouncementRef = useRef<MutationSuccessCapability | null>(null);
+  const mutationIssueIdRef = useRef(0);
+  const pendingMutationIssueRef = useRef<MutationIssueCapability | null>(null);
+  const activeMutationIssueRef = useRef<MutationIssueCapability | null>(null);
+  const focusedMutationSuccessOwnerRef = useRef<OperationOwner | null>(null);
+  const consumedListFocusRef = useRef(0);
+  const listHeadingRef = useRef<Text>(null);
+  const editorHeadingRef = useRef<Text>(null);
+  const conflictHeadingRef = useRef<Text>(null);
+  const saveActionRef = useRef<View>(null);
+  const backActionRef = useRef<View>(null);
+  const deleteActionRef = useRef<View>(null);
+  const conflictReloadActionRef = useRef<View>(null);
+  const conflictListActionRef = useRef<View>(null);
+  const decisionHeadingRef = useRef<Text>(null);
+  const decisionCancelRef = useRef<View>(null);
+  const decisionAcceptRef = useRef<View>(null);
+  const recordsFocusedRef = useRef(false);
+  const focusedDecisionRef = useRef<ScreenTrackerDecision | null>(null);
+  const pendingCancelFocusRef = useRef<PendingCancelFocusCapability | null>(null);
+  const zoneBlockedHeadingRef = useRef<Text>(null);
+  const zoneRetryActionRef = useRef<View>(null);
+  const previousStateRef = useRef<TrackerScreenState>(state);
+
+  const inputRefObjects = useMemo(() => ({
+    measurementDate: { current: null as TextInput | null },
+    weightG: { current: null as TextInput | null },
+    heightCm: { current: null as TextInput | null },
+    headCm: { current: null as TextInput | null },
+    notes: { current: null as TextInput | null },
+    feedTimeDate: { current: null as TextInput | null },
+    feedTime: { current: null as TextInput | null },
+    amountMl: { current: null as TextInput | null },
+    durationMin: { current: null as TextInput | null },
+    sleepStartDate: { current: null as TextInput | null },
+    sleepStart: { current: null as TextInput | null },
+    sleepEndDate: { current: null as TextInput | null },
+    sleepEnd: { current: null as TextInput | null },
+    nightWakings: { current: null as TextInput | null },
+    diaperTimeDate: { current: null as TextInput | null },
+    diaperTime: { current: null as TextInput | null },
+    recordDate: { current: null as TextInput | null },
+    title: { current: null as TextInput | null },
+    description: { current: null as TextInput | null },
+  }), []);
+  const groupRefObjects = useMemo(() => ({
+    feedType: { current: null as View | null },
+    sleepType: { current: null as View | null },
+    diaperType: { current: null as View | null },
+    recordType: { current: null as View | null },
+  }), []);
+  const domainTabRefs = useMemo(() => ({
+    growth: { current: null as View | null },
+    feeding: { current: null as View | null },
+    sleep: { current: null as View | null },
+    diaper: { current: null as View | null },
+    health: { current: null as View | null },
+  }), []);
+  const domainDestinationFactsRef = useRef<Record<TrackerDomain, AnyListFact | null>>({
+    growth: null,
+    feeding: null,
+    sleep: null,
+    diaper: null,
+    health: null,
+  });
+  const domainDiscardDecisionsRef = useRef<Record<TrackerDomain, DiscardDecision | null>>({
+    growth: null,
+    feeding: null,
+    sleep: null,
+    diaper: null,
+    health: null,
+  });
+  const inputRefs: TrackerInputRefs = inputRefObjects;
+  const groupRefs: TrackerGroupRefs = groupRefObjects;
+
+  const send = useCallback((action: TrackerScreenAction): boolean => {
+    const previous = stateRef.current;
+    const next = trackerScreenReducer(previous, action);
+    if (next === previous) return false;
+    const pendingMutationSuccess = pendingMutationSuccessRef.current;
+    if (pendingMutationSuccess !== null) {
+      pendingMutationSuccessRef.current = reconcileMutationSuccessCapability(
+        pendingMutationSuccess,
+        previous,
+        next,
+        action,
+      );
+    }
+    const pendingMutationIssue = pendingMutationIssueRef.current;
+    if (pendingMutationIssue !== null && next !== pendingMutationIssue.destination) {
+      pendingMutationIssueRef.current = null;
+    }
+    const activeMutationSuccess = activeSuccessAnnouncementRef.current;
+    if (activeMutationSuccess !== null && next !== activeMutationSuccess.destination) {
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+    }
+    const activeMutationIssue = activeMutationIssueRef.current;
+    if (activeMutationIssue !== null && next !== activeMutationIssue.destination) {
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+    }
+    stateRef.current = next;
+    setState(next);
+    if (
+      action.type === "OPERATION_REFRESH_FAILED"
+      || action.type === "MUTATION_REJECTED"
+      || action.type === "MUTATION_CONFLICT"
+    ) {
+      mutationIssueIdRef.current += 1;
+      const issue = mutationIssueForDestination(mutationIssueIdRef.current, next);
+      pendingMutationIssueRef.current = issue !== null && action.type === "OPERATION_REFRESH_FAILED"
+        ? Object.freeze({ ...issue, owner: action.owner })
+        : issue;
+      if (issue !== null && recordsFocusedRef.current) {
+        activeMutationIssueRef.current = pendingMutationIssueRef.current;
+        setActiveMutationIssue(pendingMutationIssueRef.current);
+      }
+    }
+    return true;
+  }, []);
+
+  const focusDecisionHeadingOnce = useCallback(() => {
+    const decision = focusableDecision(stateRef.current);
+    if (decision === null) {
+      focusedDecisionRef.current = null;
+      return;
+    }
+    if (!recordsFocusedRef.current) return;
+    if (focusedDecisionRef.current === decision || decisionHeadingRef.current === null) return;
+    focusedDecisionRef.current = decision;
+    focusRefIfAvailable(decisionHeadingRef);
+  }, []);
+
+  useEffect(() => {
+    if (focusRequest === null) return;
+    const target = focusRequest.field in groupRefObjects
+      ? groupRefObjects[focusRequest.field as keyof typeof groupRefObjects]
+      : inputRefObjects[focusRequest.field as keyof typeof inputRefObjects];
+    focusRefIfAvailable(target);
+  }, [focusRequest, groupRefObjects, inputRefObjects]);
+
+  useEffect(() => {
+    if (
+      listFocusRequest <= consumedListFocusRef.current
+      || !recordsFocusedRef.current
+      || listHeadingRef.current === null
+    ) return;
+    consumedListFocusRef.current = listFocusRequest;
+    focusRefIfAvailable(listHeadingRef);
+  }, [accessibilityDeliveryRequest, listFocusRequest, state]);
+
+  const deliverPendingAccessibility = useCallback((): boolean => {
+    const current = stateRef.current;
+    const success = pendingMutationSuccessRef.current;
+    const issue = pendingMutationIssueRef.current;
+    const deliverSuccess = success !== null && current === success.destination;
+    const deliverIssue = issue !== null && current === issue.destination;
+    if (!recordsFocusedRef.current || (!deliverSuccess && !deliverIssue)) return false;
+
+    const focusTarget = deliverIssue ? issue.focusTarget : Object.freeze({ kind: "list-heading" as const });
+    const target = focusTarget.kind === "list-heading" ? listHeadingRef
+      : focusTarget.kind === "editor-heading" ? editorHeadingRef
+        : focusTarget.kind === "conflict-heading" ? conflictHeadingRef
+          : focusTarget.field in groupRefObjects
+            ? groupRefObjects[focusTarget.field as keyof typeof groupRefObjects]
+            : inputRefObjects[focusTarget.field as keyof typeof inputRefObjects];
+    if (deliverSuccess) pendingMutationSuccessRef.current = null;
+    if (deliverIssue) pendingMutationIssueRef.current = null;
+    const listFocusAlreadyDelivered = deliverIssue
+      && issue.owner !== undefined
+      && focusedMutationSuccessOwnerRef.current !== null
+      && sameOperationOwner(issue.owner, focusedMutationSuccessOwnerRef.current);
+    if (!listFocusAlreadyDelivered) focusRefIfAvailable(target);
+    if (deliverSuccess) {
+      focusedMutationSuccessOwnerRef.current = success.owner;
+      activeSuccessAnnouncementRef.current = success;
+      setActiveSuccessAnnouncement(success);
+    }
+    if (deliverIssue && activeMutationIssueRef.current !== issue) {
+      activeMutationIssueRef.current = issue;
+      setActiveMutationIssue(issue);
+    }
+    return true;
+  }, [groupRefObjects, inputRefObjects]);
+
+  useEffect(() => {
+    deliverPendingAccessibility();
+  }, [accessibilityDeliveryRequest, deliverPendingAccessibility, state]);
+
+  useEffect(() => {
+    const capability = pendingGetRetryFocusRef.current;
+    if (capability === null) return;
+    if (state !== capability.destination) {
+      pendingGetRetryFocusRef.current = null;
+      return;
+    }
+    if ((state.tag !== "edit.editing" && state.tag !== "edit.error") || editorHeadingRef.current === null) return;
+    pendingGetRetryFocusRef.current = null;
+    focusRefIfAvailable(editorHeadingRef);
+  }, [getRetryFocusRequest, state]);
+
+  useEffect(() => {
+    const capability = pendingListRetryFocusRef.current;
+    if (capability === null) return;
+    if (state !== capability.destination) {
+      pendingListRetryFocusRef.current = null;
+      return;
+    }
+    if (listHeadingRef.current === null) return;
+    pendingListRetryFocusRef.current = null;
+    focusRefIfAvailable(listHeadingRef);
+  }, [listRetryFocusRequest, state]);
+
+  useEffect(() => {
+    const previous = previousStateRef.current;
+    previousStateRef.current = state;
+    if ((state.tag === "zone.blocked.entry" || state.tag === "zone.blocked.save")
+      && previous !== state && previous.tag !== "zone.blocked.entry" && previous.tag !== "zone.blocked.save") {
+      focusRefIfAvailable(zoneBlockedHeadingRef);
+      return;
+    }
+    if (previous.tag === "zone.blocked.entry" && state !== previous) {
+      if (previous.intent.kind === "create") focusRefIfAvailable(editorHeadingRef);
+    } else if (previous.tag === "zone.blocked.save" && state !== previous) {
+      focusRefIfAvailable(saveActionRef);
+    }
+  }, [state]);
+
+  useEffect(() => {
+    focusDecisionHeadingOnce();
+    const capability = pendingCancelFocusRef.current;
+    if (capability === null) return;
+    if (state !== capability.destination) {
+      pendingCancelFocusRef.current = null;
+      return;
+    }
+    if (!recordsFocusedRef.current || capability.decision.initiatingControlRef.current === null) return;
+    pendingCancelFocusRef.current = null;
+    focusRefIfAvailable(capability.decision.initiatingControlRef);
+  }, [focusDecisionHeadingOnce, state]);
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+    mountEpochRef.current += 1;
+    generationRef.current += 1;
+    pendingMutationSuccessRef.current = null;
+    pendingMutationIssueRef.current = null;
+    activeSuccessAnnouncementRef.current = null;
+    activeMutationIssueRef.current = null;
+    focusedMutationSuccessOwnerRef.current = null;
+  }, []);
+
+  const makeListOwner = useCallback(<D extends TrackerDomain,>(domain: D): ReadOwner<D, "list"> => {
+    return Object.freeze({
+      mountEpoch: mountEpochRef.current,
+      generation: generationRef.current + 1,
+      domain,
+      focusSession: focusSessionRef.current,
+      kind: "list",
+      recordId: undefined,
+    });
+  }, []);
+
+  const makeGetOwner = useCallback(<D extends TrackerDomain,>(domain: D, id: string): ReadOwner<D, "get"> => {
+    return Object.freeze({
+      mountEpoch: mountEpochRef.current,
+      generation: generationRef.current + 1,
+      domain,
+      focusSession: focusSessionRef.current,
+      kind: "get",
+      recordId: id,
+    });
+  }, []);
+
+  const ownsRead = useCallback((owner: ReadOwner): boolean => {
+    if (
+      !mountedRef.current
+      || owner.mountEpoch !== mountEpochRef.current
+      || owner.generation !== generationRef.current
+      || owner.focusSession !== focusSessionRef.current
+      || owner.domain !== stateDomain(stateRef.current)
+    ) return false;
+    const current = stateRef.current;
+    return (current.tag === "list.loading" && current.source === "ordinary" && sameReadOwner(current.owner, owner))
+      || (current.tag === "edit.loading" && sameReadOwner(current.owner, owner));
+  }, []);
+
+  const ownsOperationRefresh = useCallback((owner: OperationOwner): boolean => {
+    if (!mountedRef.current || owner.mountEpoch !== mountEpochRef.current) return false;
+    const current = stateRef.current;
+    return current.tag === "list.loading"
+      && current.source === "mutation-refresh"
+      && sameOperationOwner(current.owner, owner);
+  }, []);
+
+  const ownsOperation = useCallback((owner: OperationOwner): boolean => {
+    if (!mountedRef.current || owner.mountEpoch !== mountEpochRef.current) return false;
+    const current = stateRef.current;
+    return (current.tag === "mutation.submitting"
+      || current.tag === "confirm.healthCreate"
+      || current.tag === "confirm.update"
+      || current.tag === "confirm.delete")
+      && sameOperationOwner(current.owner, owner);
+  }, []);
+
+  const makeOperationOwner = useCallback(<D extends TrackerDomain, K extends "create" | "update" | "delete">(
+    domain: D,
+    kind: K,
+  ): OperationOwner<D, K> => {
+    operationIdRef.current += 1;
+    return Object.freeze({
+      mountEpoch: mountEpochRef.current,
+      operationId: operationIdRef.current,
+      domain,
+      kind,
+    });
+  }, []);
+
+  const runOrdinaryList = useCallback(<D extends TrackerDomain,>(
+    owner: ReadOwner<D, "list">,
+    prior: ListFact<D>,
+    presentationZone: string,
+    retryFocus?: ListRetryFocusAttempt,
+  ) => {
+    const requestRetryFocus = () => {
+      if (retryFocus === undefined) return;
+      const destination = stateRef.current;
+      if (destination.tag !== "list.ready.empty" && destination.tag !== "list.ready.rows" && destination.tag !== "list.error") return;
+      pendingListRetryFocusRef.current = Object.freeze({ ...retryFocus, destination });
+      setListRetryFocusRequest((value) => value + 1);
+    };
+    void service.list(owner.domain, 100).then(
+      (rows) => {
+        if (!ownsRead(owner)) return;
+        if (!validRowsForDomain(owner.domain, rows)) {
+          if (send(listFailedAction(owner))) requestRetryFocus();
+          return;
+        }
+        if (send(listSucceededAction(owner, freezeListFact(owner.domain, rows, presentationZone)))) requestRetryFocus();
+      },
+      () => {
+        if (ownsRead(owner) && send(listFailedAction(owner))) requestRetryFocus();
+      },
+    );
+  }, [ownsRead, send, service]);
+
+  const startList = useCallback(<D extends TrackerDomain,>(
+    domain: D,
+    prior: ListFact<D>,
+    source: TrackerScreenState,
+    notice?: string,
+    decision?: DiscardDecision,
+    resolvedZone?: string,
+    retryFocusSource?: ZoneBlockedEntryState,
+  ) => {
+    if (stateRef.current !== source || !listEntryAuthorized(source, prior, decision)) return;
+    const correlatedPrior = prior as AnyListFact;
+    let presentationZone = prior.presentationZone;
+    if (isInstantDomain(domain)) {
+      const zoneResult = resolvedZone === undefined ? captureDeviceTimeZone() : Object.freeze({ status: "available" as const, zone: resolvedZone });
+      if (zoneResult.status !== "available") {
+        const fact = correlatedPrior;
+        const blocked = decision === undefined
+          ? fact.domain === "feeding" ? zoneListLoadBlockedAction(source, fact, notice)
+            : fact.domain === "sleep" ? zoneListLoadBlockedAction(source, fact, notice)
+              : fact.domain === "diaper" ? zoneListLoadBlockedAction(source, fact, notice)
+                : null
+          : source.tag === "confirm.discard" && source.decision === decision
+            ? fact.domain === "feeding" && isListDiscardDecisionForDestination(decision, fact) ? zoneListLoadBlockedAction(source, fact, notice, decision)
+              : fact.domain === "sleep" && isListDiscardDecisionForDestination(decision, fact) ? zoneListLoadBlockedAction(source, fact, notice, decision)
+                : fact.domain === "diaper" && isListDiscardDecisionForDestination(decision, fact) ? zoneListLoadBlockedAction(source, fact, notice, decision)
+                  : null
+            : null;
+        if (blocked !== null) send(blocked);
+        return;
+      }
+      presentationZone = zoneResult.zone;
+    }
+    const loadingPrior = decision === undefined
+      && source.tag !== "zone.blocked.entry"
+      && prior.presentationZone !== presentationZone
+      ? freezeListFact(domain, prior.rows, presentationZone)
+      : prior;
+    const owner = makeListOwner(domain);
+    const next = Object.freeze({
+      tag: "list.loading" as const,
+      source: "ordinary" as const,
+      owner,
+      prior: loadingPrior,
+      notice,
+    });
+    if (decision !== undefined && !isListDiscardDecisionForDestination(decision, prior)) return;
+    const started = decision === undefined
+      ? listStartedAction(source, next)
+      : source.tag !== "confirm.discard" || source.decision !== decision ? null
+        : correlatedPrior.domain === "feeding" && isListDiscardDecisionForDestination(decision, correlatedPrior)
+          ? acceptedDiscardListStartedAction(source, next as OrdinaryListLoading<"feeding">, decision)
+          : correlatedPrior.domain === "sleep" && isListDiscardDecisionForDestination(decision, correlatedPrior)
+            ? acceptedDiscardListStartedAction(source, next as OrdinaryListLoading<"sleep">, decision)
+            : correlatedPrior.domain === "diaper" && isListDiscardDecisionForDestination(decision, correlatedPrior)
+              ? acceptedDiscardListStartedAction(source, next as OrdinaryListLoading<"diaper">, decision)
+              : correlatedPrior.domain === "growth" && isListDiscardDecisionForDestination(decision, correlatedPrior)
+                ? acceptedDiscardListStartedAction(source, next as OrdinaryListLoading<"growth">, decision)
+                : correlatedPrior.domain === "health" && isListDiscardDecisionForDestination(decision, correlatedPrior)
+                  ? acceptedDiscardListStartedAction(source, next as OrdinaryListLoading<"health">, decision)
+                  : null;
+    if (started === null || !send(started)) return;
+    generationRef.current = owner.generation;
+    const retryFocus = retryFocusSource !== undefined && retryFocusSource === source && isInstantDomain(domain)
+      ? Object.freeze({ source: retryFocusSource, owner: owner as ReadOwner<InstantDomain, "list"> })
+      : undefined;
+    runOrdinaryList(owner, loadingPrior, presentationZone, retryFocus);
+  }, [makeListOwner, runOrdinaryList, send]);
+
+  const requestRecord = useCallback(<D extends TrackerDomain,>(
+    domain: D,
+    id: string,
+    prior: ListFact<D>,
+    source: TrackerScreenState,
+    decision?: DiscardDecision,
+    resolvedZone?: string,
+    getRetrySource?: ZoneBlockedEntryState,
+  ) => {
+    if (stateRef.current !== source || !getEntryAuthorized(source, domain, id, prior, decision)) return;
+    const correlatedPrior = prior as AnyListFact;
+    let capturedZone = prior.presentationZone;
+    if (isInstantDomain(domain)) {
+      const zoneResult = resolvedZone === undefined ? captureDeviceTimeZone() : Object.freeze({ status: "available" as const, zone: resolvedZone });
+      if (zoneResult.status !== "available") {
+        const fact = correlatedPrior;
+        const blocked = decision === undefined
+          ? fact.domain === "feeding" ? zoneGetBlockedAction(source as DecisionlessZoneGetSource<"feeding">, id, fact)
+            : fact.domain === "sleep" ? zoneGetBlockedAction(source as DecisionlessZoneGetSource<"sleep">, id, fact)
+              : fact.domain === "diaper" ? zoneGetBlockedAction(source as DecisionlessZoneGetSource<"diaper">, id, fact)
+                : null
+          : source.tag === "confirm.discard" && source.decision === decision
+            ? fact.domain === "feeding" && isGetDiscardDecisionForDestination(decision, "feeding", id, fact) ? zoneGetBlockedAction(source, id, fact, decision)
+              : fact.domain === "sleep" && isGetDiscardDecisionForDestination(decision, "sleep", id, fact) ? zoneGetBlockedAction(source, id, fact, decision)
+                : fact.domain === "diaper" && isGetDiscardDecisionForDestination(decision, "diaper", id, fact) ? zoneGetBlockedAction(source, id, fact, decision)
+                  : null
+            : null;
+        if (blocked !== null) send(blocked);
+        return;
+      }
+      capturedZone = zoneResult.zone;
+    }
+    const owner = makeGetOwner(domain, id);
+    const getRetryFocus = getRetrySource !== undefined
+      && source === getRetrySource
+      && getRetrySource.domain === domain
+      && getRetrySource.intent.kind === "get"
+      && getRetrySource.intent.id === id
+      && getRetrySource.intent.fact === prior
+      ? Object.freeze({ source: getRetrySource, owner: owner as ReadOwner<InstantDomain, "get"> })
+      : null;
+    const requestGetRetryFocus = () => {
+      if (getRetryFocus === null) return;
+      const destination = stateRef.current;
+      if (destination.tag !== "edit.editing" && destination.tag !== "edit.error") return;
+      pendingGetRetryFocusRef.current = Object.freeze({ ...getRetryFocus, destination });
+      setGetRetryFocusRequest((value) => value + 1);
+    };
+    const failGet = () => {
+      if (send(getFailedAction(owner, READ_FAILURE))) requestGetRetryFocus();
+    };
+    const next = Object.freeze({
+      tag: "edit.loading" as const,
+      owner,
+      id,
+      capturedZone,
+      prior,
+    });
+    if (decision !== undefined && !isGetDiscardDecisionForDestination(decision, domain, id, prior)) return;
+    const started = decision === undefined
+      ? getStartedAction(source, next)
+      : source.tag !== "confirm.discard" || source.decision !== decision ? null
+        : correlatedPrior.domain === "feeding" && isGetDiscardDecisionForDestination(decision, "feeding", id, correlatedPrior)
+          ? acceptedDiscardGetStartedAction(source, next as Extract<TrackerScreenState, { tag: "edit.loading" }> & { prior: ListFact<"feeding">; owner: ReadOwner<"feeding", "get"> }, decision)
+          : correlatedPrior.domain === "sleep" && isGetDiscardDecisionForDestination(decision, "sleep", id, correlatedPrior)
+            ? acceptedDiscardGetStartedAction(source, next as Extract<TrackerScreenState, { tag: "edit.loading" }> & { prior: ListFact<"sleep">; owner: ReadOwner<"sleep", "get"> }, decision)
+            : correlatedPrior.domain === "diaper" && isGetDiscardDecisionForDestination(decision, "diaper", id, correlatedPrior)
+              ? acceptedDiscardGetStartedAction(source, next as Extract<TrackerScreenState, { tag: "edit.loading" }> & { prior: ListFact<"diaper">; owner: ReadOwner<"diaper", "get"> }, decision)
+              : correlatedPrior.domain === "growth" && isGetDiscardDecisionForDestination(decision, "growth", id, correlatedPrior)
+                ? acceptedDiscardGetStartedAction(source, next as Extract<TrackerScreenState, { tag: "edit.loading" }> & { prior: ListFact<"growth">; owner: ReadOwner<"growth", "get"> }, decision)
+                : correlatedPrior.domain === "health" && isGetDiscardDecisionForDestination(decision, "health", id, correlatedPrior)
+                  ? acceptedDiscardGetStartedAction(source, next as Extract<TrackerScreenState, { tag: "edit.loading" }> & { prior: ListFact<"health">; owner: ReadOwner<"health", "get"> }, decision)
+                  : null;
+    if (started === null || !send(started)) return;
+    generationRef.current = owner.generation;
+    void service.getById(domain, id).then(
+      (record) => {
+        if (!ownsRead(owner)) return;
+        if (record === null) {
+          let listPresentationZone = capturedZone;
+          if (isInstantDomain(domain)) {
+            const missingSource = stateRef.current;
+            const zoneResult = captureDeviceTimeZone();
+            if (!ownsRead(owner) || stateRef.current !== missingSource) return;
+            if (zoneResult.status !== "available") {
+              const fact = prior as AnyListFact;
+              const blocked = fact.domain === "feeding" ? zoneListLoadBlockedAction(missingSource, fact, "这条记录已不存在，列表已重新读取。")
+                : fact.domain === "sleep" ? zoneListLoadBlockedAction(missingSource, fact, "这条记录已不存在，列表已重新读取。")
+                  : fact.domain === "diaper" ? zoneListLoadBlockedAction(missingSource, fact, "这条记录已不存在，列表已重新读取。")
+                    : null;
+              if (blocked !== null) send(blocked);
+              return;
+            }
+            listPresentationZone = zoneResult.zone;
+          }
+          const listPrior = prior.presentationZone === listPresentationZone
+            ? prior
+            : freezeListFact(domain, prior.rows, listPresentationZone);
+          const listOwner = makeListOwner(domain);
+          const listNext = Object.freeze({
+            tag: "list.loading" as const,
+            source: "ordinary" as const,
+            owner: listOwner,
+            prior: listPrior,
+            notice: "这条记录已不存在，列表已重新读取。",
+          });
+          if (!send(getMissingReloadStartedAction(owner, listNext))) return;
+          generationRef.current = listOwner.generation;
+          runOrdinaryList(listOwner, listPrior, listPresentationZone);
+          return;
+        }
+        if (!validRecordForDomain(domain, id, record)) {
+          failGet();
+          return;
+        }
+        const built = recordToEditorDraft(domain, record, capturedZone);
+        if (built.status !== "ready") {
+          failGet();
+          return;
+        }
+        const editor = editSnapshot(domain, built.draft, record, capturedZone, prior);
+        if (!send(getSucceededAction(owner, editor))) return;
+        requestGetRetryFocus();
+      },
+      () => {
+        if (ownsRead(owner)) failGet();
+      },
+    );
+  }, [makeGetOwner, makeListOwner, ownsRead, runOrdinaryList, send, service]);
+
+  const resumeGet = useCallback((source: Extract<TrackerScreenState, { tag: "read.suspended" }>) => {
+    const request = source.request;
+    if (request.kind !== "get") return;
+    switch (request.prior.domain) {
+      case "growth": requestRecord("growth", request.id, request.prior, source); break;
+      case "feeding": requestRecord("feeding", request.id, request.prior, source); break;
+      case "sleep": requestRecord("sleep", request.id, request.prior, source); break;
+      case "diaper": requestRecord("diaper", request.id, request.prior, source); break;
+      case "health": requestRecord("health", request.id, request.prior, source); break;
+    }
+  }, [requestRecord]);
+
+  const resumeList = useCallback((source: TrackerScreenState, fact: AnyListFact, notice?: string, decision?: DiscardDecision) => {
+    switch (fact.domain) {
+      case "growth": startList("growth", fact, source, notice, decision); break;
+      case "feeding": startList("feeding", fact, source, notice, decision); break;
+      case "sleep": startList("sleep", fact, source, notice, decision); break;
+      case "diaper": startList("diaper", fact, source, notice, decision); break;
+      case "health": startList("health", fact, source, notice, decision); break;
+    }
+  }, [startList]);
+
+  useFocusEffect(useCallback(() => {
+    mountedRef.current = true;
+    recordsFocusedRef.current = true;
+    setRecordsFocused(true);
+    focusSessionRef.current += 1;
+    focusDecisionHeadingOnce();
+    const cancelCapability = pendingCancelFocusRef.current;
+    if (cancelCapability !== null && stateRef.current !== cancelCapability.destination) {
+      pendingCancelFocusRef.current = null;
+    } else if (cancelCapability !== null && cancelCapability.decision.initiatingControlRef.current !== null) {
+      pendingCancelFocusRef.current = null;
+      focusRefIfAvailable(cancelCapability.decision.initiatingControlRef);
+    }
+    const deliveredAccessibility = deliverPendingAccessibility();
+    if (!deliveredAccessibility) setAccessibilityDeliveryRequest((value) => value + 1);
+    const current = stateRef.current;
+    if (current.tag === "mutation.submitting") return () => {
+      recordsFocusedRef.current = false;
+      setRecordsFocused(false);
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+      focusedMutationSuccessOwnerRef.current = null;
+      focusSessionRef.current += 1;
+      generationRef.current += 1;
+      send({ type: "BLURRED", focusSession: focusSessionRef.current });
+    };
+    if (current.tag === "list.loading" && current.source === "mutation-refresh") return () => {
+      recordsFocusedRef.current = false;
+      setRecordsFocused(false);
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+      focusedMutationSuccessOwnerRef.current = null;
+      focusSessionRef.current += 1;
+      generationRef.current += 1;
+      send({ type: "BLURRED", focusSession: focusSessionRef.current });
+    };
+    if (deliveredAccessibility) return () => {
+      recordsFocusedRef.current = false;
+      setRecordsFocused(false);
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+      focusedMutationSuccessOwnerRef.current = null;
+      focusSessionRef.current += 1;
+      generationRef.current += 1;
+      send({ type: "BLURRED", focusSession: focusSessionRef.current });
+    };
+    if (current.tag === "read.suspended") {
+      if (current.request.kind === "get") resumeGet(current);
+      else resumeList(current, current.request.prior, current.request.notice);
+    } else if (
+      current.tag === "list.loading"
+      || current.tag === "list.ready.empty"
+      || current.tag === "list.ready.rows"
+      || current.tag === "list.error"
+    ) {
+      resumeList(current, stateListFact(current));
+    }
+    return () => {
+      recordsFocusedRef.current = false;
+      setRecordsFocused(false);
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+      focusedMutationSuccessOwnerRef.current = null;
+      focusSessionRef.current += 1;
+      generationRef.current += 1;
+      send({ type: "BLURRED", focusSession: focusSessionRef.current });
+    };
+  }, [deliverPendingAccessibility, focusDecisionHeadingOnce, resumeGet, resumeList, send]));
+
+  const requestDiscard = useCallback((decision: DiscardDecision | null) => {
+    if (decision !== null) send(discardRequestedAction(decision));
+  }, [send]);
+
+  const selectDomainFrom = useCallback((current: TrackerScreenState, domain: TrackerDomain) => {
+    if (stateRef.current !== current) return;
+    if (domain === stateDomain(current)) return;
+    const cachedFact = domainDestinationFactsRef.current[domain];
+    const fact = cachedFact ?? emptyListFact(domain, "");
+    domainDestinationFactsRef.current[domain] = fact;
+    if (current.tag === "create.editing" || current.tag === "edit.editing" || current.tag === "mutation.error") {
+      const editor = stateEditor(current);
+      if (editor !== null && editorIsDirty(editor)) {
+        const cachedDecision = domainDiscardDecisionsRef.current[domain];
+        const decision = cachedDecision?.prior === current
+          && "kind" in cachedDecision.destination
+          && cachedDecision.destination.kind === "domain"
+          && cachedDecision.destination.fact === fact
+          && cachedDecision.initiatingControlRef === domainTabRefs[domain]
+          ? cachedDecision
+          : domainDiscardDecision(current, fact, domainTabRefs[domain]);
+        domainDiscardDecisionsRef.current[domain] = decision;
+        requestDiscard(decision);
+        return;
+      }
+    }
+    resumeList(current, fact);
+  }, [domainTabRefs, requestDiscard, resumeList]);
+
+  const selectDomain = useCallback((domain: TrackerDomain) => {
+    selectDomainFrom(stateRef.current, domain);
+  }, [selectDomainFrom]);
+
+  const openCreate = useCallback(<D extends TrackerDomain,>(domain: D, prior: ListFact<D>) => {
+    const source = stateRef.current;
+    let capturedZone = prior.presentationZone;
+    if (isInstantDomain(domain)) {
+      const zoneResult = captureDeviceTimeZone();
+      if (zoneResult.status !== "available") {
+        const fact = prior as AnyListFact;
+        const blocked = source.tag !== "list.ready.empty" && source.tag !== "list.ready.rows" ? null
+          : fact.domain === "feeding" ? zoneCreateBlockedAction(source as Extract<TrackerScreenState, { tag: "list.ready.empty" | "list.ready.rows" }> & { fact: ListFact<"feeding"> }, fact)
+            : fact.domain === "sleep" ? zoneCreateBlockedAction(source as Extract<TrackerScreenState, { tag: "list.ready.empty" | "list.ready.rows" }> & { fact: ListFact<"sleep"> }, fact)
+              : fact.domain === "diaper" ? zoneCreateBlockedAction(source as Extract<TrackerScreenState, { tag: "list.ready.empty" | "list.ready.rows" }> & { fact: ListFact<"diaper"> }, fact)
+                : null;
+        if (blocked !== null) send(blocked);
+        return;
+      }
+      capturedZone = zoneResult.zone;
+    }
+    const built = createInitialDraft(domain, new Date(), capturedZone);
+    if (built.status !== "ready") return;
+    send(createRequestedAction(source, createSnapshot(domain, built.draft, capturedZone, prior)));
+  }, [send]);
+
+  const requestCreate = useCallback(() => {
+    const fact = stateListFact(stateRef.current);
+    switch (fact.domain) {
+      case "growth": openCreate("growth", fact); break;
+      case "feeding": openCreate("feeding", fact); break;
+      case "sleep": openCreate("sleep", fact); break;
+      case "diaper": openCreate("diaper", fact); break;
+      case "health": openCreate("health", fact); break;
+    }
+  }, [openCreate]);
+
+  const retryGet = useCallback(() => {
+    const current = stateRef.current;
+    if (current.tag !== "edit.error") return;
+    switch (current.prior.domain) {
+      case "growth": requestRecord("growth", current.id, current.prior, current); break;
+      case "feeding": requestRecord("feeding", current.id, current.prior, current); break;
+      case "sleep": requestRecord("sleep", current.id, current.prior, current); break;
+      case "diaper": requestRecord("diaper", current.id, current.prior, current); break;
+      case "health": requestRecord("health", current.id, current.prior, current); break;
+    }
+  }, [requestRecord]);
+
+  const returnToList = useCallback(() => {
+    const current = stateRef.current;
+    if (current.tag === "create.editing" || current.tag === "edit.editing" || current.tag === "mutation.error") {
+      const editor = stateEditor(current);
+      if (editor !== null && editorIsDirty(editor)) {
+        requestDiscard(backDiscardDecision(current, backActionRef));
+        return;
+      }
+    }
+    send({ type: "RETURN_TO_LIST" });
+    setListFocusRequest((value) => value + 1);
+  }, [requestDiscard, send]);
+
+  const requestFieldFocus = useCallback((field: string) => {
+    const target = mutationFocusField(field);
+    if (target !== undefined) setFocusRequest((previous) => ({ id: (previous?.id ?? 0) + 1, field: target }));
+  }, []);
+
+  const handleMutationFailure = useCallback((owner: OperationOwner, error: unknown) => {
+    const current = stateRef.current;
+    if (current.tag !== "mutation.submitting" || !sameOperationOwner(current.owner, owner)) return;
+    if (owner.kind !== "create" && isManualTrackerConflictError(error)) {
+      send({ type: "MUTATION_CONFLICT", source: current, conflictCode: error.code });
+      return;
+    }
+    if (owner.kind !== "delete" && error instanceof TrackerValidationError) {
+      const failure = serviceValidationFailure(error);
+      send(mutationRejectedAction(owner, failure.message, failure.field));
+      return;
+    }
+    send(mutationRejectedAction(
+      owner,
+      error instanceof RuntimeClosingError
+        ? RUNTIME_FAILURE
+        : owner.kind === "delete" ? DELETE_FAILURE : SAVE_FAILURE,
+    ));
+  }, [send]);
+
+  const applyDiscardDestination = useCallback((decision: DiscardDecision) => {
+    const source = stateRef.current;
+    const destination = decision.destination;
+    if (!("kind" in destination)) {
+      if (isInstantDomain(destination.domain)) {
+        const zoneResult = captureDeviceTimeZone();
+        if (stateRef.current !== source) return;
+        if (zoneResult.status !== "available") {
+          const blocked = source.tag !== "confirm.discard" || source.decision !== decision ? null
+            : destination.domain === "feeding" ? zoneListRestoreBlockedAction(source, destination, decision as Parameters<typeof zoneListRestoreBlockedAction>[2] & { domain: "feeding" })
+              : destination.domain === "sleep" ? zoneListRestoreBlockedAction(source, destination, decision as Parameters<typeof zoneListRestoreBlockedAction>[2] & { domain: "sleep" })
+                : destination.domain === "diaper" ? zoneListRestoreBlockedAction(source, destination, decision as Parameters<typeof zoneListRestoreBlockedAction>[2] & { domain: "diaper" })
+                  : null;
+          if (blocked !== null) send(blocked);
+          return;
+        }
+      }
+      send({ type: "DISCARD_COMPLETED", decision });
+      setListFocusRequest((value) => value + 1);
+      return;
+    }
+    if (destination.kind === "reload-record") {
+      switch (destination.domain) {
+        case "growth": requestRecord("growth", destination.id, destination.prior, source, decision); break;
+        case "feeding": requestRecord("feeding", destination.id, destination.prior, source, decision); break;
+        case "sleep": requestRecord("sleep", destination.id, destination.prior, source, decision); break;
+        case "diaper": requestRecord("diaper", destination.id, destination.prior, source, decision); break;
+        case "health": requestRecord("health", destination.id, destination.prior, source, decision); break;
+      }
+      return;
+    }
+    resumeList(source, destination.fact, undefined, decision);
+  }, [requestRecord, resumeList, send]);
+
+  const startOperationRefresh = useCallback((
+    owner: OperationOwner,
+    prior: AnyListFact,
+    completion: AnyMutationCompletion,
+  ) => {
+    const verb = owner.kind === "create" ? "已保存" : owner.kind === "update" ? "已更新" : "已删除";
+    const success = `${TRACKER_DOMAIN_LABELS[owner.domain]}记录${verb}`;
+    const refreshPrior = completion.kind === "delete"
+      ? reconciledDeletePrior(owner, prior, completion.deletion.id)
+      : prior;
+    if (refreshPrior === null) return;
+    const completionAction = completedAction(owner, completion);
+    const refreshAction = refreshStartedAction(owner, refreshPrior, success);
+    if (completionAction === null || refreshAction === null) return;
+    if (!send(completionAction) || !send(refreshAction)) return;
+    const destination = stateRef.current;
+    if (destination.tag !== "list.loading" || destination.source !== "mutation-refresh") return;
+    successCapabilityIdRef.current += 1;
+    pendingMutationSuccessRef.current = Object.freeze({
+      id: successCapabilityIdRef.current,
+      owner,
+      destination,
+      success,
+    });
+    setAccessibilityDeliveryRequest((value) => value + 1);
+    void service.list(owner.domain, 100).then(
+      (rows) => {
+        if (!ownsOperationRefresh(owner)) return;
+        const fact = listFactForRows(owner.domain, rows, refreshPrior.presentationZone);
+        if (fact === null || fact.domain !== owner.domain) {
+          send(operationRefreshFailedAction(owner));
+          return;
+        }
+        switch (owner.domain) {
+          case "growth": if (fact.domain === "growth") send(operationRefreshSucceededAction(owner, fact)); break;
+          case "feeding": if (fact.domain === "feeding") send(operationRefreshSucceededAction(owner, fact)); break;
+          case "sleep": if (fact.domain === "sleep") send(operationRefreshSucceededAction(owner, fact)); break;
+          case "diaper": if (fact.domain === "diaper") send(operationRefreshSucceededAction(owner, fact)); break;
+          case "health": if (fact.domain === "health") send(operationRefreshSucceededAction(owner, fact)); break;
+        }
+      },
+      () => {
+        if (ownsOperationRefresh(owner)) send(operationRefreshFailedAction(owner));
+      },
+    );
+  }, [ownsOperationRefresh, send, service]);
+
+  const gateInstantSave = useCallback(<D extends TrackerDomain>(prior: CreateEditorSnapshot<D> | EditEditorSnapshot<D>): boolean => {
+    if (!isInstantDomain(prior.domain)) return true;
+    const source = stateRef.current;
+    const zoneResult = captureDeviceTimeZone();
+    if (zoneResult.status !== "available") {
+      const blocked = prior.domain === "feeding" ? zoneSaveBlockedAction(source as ExactEditableState<"feeding">, prior as CreateEditorSnapshot<"feeding"> | EditEditorSnapshot<"feeding">)
+        : prior.domain === "sleep" ? zoneSaveBlockedAction(source as ExactEditableState<"sleep">, prior as CreateEditorSnapshot<"sleep"> | EditEditorSnapshot<"sleep">)
+          : prior.domain === "diaper" ? zoneSaveBlockedAction(source as ExactEditableState<"diaper">, prior as CreateEditorSnapshot<"diaper"> | EditEditorSnapshot<"diaper">)
+            : null;
+      if (blocked !== null) send(blocked);
+      return false;
+    }
+    if (zoneResult.zone !== prior.capturedZone) {
+      send({ type: "VALIDATION_FAILED", field: "form", message: CHANGED_ZONE });
+      focusRefIfAvailable(saveActionRef);
+      return false;
+    }
+    return true;
+  }, [send]);
+
+  const submitLowRiskCreate = useCallback(async <D extends LowRiskDomain,>(prior: CreateEditorSnapshot<D>) => {
+    if (isInstantDomain(prior.domain) && !gateInstantSave(prior)) return;
+    const parsed = parseDraftToCreateInput(prior.domain, prior.draft, prior.capturedZone);
+    if (parsed.status !== "valid") {
+      send({ type: "VALIDATION_FAILED", field: parsed.field, message: parsed.error });
+      requestFieldFocus(parsed.field);
+      return;
+    }
+    const owner = makeOperationOwner(prior.domain, "create");
+    const started = directCreateAction(owner, prior);
+    if (started === null) return;
+    if (!send(started)) return;
+    try {
+      const result = await service.create(prior.domain, parsed.input);
+      const current = stateRef.current;
+      if (
+        !mountedRef.current
+        || owner.mountEpoch !== mountEpochRef.current
+        || current.tag !== "mutation.submitting"
+        || !sameOperationOwner(current.owner, owner)
+      ) return;
+      if (result.status !== "completed") {
+        send(mutationRejectedAction(owner, SAVE_FAILURE));
+        return;
+      }
+      if (!validRecordForDomain(owner.domain, result.record.id, result.record)) {
+        send(mutationRejectedAction(owner, SAVE_FAILURE));
+        return;
+      }
+      switch (prior.domain) {
+        case "growth":
+          if (isCreateEditorForDomain(prior, "growth") && ownerMatches(owner, "growth", "create") && validRecordForDomain("growth", result.record.id, result.record)) {
+            startOperationRefresh(owner, prior.prior, Object.freeze({ kind: "create", record: result.record }));
+          }
+          break;
+        case "feeding":
+          if (isCreateEditorForDomain(prior, "feeding") && ownerMatches(owner, "feeding", "create") && validRecordForDomain("feeding", result.record.id, result.record)) {
+            startOperationRefresh(owner, prior.prior, Object.freeze({ kind: "create", record: result.record }));
+          }
+          break;
+        case "sleep":
+          if (isCreateEditorForDomain(prior, "sleep") && ownerMatches(owner, "sleep", "create") && validRecordForDomain("sleep", result.record.id, result.record)) {
+            startOperationRefresh(owner, prior.prior, Object.freeze({ kind: "create", record: result.record }));
+          }
+          break;
+        case "diaper":
+          if (isCreateEditorForDomain(prior, "diaper") && ownerMatches(owner, "diaper", "create") && validRecordForDomain("diaper", result.record.id, result.record)) {
+            startOperationRefresh(owner, prior.prior, Object.freeze({ kind: "create", record: result.record }));
+          }
+          break;
+      }
+    } catch (error) {
+      const current = stateRef.current;
+      if (
+        !mountedRef.current
+        || owner.mountEpoch !== mountEpochRef.current
+        || current.tag !== "mutation.submitting"
+        || !sameOperationOwner(current.owner, owner)
+      ) return;
+      handleMutationFailure(owner, error);
+    }
+  }, [gateInstantSave, handleMutationFailure, makeOperationOwner, requestFieldFocus, send, service, startOperationRefresh]);
+
+  const submitHealthCreate = useCallback(async (prior: CreateEditorSnapshot<"health">) => {
+    const parsed = parseDraftToCreateInput("health", prior.draft, prior.capturedZone);
+    if (parsed.status !== "valid") {
+      send({ type: "VALIDATION_FAILED", field: parsed.field, message: parsed.error });
+      requestFieldFocus(parsed.field);
+      return;
+    }
+    const owner = makeOperationOwner("health", "create");
+    if (!send({ type: "MUTATION_STARTED", owner, prior, phase: "probe" })) return;
+    try {
+      const result = await service.create("health", parsed.input);
+      if (!ownsOperation(owner)) return;
+      if (result.status !== "confirmation_required") {
+        send(mutationRejectedAction(owner, SAVE_FAILURE));
+        return;
+      }
+      const decision = createTrackerDecisionSnapshot({
+        kind: "healthCreate",
+        domain: "health",
+        prior,
+        initiatingControlRef: saveActionRef,
+        serviceSummary: result.summary,
+        presentationTimeZone: prior.capturedZone,
+      });
+      send({
+        type: "CONFIRMATION_REQUIRED",
+        owner,
+        next: Object.freeze({ tag: "confirm.healthCreate", owner, decision }),
+        summary: decision.serviceSummary,
+      });
+    } catch (error) {
+      if (!ownsOperation(owner)) return;
+      handleMutationFailure(owner, error);
+    }
+  }, [handleMutationFailure, makeOperationOwner, ownsOperation, requestFieldFocus, send, service]);
+
+  const normalizedEditor = useCallback(<D extends TrackerDomain>(
+    prior: EditEditorSnapshot<D>,
+    input: TrackerUpdateInputByDomain[D],
+  ): EditEditorSnapshot<D> | null => {
+    const normalizedRecord = Object.freeze({ ...prior.baseline, ...input }) as TrackerRecordByDomain[D];
+    const built = recordToEditorDraft(prior.domain, normalizedRecord, prior.capturedZone);
+    return built.status === "ready"
+      ? editSnapshot(prior.domain, built.draft, prior.baseline, prior.capturedZone, prior.prior)
+      : null;
+  }, []);
+
+  const submitUpdate = useCallback(async <D extends TrackerDomain>(prior: EditEditorSnapshot<D>) => {
+    if (isInstantDomain(prior.domain) && !gateInstantSave(prior)) return;
+    if (!isDraftDirty(prior.domain, prior.draft, prior.initialDraft)) {
+      send(normalizedNoopAction(makeOperationOwner(prior.domain, "update"), prior));
+      return;
+    }
+    const parsed = parseDraftToUpdateInput(
+      prior.domain,
+      prior.draft,
+      prior.baseline,
+      prior.capturedZone,
+    );
+    if (parsed.status !== "valid") {
+      send({ type: "VALIDATION_FAILED", field: parsed.field, message: parsed.error });
+      requestFieldFocus(parsed.field);
+      return;
+    }
+    const owner = makeOperationOwner(prior.domain, "update");
+    const started = editProbeAction(owner, prior);
+    if (started === null) return;
+    if (!send(started)) return;
+    try {
+      const result = await service.update(prior.domain, prior.baseline.id, parsed.input, prior.baseline.updatedAt);
+      if (!ownsOperation(owner)) return;
+      if (result.status !== "confirmation_required") {
+        send(mutationRejectedAction(owner, SAVE_FAILURE));
+        return;
+      }
+      if (isNormalizedUpdateNoop(prior.domain, prior.baseline, result.summary.input)) {
+        const editor = normalizedEditor(prior, result.summary.input);
+        if (editor === null) send(mutationRejectedAction(owner, SAVE_FAILURE));
+        else send(normalizedNoopAction(owner, editor));
+        return;
+      }
+      const decision = updateDecisionSnapshot(prior, result.summary, saveActionRef);
+      const confirmation = decision === null ? null : editDecisionAction(owner, decision, "confirmation");
+      if (confirmation === null) {
+        send(mutationRejectedAction(owner, SAVE_FAILURE));
+        return;
+      }
+      send(confirmation);
+    } catch (error) {
+      if (!ownsOperation(owner)) return;
+      handleMutationFailure(owner, error);
+    }
+  }, [gateInstantSave, handleMutationFailure, makeOperationOwner, normalizedEditor, ownsOperation, requestFieldFocus, send, service]);
+
+  const requestDelete = useCallback(async <D extends TrackerDomain>(prior: EditEditorSnapshot<D>) => {
+    const owner = makeOperationOwner(prior.domain, "delete");
+    const started = editProbeAction(owner, prior);
+    if (started === null) return;
+    if (!send(started)) return;
+    try {
+      const result = await service.delete(prior.domain, prior.baseline.id, prior.baseline.updatedAt);
+      if (!ownsOperation(owner)) return;
+      if (result.status !== "confirmation_required") {
+        send(mutationRejectedAction(owner, DELETE_FAILURE));
+        return;
+      }
+      const decision = deleteDecisionSnapshot(prior, result.summary, deleteActionRef);
+      const confirmation = decision === null ? null : editDecisionAction(owner, decision, "confirmation");
+      if (confirmation === null) {
+        send(mutationRejectedAction(owner, DELETE_FAILURE));
+        return;
+      }
+      send(confirmation);
+    } catch (error) {
+      if (ownsOperation(owner)) handleMutationFailure(owner, error);
+    }
+  }, [handleMutationFailure, makeOperationOwner, ownsOperation, send, service]);
+
+  const save = useCallback(() => {
+    const current = stateRef.current;
+    const editor = stateEditor(current);
+    if (editor?.mode === "create" && (current.tag === "create.editing" || current.tag === "mutation.error")) {
+      switch (editor.domain) {
+        case "growth": void submitLowRiskCreate(editor); break;
+        case "feeding": void submitLowRiskCreate(editor); break;
+        case "sleep": void submitLowRiskCreate(editor); break;
+        case "diaper": void submitLowRiskCreate(editor); break;
+        case "health": void submitHealthCreate(editor); break;
+      }
+    } else if (editor?.mode === "edit" && (current.tag === "edit.editing" || current.tag === "mutation.error")) {
+      switch (editor.domain) {
+        case "growth": void submitUpdate(editor); break;
+        case "feeding": void submitUpdate(editor); break;
+        case "sleep": void submitUpdate(editor); break;
+        case "diaper": void submitUpdate(editor); break;
+        case "health": void submitUpdate(editor); break;
+      }
+    }
+  }, [submitHealthCreate, submitLowRiskCreate, submitUpdate]);
+
+  const deleteRecord = useCallback(() => {
+    const current = stateRef.current;
+    const editor = stateEditor(current);
+    if (editor?.mode !== "edit" || (current.tag !== "edit.editing" && current.tag !== "mutation.error")) return;
+    switch (editor.domain) {
+      case "growth": void requestDelete(editor); break;
+      case "feeding": void requestDelete(editor); break;
+      case "sleep": void requestDelete(editor); break;
+      case "diaper": void requestDelete(editor); break;
+      case "health": void requestDelete(editor); break;
+    }
+  }, [requestDelete]);
+
+  const cancelDecision = useCallback((decision: ScreenTrackerDecision) => {
+    const restored = decision.kind === "discard"
+      ? send({ type: "DISCARD_CANCELLED", decision })
+      : send({ type: "CONFIRMATION_CANCELLED", decision });
+    if (restored) pendingCancelFocusRef.current = Object.freeze({ decision, destination: stateRef.current });
+  }, [send]);
+
+  const acceptDecision = useCallback(async (decision: ScreenTrackerDecision) => {
+    const current = stateRef.current;
+    if (current.tag === "confirm.discard" && decision.kind === "discard" && current.decision === decision) {
+      applyDiscardDestination(decision);
+      return;
+    }
+    if (current.tag !== "confirm.healthCreate" && current.tag !== "confirm.update" && current.tag !== "confirm.delete") return;
+    if (current.decision !== decision) return;
+    if (current.tag === "confirm.healthCreate" && decision.kind === "healthCreate") {
+      const owner = current.owner;
+      if (!send({ type: "MUTATION_STARTED", owner, prior: decision.prior, phase: "confirmed", decision })) return;
+      try {
+        const summary = decision.serviceSummary;
+        const result = await service.create(summary.domain, summary.input, "confirmed");
+        if (!ownsOperation(owner)) return;
+        if (result.status !== "completed" || !validRecordForDomain("health", result.record.id, result.record)) {
+          send(mutationRejectedAction(owner, SAVE_FAILURE));
+          return;
+        }
+        startOperationRefresh(owner, decision.prior.prior, Object.freeze({ kind: "create", record: result.record }));
+      } catch (error) {
+        if (ownsOperation(owner)) handleMutationFailure(owner, error);
+      }
+      return;
+    }
+    if (current.tag === "confirm.update" && decision.kind === "update" && current.decision === decision) {
+      const owner = current.owner;
+      const started = editDecisionAction(owner, decision, "confirmed");
+      if (started === null) return;
+      if (!send(started)) return;
+      try {
+        const summary = decision.serviceSummary;
+        const result = await service.update(summary.domain, summary.id, summary.input, summary.expectedUpdatedAt, "confirmed");
+        if (!ownsOperation(owner)) return;
+        if (result.status !== "completed" || !validRecordForDomain(summary.domain, summary.id, result.record)) {
+          send(mutationRejectedAction(owner, SAVE_FAILURE));
+          return;
+        }
+        startOperationRefresh(owner, decision.prior.prior, Object.freeze({ kind: "update", record: result.record }));
+      } catch (error) {
+        if (ownsOperation(owner)) handleMutationFailure(owner, error);
+      }
+      return;
+    }
+    if (current.tag === "confirm.delete" && decision.kind === "delete" && current.decision === decision) {
+      const owner = current.owner;
+      const started = editDecisionAction(owner, decision, "confirmed");
+      if (started === null) return;
+      if (!send(started)) return;
+      try {
+        const summary = decision.serviceSummary;
+        const result = await service.delete(summary.domain, summary.id, summary.expectedUpdatedAt, "confirmed");
+        if (!ownsOperation(owner)) return;
+        if (
+          result.status !== "completed"
+          || result.deletion.domain !== summary.domain
+          || result.deletion.id !== summary.id
+        ) {
+          send(mutationRejectedAction(owner, DELETE_FAILURE));
+          return;
+        }
+        startOperationRefresh(owner, decision.prior.prior, Object.freeze({ kind: "delete", deletion: result.deletion }));
+      } catch (error) {
+        if (ownsOperation(owner)) handleMutationFailure(owner, error);
+      }
+    }
+  }, [applyDiscardDestination, handleMutationFailure, ownsOperation, send, service, startOperationRefresh]);
+
+  const recoverConflict = useCallback((kind: "reload-record" | "reload-list") => {
+    const current = stateRef.current;
+    if (current.tag !== "conflict.stale" && current.tag !== "conflict.notFound") return;
+    if (kind === "reload-record" && current.tag !== "conflict.stale") return;
+    const editor = current.source.prior;
+    if (editor.mode !== "edit") return;
+    const initiatingControlRef = kind === "reload-record" ? conflictReloadActionRef : conflictListActionRef;
+    const decision = conflictDiscardDecision(current, kind, initiatingControlRef);
+    if (decision === null) return;
+    const destination = decision.destination;
+    if (editorIsDirty(editor)) {
+      requestDiscard(decision);
+      return;
+    }
+    if (!("kind" in destination)) return;
+    if (destination.kind === "reload-list") {
+      resumeList(current, destination.fact);
+      return;
+    }
+    if (destination.kind !== "reload-record") return;
+    switch (destination.domain) {
+      case "growth": requestRecord("growth", destination.id, destination.prior, current); break;
+      case "feeding": requestRecord("feeding", destination.id, destination.prior, current); break;
+      case "sleep": requestRecord("sleep", destination.id, destination.prior, current); break;
+      case "diaper": requestRecord("diaper", destination.id, destination.prior, current); break;
+      case "health": requestRecord("health", destination.id, destination.prior, current); break;
+    }
+  }, [requestDiscard, requestRecord, resumeList]);
+
+  const retryZone = useCallback((source: Extract<TrackerScreenState, { tag: "zone.blocked.entry" | "zone.blocked.save" }>) => {
+    if (stateRef.current !== source) return;
+    const zoneResult = captureDeviceTimeZone();
+    if (stateRef.current !== source) return;
+    if (zoneResult.status !== "available") {
+      focusRefIfAvailable(zoneRetryActionRef);
+      return;
+    }
+    if (source.tag === "zone.blocked.save") {
+      switch (source.domain) {
+        case "feeding": send(zoneSaveRestoredAction(source, restoredSaveState(source, zoneResult.zone))); break;
+        case "sleep": send(zoneSaveRestoredAction(source, restoredSaveState(source, zoneResult.zone))); break;
+        case "diaper": send(zoneSaveRestoredAction(source, restoredSaveState(source, zoneResult.zone))); break;
+      }
+      return;
+    }
+    const intent = source.intent;
+    if (intent.kind === "list-load" || intent.kind === "list-restore") {
+      startList(source.domain, intent.fact, source, intent.kind === "list-load" ? intent.notice : undefined, undefined, zoneResult.zone, source);
+      return;
+    }
+    if (intent.kind === "get") {
+      requestRecord(source.domain, intent.id, intent.fact, source, undefined, zoneResult.zone, source);
+      return;
+    }
+    const built = createInitialDraft(source.domain, new Date(), zoneResult.zone);
+    if (built.status !== "ready") return;
+    send(createRequestedAction(source, createSnapshot(source.domain, built.draft, zoneResult.zone, intent.fact)));
+  }, [requestRecord, send, startList]);
+
+  const renderList = useCallback((fact: AnyListFact, busy: boolean, source: TrackerScreenState): ReactNode => {
+    const shared = { busy, headingRef: listHeadingRef, onCreate: requestCreate };
+    switch (fact.domain) {
+      case "growth": return <TrackerRecordList {...shared} domain="growth" onSelectRecord={(id) => requestRecord("growth", id, fact, source)} records={fact.rows} timeZone={fact.presentationZone} />;
+      case "feeding": return <TrackerRecordList {...shared} domain="feeding" onSelectRecord={(id) => requestRecord("feeding", id, fact, source)} records={fact.rows} timeZone={fact.presentationZone} />;
+      case "sleep": return <TrackerRecordList {...shared} domain="sleep" onSelectRecord={(id) => requestRecord("sleep", id, fact, source)} records={fact.rows} timeZone={fact.presentationZone} />;
+      case "diaper": return <TrackerRecordList {...shared} domain="diaper" onSelectRecord={(id) => requestRecord("diaper", id, fact, source)} records={fact.rows} timeZone={fact.presentationZone} />;
+      case "health": return <TrackerRecordList {...shared} domain="health" onSelectRecord={(id) => requestRecord("health", id, fact, source)} records={fact.rows} timeZone={fact.presentationZone} />;
+    }
+  }, [requestCreate, requestRecord]);
+
+  const renderEditor = useCallback((editor: AnyEditorSnapshot, busy: boolean, errors = editor.errors): ReactNode => {
+    const shared = {
+      backRef: backActionRef,
+      busy,
+      errors,
+      groupRefs,
+      headingRef: editorHeadingRef,
+      inputRefs,
+      onBack: returnToList,
+      saveRef: saveActionRef,
+    };
+    switch (editor.domain) {
+      case "growth": return editor.mode === "create"
+        ? <TrackerEditor {...shared} domain="growth" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "growth", draft })} onSave={save} />
+        : <TrackerEditor {...shared} domain="growth" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "growth", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
+      case "feeding": return editor.mode === "create"
+        ? <TrackerEditor {...shared} domain="feeding" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "feeding", draft })} onSave={save} />
+        : <TrackerEditor {...shared} domain="feeding" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "feeding", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
+      case "sleep": return editor.mode === "create"
+        ? <TrackerEditor {...shared} domain="sleep" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "sleep", draft })} onSave={save} />
+        : <TrackerEditor {...shared} domain="sleep" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "sleep", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
+      case "diaper": return editor.mode === "create"
+        ? <TrackerEditor {...shared} domain="diaper" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "diaper", draft })} onSave={save} />
+        : <TrackerEditor {...shared} domain="diaper" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "diaper", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
+      case "health": return editor.mode === "create"
+        ? <TrackerEditor {...shared} domain="health" draft={editor.draft} mode="create" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "health", draft })} onSave={save} />
+        : <TrackerEditor {...shared} domain="health" draft={editor.draft} mode="edit" onChange={(draft) => send({ type: "DRAFT_CHANGED", domain: "health", draft })} deleteRef={deleteActionRef} onDelete={deleteRecord} onSave={save} />;
+    }
+  }, [deleteRecord, groupRefs, inputRefs, returnToList, save, send]);
+
+  const selectedDomain = stateDomain(state);
+  const label = TRACKER_DOMAIN_LABELS[selectedDomain];
+  const editing = stateEditor(state);
+  const activeDecision = state.tag === "confirm.healthCreate"
+    || state.tag === "confirm.update"
+    || state.tag === "confirm.delete"
+    || state.tag === "confirm.discard"
+    ? state.decision
+    : state.tag === "mutation.submitting" && "decision" in state ? state.decision ?? null : null;
+  const exposeSuccessAnnouncement = activeSuccessAnnouncement !== null
+    && recordsFocused
+    && state === activeSuccessAnnouncement.destination;
+  const exposeMutationIssue = activeMutationIssue !== null
+    && recordsFocused
+    && state === activeMutationIssue.destination;
+  let content: ReactNode;
+
+  if (state.tag === "zone.blocked.entry" || state.tag === "zone.blocked.save") {
+    content = (
+      <View style={{ gap: spacing.md }}>
+        <TrackerDomainSwitcher disabled onSelectDomain={(domain) => selectDomainFrom(state, domain)} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
+        <Text accessibilityRole="header" allowFontScaling ref={zoneBlockedHeadingRef}>本机时区不可用</Text>
+        <Text accessibilityLiveRegion="assertive" accessibilityRole="alert" allowFontScaling>{INVALID_ZONE}</Text>
+        <PrimaryAction actionRef={zoneRetryActionRef} label="重新读取本机时区" onPress={() => retryZone(state)} />
+      </View>
+    );
+  } else if (state.tag === "list.loading") {
+    content = (
+      <View style={{ gap: spacing.md }}>
+        <TrackerDomainSwitcher disabled={state.source === "mutation-refresh"} onSelectDomain={selectDomain} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
+        {renderList(state.prior, true, state)}
+        <Text accessibilityLiveRegion={recordsFocused && !exposeSuccessAnnouncement ? "polite" : undefined} allowFontScaling style={{ color: colors.textSecondary }}>
+          正在读取{label}记录…
+        </Text>
+        {state.source === "mutation-refresh" ? (
+          <Text
+            accessibilityLiveRegion={exposeSuccessAnnouncement ? "polite" : undefined}
+            allowFontScaling
+            key={exposeSuccessAnnouncement ? `success-${activeSuccessAnnouncement?.id}` : undefined}
+          >
+            {state.success}
+          </Text>
+        ) : null}
+      </View>
+    );
+  } else if (state.tag === "list.ready.empty" || state.tag === "list.ready.rows") {
+    content = (
+      <View style={{ gap: spacing.md }}>
+        <TrackerDomainSwitcher onSelectDomain={(domain) => selectDomainFrom(state, domain)} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
+        {state.notice ? <Text accessibilityLiveRegion="assertive" accessibilityRole="alert" allowFontScaling>{state.notice}</Text> : null}
+        {state.success ? (
+          <Text
+            accessibilityLiveRegion={exposeSuccessAnnouncement ? "polite" : undefined}
+            allowFontScaling
+            key={exposeSuccessAnnouncement ? `success-${activeSuccessAnnouncement?.id}` : undefined}
+          >
+            {state.success}
+          </Text>
+        ) : null}
+        {renderList(state.fact, false, state)}
+      </View>
+    );
+  } else if (state.tag === "list.error") {
+    content = (
+      <View style={{ gap: spacing.md }}>
+        <TrackerDomainSwitcher onSelectDomain={(domain) => selectDomainFrom(state, domain)} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
+        {state.kind === "refresh" && state.fact.rows.length > 0
+          ? renderList(state.fact, false, state)
+          : <Text accessibilityRole="header" allowFontScaling ref={listHeadingRef}>{label}记录</Text>}
+        {state.kind === "refresh" ? (
+          <Text
+            accessibilityLiveRegion={exposeSuccessAnnouncement ? "polite" : undefined}
+            allowFontScaling
+            key={exposeSuccessAnnouncement ? `success-${activeSuccessAnnouncement?.id}` : undefined}
+          >
+            {state.success}
+          </Text>
+        ) : null}
+        <Text
+          accessibilityLiveRegion={state.kind === "initial" || exposeMutationIssue ? "assertive" : undefined}
+          accessibilityRole={state.kind === "initial" || exposeMutationIssue ? "alert" : undefined}
+          allowFontScaling
+          key={exposeMutationIssue ? `issue-${activeMutationIssue?.id}` : undefined}
+        >
+          {state.kind === "refresh" ? "记录可能不是最新内容。" : `暂时无法读取${label}记录。本机数据没有更改。`}
+        </Text>
+        <PrimaryAction label="重新读取记录" onPress={() => resumeList(state, state.fact)} />
+      </View>
+    );
+  } else if (state.tag === "edit.loading" || (state.tag === "read.suspended" && state.request.kind === "get")) {
+    content = (
+      <View style={{ gap: spacing.md }}>
+        <TrackerDomainSwitcher busy onSelectDomain={(domain) => selectDomainFrom(state, domain)} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
+        <Text accessibilityRole="header" allowFontScaling>编辑{label}记录</Text>
+        <SecondaryAction disabled label={`返回${label}列表`} onPress={returnToList} />
+        <Text accessibilityLiveRegion="polite" allowFontScaling>正在读取这条{label}记录…</Text>
+      </View>
+    );
+  } else if (state.tag === "edit.error") {
+    content = (
+      <View style={{ gap: spacing.md }}>
+        <TrackerDomainSwitcher disabled onSelectDomain={(domain) => selectDomainFrom(state, domain)} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
+        <Text ref={editorHeadingRef} accessibilityRole="header" allowFontScaling>编辑{label}记录</Text>
+        <Text accessibilityLiveRegion="assertive" accessibilityRole="alert" allowFontScaling>{state.message}</Text>
+        <PrimaryAction label="重新读取这条记录" onPress={retryGet} />
+        <SecondaryAction label={`返回${label}列表`} onPress={returnToList} />
+      </View>
+    );
+  } else if (state.tag === "conflict.stale" || state.tag === "conflict.notFound") {
+    content = (
+      <View style={{ gap: spacing.md }}>
+        <Text accessibilityRole="header" allowFontScaling ref={conflictHeadingRef}>记录冲突</Text>
+        <Text
+          accessibilityLiveRegion={exposeMutationIssue ? "assertive" : undefined}
+          accessibilityRole={exposeMutationIssue ? "alert" : undefined}
+          allowFontScaling
+          key={exposeMutationIssue ? `issue-${activeMutationIssue?.id}` : undefined}
+        >
+          {state.tag === "conflict.stale"
+            ? "这条记录已在其他位置更新。为避免覆盖，请重新读取后再修改。"
+            : "这条记录已不存在，不能继续保存或删除。"}
+        </Text>
+        {state.tag === "conflict.stale"
+          ? <PrimaryAction actionRef={conflictReloadActionRef} label="重新读取记录" onPress={() => recoverConflict("reload-record")} />
+          : null}
+        <SecondaryAction actionRef={conflictListActionRef} label="返回列表" onPress={() => recoverConflict("reload-list")} />
+      </View>
+    );
+  } else if (activeDecision !== null) {
+    content = (
+      <InlineTrackerConfirmation
+        acceptActionRef={decisionAcceptRef}
+        busy={state.tag === "mutation.submitting"}
+        cancelActionRef={decisionCancelRef}
+        decision={activeDecision}
+        headingRef={decisionHeadingRef}
+        onAccept={acceptDecision}
+        onCancel={cancelDecision}
+      />
+    );
+  } else if (editing !== null) {
+    const notice = (state.tag === "create.editing" || state.tag === "edit.editing") ? state.notice : undefined;
+    const editorContent = renderEditor(
+      editing,
+      state.tag === "mutation.submitting",
+      state.tag === "mutation.error"
+        ? Object.freeze({ ...editing.errors, [state.field ?? "form"]: state.message })
+        : editing.errors,
+    );
+    content = (
+      <View style={{ gap: spacing.md }}>
+        <TrackerDomainSwitcher busy={state.tag === "mutation.submitting"} onSelectDomain={(domain) => selectDomainFrom(state, domain)} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
+        {notice ? <Text accessibilityLiveRegion="polite" allowFontScaling>{notice}</Text> : null}
+        {state.tag === "mutation.error" ? (
+          <TrackerErrorAnnouncementScope
+            announcement={exposeMutationIssue && activeMutationIssue !== null
+              ? Object.freeze({ id: activeMutationIssue.id, message: activeMutationIssue.message })
+              : null}
+          >
+            {editorContent}
+          </TrackerErrorAnnouncementScope>
+        ) : editorContent}
+      </View>
+    );
+  } else {
+    const fact = stateListFact(state);
+    content = (
+      <View style={{ gap: spacing.md }}>
+        <TrackerDomainSwitcher busy onSelectDomain={(domain) => selectDomainFrom(state, domain)} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
+        {renderList(fact, true, state)}
+      </View>
+    );
+  }
+
+  return (
+    <AppFrame keyboardDismissMode="on-drag" localOnly title="记录">
+      {content}
+    </AppFrame>
+  );
+}

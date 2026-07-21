@@ -1,4 +1,5 @@
 import { RuntimeClosingError } from "../../src/application/bootstrap/appRuntime";
+import { ManualTrackerConflictError } from "../../src/application/tracker/manualTrackerService";
 import { cleanupFailure, isCleanupFailure } from "../../src/shared/errors/cleanupFailure";
 import { createProductionBootstrap } from "../../src/infrastructure/bootstrap/createProductionBootstrap";
 
@@ -75,6 +76,14 @@ test("production bootstrap exposes profile and tracker services only on its read
     description: null,
     sourceMessageId: null,
   })).resolves.toEqual(expect.objectContaining({ status: "confirmation_required" }));
+  const missingDelete = tracker.delete(
+    "feeding",
+    "missing-feeding",
+    "2026-07-20T01:00:00.000Z",
+    "confirmed",
+  );
+  await expect(missingDelete).rejects.toMatchObject({ code: "not_found" });
+  await expect(missingDelete).rejects.toBeInstanceOf(ManualTrackerConflictError);
   const first = runtime.close();
   const second = runtime.close();
   expect(first).toBe(second);

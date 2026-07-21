@@ -8,6 +8,7 @@ import { applyUserDatabaseMigrations } from "../db/migrations/index.ts";
 import { openConfiguredDatabase } from "../db/openDatabase.ts";
 import { StartupRecoveryRepository } from "../db/repositories/startupRecoveryRepository.ts";
 import { BabyProfileRepository } from "../db/repositories/babyProfileRepository.ts";
+import { RepositoryTrackerConflictClassifier } from "../db/repositories/trackerConflictClassifier.ts";
 import { TrackerRepository } from "../db/repositories/trackerRepository.ts";
 import { IntlDeviceCalendar } from "../time/deviceCalendar.ts";
 import { RejectPendingAlbumRecovery } from "./albumRecoveryBoundary.ts";
@@ -34,6 +35,7 @@ export function createProductionBootstrap(): ProductionBootstrap<ReadyAppService
   const recovery = new StartupRecoveryRepository();
   const profiles = new BabyProfileRepository();
   const trackers = new TrackerRepository();
+  const trackerConflicts = new RepositoryTrackerConflictClassifier();
   const calendar = new IntlDeviceCalendar();
   const clock = { now: () => new Date().toISOString() };
   const trackerIds = new ProcessLocalIdGenerator();
@@ -74,6 +76,7 @@ export function createProductionBootstrap(): ProductionBootstrap<ReadyAppService
                 coordinator,
                 trackers,
                 trackers,
+                trackerConflicts,
                 clock,
                 trackerIds,
                 operations,

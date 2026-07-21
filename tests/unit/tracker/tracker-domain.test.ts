@@ -6,6 +6,7 @@ import { DataMutationCoordinator } from "../../../src/application/data/DataMutat
 import type { QueryRunHandle } from "../../../src/application/data/ExclusiveTransactionPort.ts";
 import {
   ManualTrackerService,
+  type ManualTrackerConflictClassifierPort,
   type TrackerStore,
   type TrackerWriter,
 } from "../../../src/application/tracker/manualTrackerService.ts";
@@ -198,11 +199,13 @@ test("UT-TRACK-003 and manual UT-TRACK-006 policy validate first and perform no 
       return Object.freeze({ domain, id, updatedAt: now, deletedAt: now });
     },
   };
+  const conflicts: ManualTrackerConflictClassifierPort = { classify: () => null };
   const service = new ManualTrackerService(
     transactions,
     new DataMutationCoordinator(),
     store,
     writer,
+    conflicts,
     { now: () => { calls.clocks += 1; return "2026-07-20T02:00:00.000Z"; } },
     { nextId: () => { calls.ids += 1; return "generated-1"; } },
     new RuntimeOperationGate(),

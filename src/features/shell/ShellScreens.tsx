@@ -138,7 +138,6 @@ function DestinationScreen({ title, heading, description }: { title: string; hea
   return <AppFrame title={title}><EmptyState description={description} title={heading} /></AppFrame>;
 }
 
-export const RecordsScreen = () => <DestinationScreen description="本地记录功能将在后续版本启用。" heading="还没有照护记录" title="记录" />;
 export const GrowthScreen = () => <DestinationScreen description="有真实的本地记录后，成长信息才会显示在这里。" heading="还没有可展示的成长数据" title="成长" />;
 export const AlbumScreen = () => <DestinationScreen description="照片导入功能尚未启用，当前不会请求相册权限。" heading="还没有照片" title="相册" />;
 
