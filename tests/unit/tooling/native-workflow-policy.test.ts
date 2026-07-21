@@ -3542,13 +3542,19 @@ const exactProfileSaveVisibilitySequence = `- tapOn: "保存宝宝资料"
 - scrollUntilVisible:
     element:
       text: "G031LeapBaby"
-    direction: UP`;
+    direction: UP
+- assertVisible: "G031LeapBaby"
+- scrollUntilVisible:
+    element:
+      text: "\${AGE_DISPLAY}"
+    direction: UP
+- assertVisible: "\${AGE_DISPLAY}"`;
 
 function assertProfileSaveVisibilityPolicy(flow: string): void {
   assert.equal(
     flow.split(exactProfileSaveVisibilitySequence).length - 1,
     1,
-    "Profile save must scroll DOWN to the exact success message, assert it, then scroll UP to the saved name",
+    "Profile save must preserve the saved-name assertion and use the exact age oracle as its final upward scroll anchor",
   );
   assert.equal(
     (flow.match(/\^宝宝资料已保存\$/g) ?? []).length,
@@ -4015,6 +4021,10 @@ pid=$(pidof_app)
       text: "^宝宝资料已保存$"
     direction: DOWN`;
   const exactSuccessAssertion = '- assertVisible: "^宝宝资料已保存$"';
+  const exactAgeScroll = `- scrollUntilVisible:
+    element:
+      text: "\${AGE_DISPLAY}"
+    direction: UP`;
   const saveVisibilityMutations = [
     ["direct off-screen wait", saveFlow.replace(
       `${exactSuccessScroll}\n${exactSuccessAssertion}`,
@@ -4023,6 +4033,9 @@ pid=$(pidof_app)
     ["missing success scroll", saveFlow.replace(`${exactSuccessScroll}\n`, "")],
     ["ambiguous success message", saveFlow.replaceAll("^宝宝资料已保存$", "宝宝资料已保存")],
     ["wrong success scroll direction", saveFlow.replace(exactSuccessScroll, exactSuccessScroll.replace("direction: DOWN", "direction: UP"))],
+    ["missing age scroll", saveFlow.replace(`${exactAgeScroll}\n`, "")],
+    ["duplicate name as final scroll anchor", saveFlow.replace(exactAgeScroll, exactAgeScroll.replace("${AGE_DISPLAY}", "G031LeapBaby"))],
+    ["wrong age scroll direction", saveFlow.replace(exactAgeScroll, exactAgeScroll.replace("direction: UP", "direction: DOWN"))],
     ["optional success assertion", saveFlow.replace(exactSuccessAssertion, '- assertVisible:\n    text: "^宝宝资料已保存$"\n    optional: true')],
     ["coordinate fallback", saveFlow.replace('- tapOn: "保存宝宝资料"', '- tapOn: "保存宝宝资料"\n- tapOn:\n    point: "50%,90%"')],
     ["sleep fallback", saveFlow.replace('- tapOn: "保存宝宝资料"', '- tapOn: "保存宝宝资料"\n- evalScript: "sleep(1000)"')],
