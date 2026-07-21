@@ -1,4 +1,5 @@
-import { act, fireEvent, render, screen } from "@testing-library/react-native";
+import { readFileSync } from "node:fs";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import * as ts from "typescript";
 
@@ -8,16 +9,34 @@ import type {
   TrackerDeleteSummary,
   TrackerUpdateSummary,
 } from "../../../../src/application/tracker/manualTrackerService";
+import { ManualTrackerConflictError } from "../../../../src/application/tracker/manualTrackerService";
+import { RuntimeClosingError } from "../../../../src/application/bootstrap/appRuntime";
 import type {
   TrackerDomain,
   TrackerRecordByDomain,
   TrackerUpdateInputByDomain,
 } from "../../../../src/domain/tracker/types";
+import { TrackerValidationError } from "../../../../src/domain/tracker/validation";
+import { DiaperTrackerForm } from "../../../../src/features/tracker/forms/DiaperTrackerForm";
+import { FeedingTrackerForm } from "../../../../src/features/tracker/forms/FeedingTrackerForm";
+import { GrowthTrackerForm } from "../../../../src/features/tracker/forms/GrowthTrackerForm";
+import { SleepTrackerForm } from "../../../../src/features/tracker/forms/SleepTrackerForm";
 import { ManualTrackerScreen } from "../../../../src/features/tracker/ManualTrackerScreen";
 import { ManualTrackerServiceProvider } from "../../../../src/features/tracker/ManualTrackerServiceContext";
 import * as trackerLocalTime from "../../../../src/features/tracker/trackerLocalTime";
 import {
+  backDiscardDecision,
+  acceptedDiscardGetStartedAction,
+  acceptedDiscardListStartedAction,
+  conflictDiscardDecision,
+  createRequestedAction,
+  discardRequestedAction,
+  getStartedAction,
+  isGetDiscardDecisionForDestination,
+  isListDiscardDecisionForDestination,
+  listStartedAction,
   trackerScreenReducer,
+  type CreateEditorSnapshot,
   type EditEditorSnapshot,
   type ListFact,
   type OperationOwner,
@@ -28,12 +47,19 @@ import {
 const mockTrackerReducerObserver = jest.fn(
   (_action: TrackerScreenAction, _state: TrackerScreenState): void => undefined,
 );
+const mockTrackerReducerRejector = jest.fn(
+  (_action: TrackerScreenAction, _state: TrackerScreenState): boolean => false,
+);
 
 jest.mock("../../../../src/features/tracker/trackerScreenState", () => {
   const actual = jest.requireActual("../../../../src/features/tracker/trackerScreenState");
   return {
     ...actual,
     trackerScreenReducer: (state: TrackerScreenState, action: TrackerScreenAction) => {
+      if (mockTrackerReducerRejector(action, state)) {
+        mockTrackerReducerObserver(action, state);
+        return state;
+      }
       const next = actual.trackerScreenReducer(state, action) as TrackerScreenState;
       mockTrackerReducerObserver(action, next);
       return next;
@@ -202,6 +228,8 @@ function observedStatesAfter(
 
 beforeEach(() => {
   mockTrackerReducerObserver.mockClear();
+  mockTrackerReducerRejector.mockReset();
+  mockTrackerReducerRejector.mockReturnValue(false);
   jest.useFakeTimers();
   jest.setSystemTime(new Date("2026-07-20T00:10:00.000Z"));
   jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone });
@@ -210,6 +238,108 @@ beforeEach(() => {
 afterEach(() => {
   jest.useRealTimers();
   jest.restoreAllMocks();
+});
+
+test("rejected missing-record reload transition suppresses its fallback list", async () => {
+  const rows = Object.freeze([records.growth]);
+  const list = jest.fn(async () => rows);
+  const getById = jest.fn(async () => null);
+  const service = createServiceMock({ list: list as ManualTrackerServicePort["list"], getById: getById as ManualTrackerServicePort["getById"] });
+  renderTracker(service);
+  mockTrackerReducerRejector.mockImplementation((action) => action.type === "GET_MISSING_RELOAD_STARTED");
+  fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
+  await waitFor(() => expect(getById).toHaveBeenCalledTimes(1));
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(list).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("header", { name: "编辑生长记录" })).toBeTruthy();
+});
+
+test.each(["direct-create", "health-create", "update", "delete"] as const)("rejected %s start transition performs zero mutation service calls", async (path) => {
+  const create = jest.fn();
+  const update = jest.fn();
+  const remove = jest.fn();
+  const service = createServiceMock({
+    list: jest.fn(async (domain) => domain === "growth" ? [records.growth] : []) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+    create: create as ManualTrackerServicePort["create"],
+    update: update as ManualTrackerServicePort["update"],
+    delete: remove as ManualTrackerServicePort["delete"],
+  });
+  mockTrackerReducerRejector.mockImplementation((action) => action.type === "MUTATION_STARTED" && (
+    path === "direct-create" ? action.owner.domain === "growth" && action.owner.kind === "create"
+      : path === "health-create" ? action.owner.domain === "health" && action.owner.kind === "create" && action.phase === "probe"
+        : action.owner.kind === path && action.phase === "probe"
+  ));
+  if (path === "direct-create") {
+    renderTracker(service);
+    await screen.findByRole("button", { name: /生长记录，/ });
+    fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+    fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+    fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  } else if (path === "health-create") {
+    renderTracker(service);
+    await openHealthCreate();
+    fireEvent.press(screen.getByRole("button", { name: "保存健康记录" }));
+  } else {
+    await openEditor("growth", "生长", service);
+    if (path === "update") fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+    fireEvent.press(screen.getByRole("button", { name: path === "update" ? "保存修改" : "删除这条记录" }));
+  }
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(create).not.toHaveBeenCalled();
+  expect(update).not.toHaveBeenCalled();
+  expect(remove).not.toHaveBeenCalled();
+});
+
+test.each(["health-create", "update", "delete"] as const)("rejected confirmed %s transition performs zero confirmed mutation calls", async (path) => {
+  const healthInput = Object.freeze({ recordDate: "2026-07-20", recordType: "illness" as const, title: "轻微咳嗽", description: "居家观察", sourceMessageId: null });
+  const healthSummary: TrackerCreateSummary<"health"> = Object.freeze({ action: "create", domain: "health", input: healthInput });
+  const updateInput = Object.freeze({ ...expectedUpdateInputs.growth, weightG: 7300 });
+  const updateSummary: TrackerUpdateSummary<"growth"> = Object.freeze({ action: "update", domain: "growth", id: records.growth.id, expectedUpdatedAt: records.growth.updatedAt, input: updateInput });
+  const deleteSummary: TrackerDeleteSummary<"growth"> = Object.freeze({ action: "delete", domain: "growth", id: records.growth.id, expectedUpdatedAt: records.growth.updatedAt });
+  const create = jest.fn(async () => Object.freeze({ status: "confirmation_required" as const, summary: healthSummary }));
+  const update = jest.fn(async () => Object.freeze({ status: "confirmation_required" as const, summary: updateSummary }));
+  const remove = jest.fn(async () => Object.freeze({ status: "confirmation_required" as const, summary: deleteSummary }));
+  const service = createServiceMock({
+    list: jest.fn(async (domain) => domain === "growth" ? [records.growth] : []) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+    create: create as ManualTrackerServicePort["create"], update: update as ManualTrackerServicePort["update"], delete: remove as ManualTrackerServicePort["delete"],
+  });
+  if (path === "health-create") {
+    renderTracker(service);
+    await openHealthCreate();
+    fireEvent.press(screen.getByRole("button", { name: "保存健康记录" }));
+    await screen.findByRole("button", { name: "确认保存" });
+  } else {
+    await openEditor("growth", "生长", service);
+    if (path === "update") fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+    fireEvent.press(screen.getByRole("button", { name: path === "update" ? "保存修改" : "删除这条记录" }));
+    await screen.findByRole("button", { name: path === "update" ? "确认保存" : "确认删除" });
+  }
+  mockTrackerReducerRejector.mockImplementation((action) => action.type === "MUTATION_STARTED" && action.phase === "confirmed");
+  fireEvent.press(screen.getByRole("button", { name: path === "delete" ? "确认删除" : "确认保存" }));
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(create).toHaveBeenCalledTimes(path === "health-create" ? 1 : 0);
+  expect(update).toHaveBeenCalledTimes(path === "update" ? 1 : 0);
+  expect(remove).toHaveBeenCalledTimes(path === "delete" ? 1 : 0);
+});
+
+test.each(["MUTATION_COMPLETED", "OPERATION_REFRESH_STARTED"] as const)("rejected %s transition suppresses completion refresh list", async (rejectedType) => {
+  const completed = Object.freeze({ ...records.growth, id: "created-growth", updatedAt: "2026-07-20T00:03:00.000Z", weightG: 7300 });
+  const input = Object.freeze({ measurementDate: "2026-07-20", weightG: 7300, heightCm: null, headCm: null, weightPercentile: null, heightPercentile: null, headPercentile: null, notes: null, sourceMessageId: null });
+  const summary: TrackerCreateSummary<"growth"> = Object.freeze({ action: "create", domain: "growth", input });
+  const create = jest.fn(async () => Object.freeze({ status: "completed" as const, summary, record: completed }));
+  const list = jest.fn(async () => Object.freeze([]));
+  const service = createServiceMock({ list: list as ManualTrackerServicePort["list"], create: create as ManualTrackerServicePort["create"] });
+  renderTracker(service);
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  mockTrackerReducerRejector.mockImplementation((action) => action.type === rejectedType);
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(list).toHaveBeenCalledTimes(1);
 });
 
 test("health create cancel performs zero confirmed calls and restores the exact frozen draft", async () => {
@@ -235,7 +365,7 @@ test("health create cancel performs zero confirmed calls and restores the exact 
   expect(screen.getByLabelText("标题").props.value).toBe("  轻微咳嗽  ");
   expect(screen.getByLabelText("说明").props.value).toBe("居家观察");
   expect(create).toHaveBeenCalledTimes(1);
-  expect(create).toHaveBeenCalledWith("health", expect.any(Object));
+  expect(create).toHaveBeenCalledWith("health", normalizedInput);
 });
 
 test("health create accept reuses the exact returned summary input", async () => {
@@ -579,9 +709,13 @@ test("delete cancel cannot leak its summary into a distinct record and failed re
     if (completed && domain === "health") throw new Error("refresh unavailable");
     return domain === "health" ? [records.health, second] : [];
   });
+  const create = jest.fn();
+  const update = jest.fn();
   const service = createServiceMock({
     list: list as ManualTrackerServicePort["list"],
     getById: jest.fn(async (_domain, id) => id === second.id ? second : records.health) as ManualTrackerServicePort["getById"],
+    create: create as ManualTrackerServicePort["create"],
+    update: update as ManualTrackerServicePort["update"],
     delete: remove as ManualTrackerServicePort["delete"],
   });
   renderTracker(service);
@@ -610,6 +744,14 @@ test("delete cancel cannot leak its summary into a distinct record and failed re
   expect(retainedRows).toHaveLength(1);
   expect(retainedRows[0]!.props.accessibilityLabel).toContain(records.health.title);
   expect(retainedRows[0]!.props.accessibilityLabel).not.toContain(second.title);
+  const mutationCounts = Object.freeze({ create: create.mock.calls.length, update: update.mock.calls.length, delete: remove.mock.calls.length });
+  const listCount = list.mock.calls.length;
+  fireEvent.press(screen.getByRole("button", { name: "重新读取记录" }));
+  await waitFor(() => expect(list).toHaveBeenCalledTimes(listCount + 1));
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(create).toHaveBeenCalledTimes(mutationCounts.create);
+  expect(update).toHaveBeenCalledTimes(mutationCounts.update);
+  expect(remove).toHaveBeenCalledTimes(mutationCounts.delete);
 });
 
 test("completed delete preserves the exact returned deletion fact without enumerating or cloning it", async () => {
@@ -737,6 +879,7 @@ test("the reducer restores the exact editor and rejects confirmed-from-editor an
     type: "CONFIRMATION_REQUIRED",
     owner,
     next: Object.freeze({ tag: "confirm.update", owner, decision }),
+    summary: decision.serviceSummary,
   });
   const restored = trackerScreenReducer(confirmation, { type: "CONFIRMATION_CANCELLED", decision });
   expect(restored).toEqual({ tag: "edit.editing", editor });
@@ -786,6 +929,247 @@ test("the reducer restores the exact editor and rejects confirmed-from-editor an
   expect(failedRefresh.fact).toBe(prior);
   expect(failedRefresh.fact.rows).toBe(prior.rows);
   expect(failedRefresh.completion).toBe(completion);
+});
+
+test("protected states reject stale or unauthorized read/create starts while exact conflict and discard identities authorize only their destination", () => {
+  const prior: ListFact<"health"> = Object.freeze({ domain: "health", rows: Object.freeze([records.health]), presentationZone: zone });
+  const draft = Object.freeze({
+    domain: "health" as const, timeZone: zone, dateText: records.health.recordDate,
+    recordType: records.health.recordType, title: "复查", description: records.health.description ?? "",
+  });
+  const editor: EditEditorSnapshot<"health"> = Object.freeze({
+    mode: "edit", domain: "health", draft, initialDraft: Object.freeze({ ...draft, title: records.health.title }),
+    baseline: records.health, capturedZone: zone, errors: Object.freeze({}), prior,
+  });
+  const editing: TrackerScreenState = Object.freeze({ tag: "edit.editing", editor });
+  const updateOwner: OperationOwner<"health", "update"> = Object.freeze({ mountEpoch: 1, operationId: 10, domain: "health", kind: "update" });
+  const probing = trackerScreenReducer(editing, { type: "MUTATION_STARTED", owner: updateOwner, prior: editor, phase: "probe" });
+  if (probing.tag !== "mutation.submitting") throw new Error("expected probe");
+  const conflict = trackerScreenReducer(probing, { type: "MUTATION_CONFLICT", source: probing, conflictCode: "stale_write" });
+  const listOwner = Object.freeze({ mountEpoch: 1, generation: 11, domain: "health" as const, focusSession: 1, kind: "list" as const, recordId: undefined });
+  const listNext = Object.freeze({ tag: "list.loading" as const, source: "ordinary" as const, owner: listOwner, prior });
+  const getOwner = Object.freeze({ mountEpoch: 1, generation: 12, domain: "health" as const, focusSession: 1, kind: "get" as const, recordId: records.health.id });
+  const getNext = Object.freeze({ tag: "edit.loading" as const, owner: getOwner, id: records.health.id, capturedZone: zone, prior });
+
+  expect(trackerScreenReducer(conflict, listStartedAction(editing, listNext))).toBe(conflict);
+  expect(trackerScreenReducer(conflict, getStartedAction(editing, getNext))).toBe(conflict);
+  expect(trackerScreenReducer(conflict, createRequestedAction(editing, Object.freeze({
+    mode: "create", domain: "health", draft, initialDraft: draft, baseline: null,
+    capturedZone: zone, errors: Object.freeze({}), prior,
+  })))).toBe(conflict);
+  expect(trackerScreenReducer(conflict, listStartedAction(conflict, listNext))).toBe(conflict);
+  expect(trackerScreenReducer(conflict, getStartedAction(conflict, getNext))).toBe(conflict);
+  expect(trackerScreenReducer(conflict, { type: "RETURN_TO_LIST" })).toBe(conflict);
+
+  const cleanEditor = Object.freeze({ ...editor, draft: editor.initialDraft });
+  const cleanProbe = Object.freeze({ tag: "mutation.submitting" as const, owner: updateOwner, prior: cleanEditor, phase: "probe" as const, decision: undefined });
+  const cleanConflict: TrackerScreenState = Object.freeze({ tag: "conflict.stale", source: cleanProbe });
+  expect(trackerScreenReducer(cleanConflict, getStartedAction(cleanConflict, getNext))).toBe(getNext);
+
+  const feedingPrior: ListFact<"feeding"> = Object.freeze({ domain: "feeding", rows: Object.freeze([]), presentationZone: zone });
+  const feedingOwner = Object.freeze({ ...listOwner, generation: 13, domain: "feeding" as const });
+  const feedingNext = Object.freeze({ ...listNext, owner: feedingOwner, prior: feedingPrior });
+  expect(trackerScreenReducer(editing, listStartedAction(editing, feedingNext))).toBe(editing);
+  expect(trackerScreenReducer(editing, { type: "RETURN_TO_LIST" })).toBe(editing);
+
+  const decision = backDiscardDecision(editing, Object.freeze({ current: null }));
+  if (decision === null) throw new Error("expected discard decision");
+  const cleanEditing: TrackerScreenState = Object.freeze({ tag: "edit.editing", editor: cleanEditor });
+  const cleanDecision = backDiscardDecision(cleanEditing, Object.freeze({ current: null }));
+  if (cleanDecision === null) throw new Error("expected clean discard decision");
+  expect(trackerScreenReducer(cleanEditing, discardRequestedAction(cleanDecision))).toBe(cleanEditing);
+  const discard = trackerScreenReducer(editing, discardRequestedAction(decision));
+  if (discard.tag !== "confirm.discard") throw new Error("expected discard confirmation");
+  const copied = Object.freeze({ ...decision });
+  expect(trackerScreenReducer(discard, listStartedAction(discard, listNext))).toBe(discard);
+  expect(trackerScreenReducer(discard, getStartedAction(discard, getNext))).toBe(discard);
+  expect(trackerScreenReducer(discard, { type: "LIST_STARTED", source: discard, next: listNext, decision: copied } as unknown as TrackerScreenAction)).toBe(discard);
+  const acceptedBack = isListDiscardDecisionForDestination(decision, prior)
+    ? acceptedDiscardListStartedAction(discard, listNext, decision)
+    : null;
+  expect(acceptedBack).toBeNull();
+  expect(trackerScreenReducer(discard, createRequestedAction(discard, Object.freeze({
+    mode: "create", domain: "health", draft, initialDraft: draft, baseline: null,
+    capturedZone: zone, errors: Object.freeze({}), prior,
+  })))).toBe(discard);
+});
+
+test("accepted discard read helpers reject stale destination-equivalent decisions and preserve the exact current decision", () => {
+  const prior: ListFact<"health"> = Object.freeze({ domain: "health", rows: Object.freeze([records.health]), presentationZone: zone });
+  const draft = Object.freeze({
+    domain: "health" as const, timeZone: zone, dateText: records.health.recordDate,
+    recordType: records.health.recordType, title: "复查", description: records.health.description ?? "",
+  });
+  const editor: EditEditorSnapshot<"health"> = Object.freeze({
+    mode: "edit", domain: "health", draft, initialDraft: Object.freeze({ ...draft, title: records.health.title }),
+    baseline: records.health, capturedZone: zone, errors: Object.freeze({}), prior,
+  });
+  const owner: OperationOwner<"health", "update"> = Object.freeze({ mountEpoch: 1, operationId: 40, domain: "health", kind: "update" });
+  const submitting = Object.freeze({ tag: "mutation.submitting" as const, owner, prior: editor, phase: "probe" as const, decision: undefined });
+  const conflict: TrackerScreenState = Object.freeze({ tag: "conflict.stale", source: submitting });
+  const oldRef = Object.freeze({ current: null });
+  const currentRef = Object.freeze({ current: null });
+
+  const listOld = conflictDiscardDecision(conflict, "reload-list", oldRef);
+  const listCurrent = conflictDiscardDecision(conflict, "reload-list", currentRef);
+  if (listOld === null || listCurrent === null) throw new Error("expected list discard decisions");
+  expect(listOld).not.toBe(listCurrent);
+  expect(listOld.destination).not.toBe(listCurrent.destination);
+  if (!("kind" in listOld.destination) || !("kind" in listCurrent.destination)) throw new Error("expected list destinations");
+  expect(listOld.destination.kind).toBe("reload-list");
+  expect(listCurrent.destination.kind).toBe("reload-list");
+  if (listOld.destination.kind !== "reload-list" || listCurrent.destination.kind !== "reload-list") throw new Error("expected reload-list destinations");
+  expect(listOld.destination.fact).toBe(listCurrent.destination.fact);
+  const listConfirmation = trackerScreenReducer(conflict, discardRequestedAction(listCurrent));
+  if (listConfirmation.tag !== "confirm.discard") throw new Error("expected current list confirmation");
+  const listOwner = Object.freeze({ mountEpoch: 1, generation: 41, domain: "health" as const, focusSession: 1, kind: "list" as const, recordId: undefined });
+  const listNext = Object.freeze({ tag: "list.loading" as const, source: "ordinary" as const, owner: listOwner, prior });
+  if (!isListDiscardDecisionForDestination(listOld, prior) || !isListDiscardDecisionForDestination(listCurrent, prior)) {
+    throw new Error("expected correlated list decisions");
+  }
+  expect(acceptedDiscardListStartedAction(listConfirmation, listNext, listOld)).toBeNull();
+  const acceptedList = acceptedDiscardListStartedAction(listConfirmation, listNext, listCurrent);
+  expect(acceptedList).not.toBeNull();
+  expect(acceptedList?.type === "LIST_STARTED" ? acceptedList.decision : null).toBe(listCurrent);
+  expect(acceptedList === null ? listConfirmation : trackerScreenReducer(listConfirmation, acceptedList)).toBe(listNext);
+
+  const getOld = conflictDiscardDecision(conflict, "reload-record", oldRef);
+  const getCurrent = conflictDiscardDecision(conflict, "reload-record", currentRef);
+  if (getOld === null || getCurrent === null) throw new Error("expected get discard decisions");
+  expect(getOld).not.toBe(getCurrent);
+  if (!("kind" in getOld.destination) || !("kind" in getCurrent.destination)) throw new Error("expected get destinations");
+  if (getOld.destination.kind !== "reload-record" || getCurrent.destination.kind !== "reload-record") throw new Error("expected reload-record destinations");
+  expect(getOld.destination.domain).toBe(getCurrent.destination.domain);
+  expect(getOld.destination.id).toBe(getCurrent.destination.id);
+  expect(getOld.destination.prior).toBe(getCurrent.destination.prior);
+  const getConfirmation = trackerScreenReducer(conflict, discardRequestedAction(getCurrent));
+  if (getConfirmation.tag !== "confirm.discard") throw new Error("expected current get confirmation");
+  const getOwner = Object.freeze({ mountEpoch: 1, generation: 42, domain: "health" as const, focusSession: 1, kind: "get" as const, recordId: records.health.id });
+  const getNext = Object.freeze({ tag: "edit.loading" as const, owner: getOwner, id: records.health.id, capturedZone: zone, prior });
+  if (
+    !isGetDiscardDecisionForDestination(getOld, "health", records.health.id, prior)
+    || !isGetDiscardDecisionForDestination(getCurrent, "health", records.health.id, prior)
+  ) throw new Error("expected correlated get decisions");
+  expect(acceptedDiscardGetStartedAction(getConfirmation, getNext, getOld)).toBeNull();
+  const acceptedGet = acceptedDiscardGetStartedAction(getConfirmation, getNext, getCurrent);
+  expect(acceptedGet).not.toBeNull();
+  expect(acceptedGet?.type === "GET_STARTED" ? acceptedGet.decision : null).toBe(getCurrent);
+  expect(acceptedGet === null ? getConfirmation : trackerScreenReducer(getConfirmation, acceptedGet)).toBe(getNext);
+});
+
+test("mutation-error retry requires a fresh same-kind owner and the exact direct/probe protocol", () => {
+  const prior: ListFact<"growth"> = Object.freeze({ domain: "growth", rows: Object.freeze([records.growth]), presentationZone: zone });
+  const draft = Object.freeze({ domain: "growth" as const, timeZone: zone, dateText: records.growth.measurementDate, weightG: "7300", heightCm: "68.5", headCm: "", notes: records.growth.notes ?? "" });
+  const editor: EditEditorSnapshot<"growth"> = Object.freeze({
+    mode: "edit", domain: "growth", draft, initialDraft: Object.freeze({ ...draft, weightG: "7200" }), baseline: records.growth,
+    capturedZone: zone, errors: Object.freeze({}), prior,
+  });
+  const editing: TrackerScreenState = Object.freeze({ tag: "edit.editing", editor });
+  const owner: OperationOwner<"growth", "update"> = Object.freeze({ mountEpoch: 1, operationId: 20, domain: "growth", kind: "update" });
+  const probing = trackerScreenReducer(editing, { type: "MUTATION_STARTED", owner, prior: editor, phase: "probe" });
+  const failed = trackerScreenReducer(probing, { type: "MUTATION_REJECTED", owner, message: "保存失败" });
+  expect(failed.tag).toBe("mutation.error");
+  expect(trackerScreenReducer(failed, { type: "MUTATION_STARTED", owner, prior: editor, phase: "probe" })).toBe(failed);
+
+  const older: OperationOwner<"growth", "update"> = Object.freeze({ ...owner, operationId: 19 });
+  expect(trackerScreenReducer(failed, { type: "MUTATION_STARTED", owner: older, prior: editor, phase: "probe" })).toBe(failed);
+  const crossMount: OperationOwner<"growth", "update"> = Object.freeze({ ...owner, mountEpoch: 2, operationId: 21 });
+  expect(trackerScreenReducer(failed, { type: "MUTATION_STARTED", owner: crossMount, prior: editor, phase: "probe" })).toBe(failed);
+
+  const wrongKind: OperationOwner<"growth", "delete"> = Object.freeze({ ...owner, operationId: 21, kind: "delete" });
+  expect(trackerScreenReducer(failed, { type: "MUTATION_STARTED", owner: wrongKind, prior: editor, phase: "probe" })).toBe(failed);
+  const fresh: OperationOwner<"growth", "update"> = Object.freeze({ ...owner, operationId: 22 });
+  const retried = trackerScreenReducer(failed, { type: "MUTATION_STARTED", owner: fresh, prior: editor, phase: "probe" });
+  expect(retried).toEqual({ tag: "mutation.submitting", owner: fresh, prior: editor, phase: "probe", decision: undefined });
+
+  const malformedDirect = { type: "MUTATION_STARTED", owner: fresh, prior: editor, phase: "direct" } as unknown as TrackerScreenAction;
+  expect(trackerScreenReducer(failed, malformedDirect)).toBe(failed);
+});
+
+test("retry freshness and exact-prior guards cover direct create, health create, and delete probes", () => {
+  const growthPrior: ListFact<"growth"> = Object.freeze({ domain: "growth", rows: Object.freeze([records.growth]), presentationZone: zone });
+  const growthDraft = Object.freeze({
+    domain: "growth" as const, timeZone: zone, dateText: records.growth.measurementDate,
+    weightG: "7300", heightCm: "68.5", headCm: "", notes: records.growth.notes ?? "",
+  });
+  const growthCreate: CreateEditorSnapshot<"growth"> = Object.freeze({
+    mode: "create", domain: "growth", draft: growthDraft, initialDraft: growthDraft,
+    baseline: null, capturedZone: zone, errors: Object.freeze({}), prior: growthPrior,
+  });
+  const growthOwner: OperationOwner<"growth", "create"> = Object.freeze({ mountEpoch: 3, operationId: 10, domain: "growth", kind: "create" });
+  const growthSubmitting = trackerScreenReducer(Object.freeze({ tag: "create.editing", editor: growthCreate }), {
+    type: "MUTATION_STARTED", owner: growthOwner, prior: growthCreate,
+  });
+  const growthFailed = trackerScreenReducer(growthSubmitting, { type: "MUTATION_REJECTED", owner: growthOwner, message: "保存失败" });
+  if (growthFailed.tag !== "mutation.error") throw new Error("expected direct-create failure");
+  const copiedGrowthCreate = Object.freeze({ ...growthCreate });
+  expect(trackerScreenReducer(growthFailed, { type: "MUTATION_STARTED", owner: growthOwner, prior: growthCreate })).toBe(growthFailed);
+  expect(trackerScreenReducer(growthFailed, { type: "MUTATION_STARTED", owner: Object.freeze({ ...growthOwner, operationId: 9 }), prior: growthCreate })).toBe(growthFailed);
+  expect(trackerScreenReducer(growthFailed, { type: "MUTATION_STARTED", owner: Object.freeze({ ...growthOwner, mountEpoch: 4, operationId: 11 }), prior: growthCreate })).toBe(growthFailed);
+  expect(trackerScreenReducer(growthFailed, { type: "MUTATION_STARTED", owner: Object.freeze({ ...growthOwner, operationId: 11 }), prior: copiedGrowthCreate })).toBe(growthFailed);
+  const growthFresh = Object.freeze({ ...growthOwner, operationId: 11 });
+  expect(trackerScreenReducer(growthFailed, { type: "MUTATION_STARTED", owner: growthFresh, prior: growthCreate })).toEqual({
+    tag: "mutation.submitting", owner: growthFresh, prior: growthCreate, phase: "direct", decision: undefined,
+  });
+
+  const healthPrior: ListFact<"health"> = Object.freeze({ domain: "health", rows: Object.freeze([]), presentationZone: zone });
+  const healthDraft = Object.freeze({ domain: "health" as const, timeZone: zone, dateText: records.health.recordDate, recordType: "illness" as const, title: "轻微咳嗽", description: "居家观察" });
+  const healthCreate: CreateEditorSnapshot<"health"> = Object.freeze({ mode: "create", domain: "health", draft: healthDraft, initialDraft: healthDraft, baseline: null, capturedZone: zone, errors: Object.freeze({}), prior: healthPrior });
+  const healthOwner: OperationOwner<"health", "create"> = Object.freeze({ mountEpoch: 5, operationId: 20, domain: "health", kind: "create" });
+  const healthSubmitting = trackerScreenReducer(Object.freeze({ tag: "create.editing", editor: healthCreate }), { type: "MUTATION_STARTED", owner: healthOwner, prior: healthCreate, phase: "probe" });
+  const healthFailed = trackerScreenReducer(healthSubmitting, { type: "MUTATION_REJECTED", owner: healthOwner, message: "保存失败" });
+  if (healthFailed.tag !== "mutation.error") throw new Error("expected health-create failure");
+  const copiedHealthCreate = Object.freeze({ ...healthCreate });
+  expect(trackerScreenReducer(healthFailed, { type: "MUTATION_STARTED", owner: healthOwner, prior: healthCreate, phase: "probe" })).toBe(healthFailed);
+  expect(trackerScreenReducer(healthFailed, { type: "MUTATION_STARTED", owner: Object.freeze({ ...healthOwner, operationId: 19 }), prior: healthCreate, phase: "probe" })).toBe(healthFailed);
+  expect(trackerScreenReducer(healthFailed, { type: "MUTATION_STARTED", owner: Object.freeze({ ...healthOwner, mountEpoch: 6, operationId: 21 }), prior: healthCreate, phase: "probe" })).toBe(healthFailed);
+  expect(trackerScreenReducer(healthFailed, { type: "MUTATION_STARTED", owner: Object.freeze({ ...healthOwner, operationId: 21 }), prior: copiedHealthCreate, phase: "probe" })).toBe(healthFailed);
+  const healthFresh = Object.freeze({ ...healthOwner, operationId: 21 });
+  expect(trackerScreenReducer(healthFailed, { type: "MUTATION_STARTED", owner: healthFresh, prior: healthCreate, phase: "probe" })).toEqual({
+    tag: "mutation.submitting", owner: healthFresh, prior: healthCreate, phase: "probe", decision: undefined,
+  });
+
+  const editDraft = Object.freeze({ ...growthDraft, weightG: "7400" });
+  const edit: EditEditorSnapshot<"growth"> = Object.freeze({ mode: "edit", domain: "growth", draft: editDraft, initialDraft: growthDraft, baseline: records.growth, capturedZone: zone, errors: Object.freeze({}), prior: growthPrior });
+  const deleteOwner: OperationOwner<"growth", "delete"> = Object.freeze({ mountEpoch: 7, operationId: 30, domain: "growth", kind: "delete" });
+  const deleteSubmitting = trackerScreenReducer(Object.freeze({ tag: "edit.editing", editor: edit }), { type: "MUTATION_STARTED", owner: deleteOwner, prior: edit, phase: "probe" });
+  const deleteFailed = trackerScreenReducer(deleteSubmitting, { type: "MUTATION_REJECTED", owner: deleteOwner, message: "删除失败" });
+  if (deleteFailed.tag !== "mutation.error") throw new Error("expected delete failure");
+  const copiedEdit = Object.freeze({ ...edit });
+  const wrongDecision = backDiscardDecision(Object.freeze({ tag: "edit.editing", editor: edit }), Object.freeze({ current: null }));
+  expect(trackerScreenReducer(deleteFailed, { type: "MUTATION_STARTED", owner: deleteOwner, prior: edit, phase: "probe" })).toBe(deleteFailed);
+  expect(trackerScreenReducer(deleteFailed, { type: "MUTATION_STARTED", owner: Object.freeze({ ...deleteOwner, operationId: 29 }), prior: edit, phase: "probe" })).toBe(deleteFailed);
+  expect(trackerScreenReducer(deleteFailed, { type: "MUTATION_STARTED", owner: Object.freeze({ ...deleteOwner, mountEpoch: 8, operationId: 31 }), prior: edit, phase: "probe" })).toBe(deleteFailed);
+  expect(trackerScreenReducer(deleteFailed, { type: "MUTATION_STARTED", owner: Object.freeze({ ...deleteOwner, operationId: 31 }), prior: copiedEdit, phase: "probe" })).toBe(deleteFailed);
+  expect(trackerScreenReducer(deleteFailed, {
+    type: "MUTATION_STARTED", owner: Object.freeze({ ...deleteOwner, operationId: 31 }), prior: edit, phase: "confirmed", decision: wrongDecision,
+  } as unknown as TrackerScreenAction)).toBe(deleteFailed);
+  const deleteFresh = Object.freeze({ ...deleteOwner, operationId: 31 });
+  expect(trackerScreenReducer(deleteFailed, { type: "MUTATION_STARTED", owner: deleteFresh, prior: edit, phase: "probe" })).toEqual({
+    tag: "mutation.submitting", owner: deleteFresh, prior: edit, phase: "probe", decision: undefined,
+  });
+});
+
+test("confirmation boundary rejects copied baseline and mismatched kind, id, token, or owner", () => {
+  const prior: ListFact<"growth"> = Object.freeze({ domain: "growth", rows: Object.freeze([records.growth]), presentationZone: zone });
+  const draft = Object.freeze({ domain: "growth" as const, timeZone: zone, dateText: records.growth.measurementDate, weightG: "7300", heightCm: "68.5", headCm: "", notes: records.growth.notes ?? "" });
+  const editor: EditEditorSnapshot<"growth"> = Object.freeze({ mode: "edit", domain: "growth", draft, initialDraft: Object.freeze({ ...draft, weightG: "7200" }), baseline: records.growth, capturedZone: zone, errors: Object.freeze({}), prior });
+  const owner: OperationOwner<"growth", "update"> = Object.freeze({ mountEpoch: 1, operationId: 30, domain: "growth", kind: "update" });
+  const probing = trackerScreenReducer(Object.freeze({ tag: "edit.editing", editor }), { type: "MUTATION_STARTED", owner, prior: editor, phase: "probe" });
+  const summary: TrackerUpdateSummary<"growth"> = Object.freeze({ action: "update", domain: "growth", id: records.growth.id, expectedUpdatedAt: records.growth.updatedAt, input: expectedUpdateInputs.growth });
+  const baseDecision = Object.freeze({ kind: "update" as const, domain: "growth" as const, prior: editor, baseline: records.growth, initiatingControlRef: Object.freeze({ current: null }), serviceSummary: summary, presentationTimeZone: zone });
+  const malformed = [
+    Object.freeze({ ...baseDecision, baseline: Object.freeze({ ...records.growth }) }),
+    Object.freeze({ ...baseDecision, serviceSummary: Object.freeze({ ...summary, id: "copied-id" }) }),
+    Object.freeze({ ...baseDecision, serviceSummary: Object.freeze({ ...summary, expectedUpdatedAt: "copied-token" }) }),
+  ];
+  for (const decision of malformed) {
+    expect(trackerScreenReducer(probing, { type: "CONFIRMATION_REQUIRED", owner, next: Object.freeze({ tag: "confirm.update", owner, decision }), summary } as TrackerScreenAction)).toBe(probing);
+  }
+  const deleteOwner: OperationOwner<"growth", "delete"> = Object.freeze({ ...owner, kind: "delete" });
+  expect(trackerScreenReducer(probing, { type: "CONFIRMATION_REQUIRED", owner: deleteOwner, next: Object.freeze({ tag: "confirm.update", owner: deleteOwner, decision: baseDecision }), summary } as unknown as TrackerScreenAction)).toBe(probing);
+  expect(trackerScreenReducer(probing, { type: "CONFIRMATION_REQUIRED", owner, next: Object.freeze({ tag: "confirm.delete", owner, decision: baseDecision }), summary } as unknown as TrackerScreenAction)).toBe(probing);
+  expect(trackerScreenReducer(probing, { type: "CONFIRMATION_REQUIRED", owner, next: Object.freeze({ tag: "confirm.update", owner, decision: baseDecision }), summary })).not.toBe(probing);
 });
 
 test.each(editCases)("$domain normalized no-op retains the exact baseline, revision, and prior fact", ({ domain }) => {
@@ -859,6 +1243,7 @@ test("delete refresh failure retains remaining row identity and order", () => {
   const confirmation = trackerScreenReducer(probing, {
     type: "CONFIRMATION_REQUIRED", owner,
     next: Object.freeze({ tag: "confirm.delete", owner, decision }),
+    summary: decision.serviceSummary,
   });
   const confirmed = trackerScreenReducer(confirmation, {
     type: "MUTATION_STARTED", owner, prior: editor, phase: "confirmed", decision,
@@ -892,9 +1277,12 @@ test("tracker screen state types reject cross-domain decisions and impossible mu
     import { createTrackerDecisionSnapshot, type TrackerUpdateDecision } from "./src/features/tracker/InlineTrackerConfirmation";
     import type { TrackerDomain } from "./src/domain/tracker/types";
     import {
-      mutationCompletedAction, updateConfirmationRequiredAction, updateProbeStartedAction,
-      type CreateEditorSnapshot, type DomainAction, type DomainState,
-      type EditEditorSnapshot, type MutationCompletion, type OperationOwner,
+      acceptedDiscardGetStartedAction, acceptedDiscardListStartedAction, getStartedAction, getSucceededAction,
+      listStartedAction, listSucceededAction, mutationCompletedAction,
+      operationRefreshSucceededAction, updateConfirmationRequiredAction, updateProbeStartedAction,
+      type CreateEditorSnapshot, type DiscardPriorByDomain, type DomainAction, type DomainState,
+      type EditEditorSnapshot, type ListFact, type MutationCompletion, type OperationOwner,
+      type ReadOwner, type ScreenDiscardDecision, type TrackerScreenAction, type TrackerScreenState,
     } from "./src/features/tracker/trackerScreenState";
     declare const growthCreate: CreateEditorSnapshot<"growth">;
     declare const growthEdit: EditEditorSnapshot<"growth">;
@@ -907,6 +1295,26 @@ test("tracker screen state types reject cross-domain decisions and impossible mu
     declare const widenedDomainUpdateOwner: OperationOwner<TrackerDomain, "update">;
     declare const widenedKindGrowthOwner: OperationOwner<"growth", "create" | "update">;
     declare const growthUpdateCompletion: MutationCompletion<"growth", "update">;
+    declare const growthListOwner: ReadOwner<"growth", "list">;
+    declare const growthGetOwner: ReadOwner<"growth", "get">;
+    declare const growthFact: ListFact<"growth">;
+    declare const feedingFact: ListFact<"feeding">;
+    declare const growthPrior: DiscardPriorByDomain["growth"];
+    declare const feedingPrior: DiscardPriorByDomain["feeding"];
+    declare const growthDomainDecision: import("./src/features/tracker/InlineTrackerConfirmation").TrackerDiscardDecision<"growth", DiscardPriorByDomain["growth"], { readonly kind: "domain"; readonly fact: ListFact<"feeding"> }>;
+    declare const growthReloadListDecision: import("./src/features/tracker/InlineTrackerConfirmation").TrackerDiscardDecision<"growth", DiscardPriorByDomain["growth"], { readonly kind: "reload-list"; readonly fact: ListFact<"growth"> }>;
+    declare const growthReloadRecordDecision: import("./src/features/tracker/InlineTrackerConfirmation").TrackerDiscardDecision<"growth", DiscardPriorByDomain["growth"], { readonly kind: "reload-record"; readonly domain: "growth"; readonly id: string; readonly prior: ListFact<"growth"> }>;
+    declare const feedingReloadListDecision: import("./src/features/tracker/InlineTrackerConfirmation").TrackerDiscardDecision<"feeding", DiscardPriorByDomain["feeding"], { readonly kind: "reload-list"; readonly fact: ListFact<"feeding"> }>;
+    declare const feedingReloadRecordDecision: import("./src/features/tracker/InlineTrackerConfirmation").TrackerDiscardDecision<"feeding", DiscardPriorByDomain["feeding"], { readonly kind: "reload-record"; readonly domain: "feeding"; readonly id: string; readonly prior: ListFact<"feeding"> }>;
+    const growthDomainSource: Extract<TrackerScreenState, { tag: "confirm.discard" }> = { tag: "confirm.discard", decision: growthDomainDecision };
+    const growthReloadListSource: Extract<TrackerScreenState, { tag: "confirm.discard" }> = { tag: "confirm.discard", decision: growthReloadListDecision };
+    const growthReloadRecordSource: Extract<TrackerScreenState, { tag: "confirm.discard" }> = { tag: "confirm.discard", decision: growthReloadRecordDecision };
+    const feedingReloadListSource: Extract<TrackerScreenState, { tag: "confirm.discard" }> = { tag: "confirm.discard", decision: feedingReloadListDecision };
+    const feedingReloadRecordSource: Extract<TrackerScreenState, { tag: "confirm.discard" }> = { tag: "confirm.discard", decision: feedingReloadRecordDecision };
+    declare const growthListNext: import("./src/features/tracker/trackerScreenState").OrdinaryListLoading<"growth">;
+    declare const feedingListNext: import("./src/features/tracker/trackerScreenState").OrdinaryListLoading<"feeding">;
+    declare const growthGetNext: import("./src/features/tracker/trackerScreenState").EditLoading<"growth">;
+    declare const feedingGetNext: import("./src/features/tracker/trackerScreenState").EditLoading<"feeding">;
     const valid: DomainState<"growth"> = { tag: "confirm.update", owner: growthUpdateOwner, decision: growthDecision };
     void valid;
     // @ts-expect-error a growth state cannot contain a feeding confirmation
@@ -925,9 +1333,35 @@ test("tracker screen state types reject cross-domain decisions and impossible mu
     updateProbeStartedAction(widenedDomainUpdateOwner, growthEdit);
     // @ts-expect-error widened mutation-kind owners cannot choose a correlated completion tuple
     mutationCompletedAction(widenedKindGrowthOwner, growthUpdateCompletion);
+    // @ts-expect-error list completion owner and fact domains are correlated
+    listSucceededAction(growthListOwner, feedingFact);
+    // @ts-expect-error get completion owner and editor domains are correlated
+    getSucceededAction(growthGetOwner, feedingEdit);
+    // @ts-expect-error mutation refresh owner and fact domains are correlated
+    operationRefreshSucceededAction(growthUpdateOwner, feedingFact);
+    // @ts-expect-error domain discard cannot target its source domain
+    const sameDomainDiscard: ScreenDiscardDecision = { kind: "discard", domain: "growth", prior: growthPrior, destination: { kind: "domain", fact: growthFact }, initiatingControlRef: { current: null } };
     // @ts-expect-error the approved decision boundary rejects mixed-domain envelopes
     createTrackerDecisionSnapshot({ ...feedingDecision, domain: "growth", prior: growthEdit, baseline: growthEdit.baseline });
-    void foreignConfirmation; void impossibleState; void impossibleAction; void wrongOwnerAction;
+    listStartedAction(growthDomainSource, feedingListNext, growthDomainDecision);
+    acceptedDiscardListStartedAction(growthDomainSource, feedingListNext, growthDomainDecision);
+    listStartedAction(growthReloadListSource, growthListNext, growthReloadListDecision);
+    acceptedDiscardListStartedAction(growthReloadListSource, growthListNext, growthReloadListDecision);
+    listStartedAction(feedingReloadListSource, feedingListNext, feedingReloadListDecision);
+    acceptedDiscardListStartedAction(feedingReloadListSource, feedingListNext, feedingReloadListDecision);
+    getStartedAction(growthReloadRecordSource, growthGetNext, growthReloadRecordDecision);
+    acceptedDiscardGetStartedAction(growthReloadRecordSource, growthGetNext, growthReloadRecordDecision);
+    // @ts-expect-error a valid domain decision cannot start a list in a different destination domain
+    listStartedAction(growthDomainSource, growthListNext, growthDomainDecision);
+    // @ts-expect-error a valid reload-list decision cannot start another domain's list
+    acceptedDiscardListStartedAction(growthReloadListSource, feedingListNext, growthReloadListDecision);
+    // @ts-expect-error a valid reload-record decision cannot start another domain's get
+    getStartedAction(growthReloadRecordSource, feedingGetNext, growthReloadRecordDecision);
+    // @ts-expect-error accepted get helper preserves the reload-record destination domain
+    acceptedDiscardGetStartedAction(feedingReloadRecordSource, growthGetNext, feedingReloadRecordDecision);
+    // @ts-expect-error discard request prior and decision domains are correlated
+    const mixedDiscard: TrackerScreenAction = { type: "DISCARD_REQUESTED", prior: growthPrior, decision: feedingReloadListDecision };
+    void foreignConfirmation; void impossibleState; void impossibleAction; void wrongOwnerAction; void sameDomainDiscard; void feedingPrior; void mixedDiscard;
   `;
   const config = ts.readConfigFile(`${process.cwd()}/tsconfig.json`, ts.sys.readFile);
   const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, process.cwd());
@@ -946,4 +1380,566 @@ test("tracker screen state types reject cross-domain decisions and impossible mu
   const diagnostics = ts.getPreEmitDiagnostics(program).filter((diagnostic) => diagnostic.file?.fileName === fixturePath);
 
   expect(diagnostics.map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"))).toEqual([]);
+});
+
+test("component dispatch contains no broad action, list-fact, or discard-decision casts", () => {
+  const source = readFileSync(
+    `${process.cwd()}/src/features/tracker/ManualTrackerScreen.tsx`,
+    "utf8",
+  );
+  expect(source).not.toMatch(/action\s+as\s+TrackerScreenAction/);
+  expect(source).not.toMatch(/as\s+ListFact</);
+  expect(source).not.toMatch(/as\s+DiscardDecision/);
+});
+
+test("stale update probe freezes the exact source and gates reload through discard before one get", async () => {
+  const replacement = Object.freeze({
+    ...records.growth,
+    weightG: 7400,
+    updatedAt: "2026-07-20T00:09:00.000Z",
+  });
+  const list = jest.fn(async () => [records.growth]);
+  const getById = jest.fn()
+    .mockResolvedValueOnce(records.growth)
+    .mockResolvedValueOnce(replacement);
+  const replacementInput = Object.freeze({ ...expectedUpdateInputs.growth, weightG: 7500 });
+  const replacementSummary: TrackerUpdateSummary<"growth"> = Object.freeze({
+    action: "update", domain: "growth", id: replacement.id,
+    expectedUpdatedAt: replacement.updatedAt, input: replacementInput,
+  });
+  const update = jest.fn()
+    .mockRejectedValueOnce(new ManualTrackerConflictError("stale_write"))
+    .mockResolvedValueOnce(Object.freeze({ status: "confirmation_required", summary: replacementSummary }));
+  const service = createServiceMock({
+    list: list as ManualTrackerServicePort["list"],
+    getById: getById as ManualTrackerServicePort["getById"],
+    update: update as ManualTrackerServicePort["update"],
+  });
+  await openEditor("growth", "生长", service);
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  const editor = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+
+  expect(await screen.findByText("这条记录已在其他位置更新。为避免覆盖，请重新读取后再修改。")).toBeTruthy();
+  const conflict = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  expect(conflict.tag).toBe("conflict.stale");
+  if (conflict.tag !== "conflict.stale" || editor.tag !== "edit.editing") throw new Error("expected stale conflict");
+  expect(conflict.source.prior).toBe(editor.editor);
+  expect(update).toHaveBeenCalledTimes(1);
+  expect(getById).toHaveBeenCalledTimes(1);
+
+  fireEvent.press(screen.getByRole("button", { name: "重新读取记录" }));
+  expect(await screen.findByRole("header", { name: "放弃未保存的更改？" })).toBeTruthy();
+  expect(getById).toHaveBeenCalledTimes(1);
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  expect(mockTrackerReducerObserver.mock.calls.at(-1)?.[1]).toBe(conflict);
+
+  fireEvent.press(screen.getByRole("button", { name: "重新读取记录" }));
+  fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+  await screen.findByRole("header", { name: "编辑生长记录" });
+  const reloaded = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  expect(reloaded.tag).toBe("edit.editing");
+  if (reloaded.tag !== "edit.editing") throw new Error("expected editor");
+  expect(reloaded.editor.baseline).toBe(replacement);
+  expect(reloaded.editor.draft).not.toBe(editor.editor.draft);
+  expect(reloaded.editor.initialDraft).not.toBe(editor.editor.initialDraft);
+  expect(reloaded.editor.initialDraft).toEqual(reloaded.editor.draft);
+  expect(reloaded.editor.prior).toBe(editor.editor.prior);
+  expect(screen.getByLabelText("体重（克）").props.value).toBe("7400");
+  expect(getById.mock.calls).toEqual([
+    ["growth", records.growth.id],
+    ["growth", records.growth.id],
+  ]);
+  expect(list).toHaveBeenCalledTimes(1);
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7500");
+  fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+  await screen.findByRole("button", { name: "确认保存" });
+  expect(update.mock.calls[1]).toEqual(["growth", replacement.id, replacementInput, replacement.updatedAt]);
+  expect(service.create).not.toHaveBeenCalled();
+  expect(service.delete).not.toHaveBeenCalled();
+});
+
+test.each(["update", "delete"] as const)("confirmed %s stale conflict retains the exact returned summary without replay", async (kind) => {
+  const updateSummary = Object.freeze({
+    action: "update" as const,
+    domain: "growth" as const,
+    id: records.growth.id,
+    expectedUpdatedAt: records.growth.updatedAt,
+    input: expectedUpdateInputs.growth,
+  });
+  const deleteSummary = Object.freeze({
+    action: "delete" as const,
+    domain: "growth" as const,
+    id: records.growth.id,
+    expectedUpdatedAt: records.growth.updatedAt,
+  });
+  const update = jest.fn()
+    .mockResolvedValueOnce(Object.freeze({ status: "confirmation_required" as const, summary: updateSummary }))
+    .mockRejectedValueOnce(new ManualTrackerConflictError("stale_write"));
+  const deleteRecord = jest.fn()
+    .mockResolvedValueOnce(Object.freeze({ status: "confirmation_required" as const, summary: deleteSummary }))
+    .mockRejectedValueOnce(new ManualTrackerConflictError("stale_write"));
+  const service = createServiceMock({
+    list: jest.fn(async () => [records.growth]) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+    update: update as ManualTrackerServicePort["update"],
+    delete: deleteRecord as ManualTrackerServicePort["delete"],
+  });
+  await openEditor("growth", "生长", service);
+  if (kind === "update") {
+    fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+    fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+    fireEvent.press(await screen.findByRole("button", { name: "确认保存" }));
+  } else {
+    fireEvent.press(screen.getByRole("button", { name: "删除这条记录" }));
+    fireEvent.press(await screen.findByRole("button", { name: "确认删除" }));
+  }
+  expect(await screen.findByText("这条记录已在其他位置更新。为避免覆盖，请重新读取后再修改。")).toBeTruthy();
+  const conflict = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  expect(conflict.tag).toBe("conflict.stale");
+  if (conflict.tag !== "conflict.stale") throw new Error("expected stale conflict");
+  expect(conflict.source.phase).toBe("confirmed");
+  expect(conflict.source.decision?.serviceSummary).toBe(kind === "update" ? updateSummary : deleteSummary);
+  expect(kind === "update" ? update : deleteRecord).toHaveBeenCalledTimes(2);
+  expect(service.list).toHaveBeenCalledTimes(1);
+  expect(service.getById).toHaveBeenCalledTimes(1);
+});
+
+test("stale reload null performs get then list only and shows the approved missing notice", async () => {
+  const refreshed = Object.freeze([records.growth]);
+  const list = jest.fn().mockResolvedValueOnce([records.growth]).mockResolvedValueOnce(refreshed);
+  const getById = jest.fn().mockResolvedValueOnce(records.growth).mockResolvedValueOnce(null);
+  const update = jest.fn(async () => { throw new ManualTrackerConflictError("stale_write"); });
+  const service = createServiceMock({ list, getById, update } as Partial<ManualTrackerServicePort>);
+  await openEditor("growth", "生长", service);
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+  fireEvent.press(await screen.findByRole("button", { name: "重新读取记录" }));
+  fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+  expect(await screen.findByText("这条记录已不存在，列表已重新读取。")).toBeTruthy();
+  expect(getById.mock.calls.at(-1)).toEqual(["growth", records.growth.id]);
+  expect(list.mock.calls.at(-1)).toEqual(["growth", 100]);
+  expect(update).toHaveBeenCalledTimes(1);
+  expect(service.create).not.toHaveBeenCalled();
+  expect(service.delete).not.toHaveBeenCalled();
+  const recovered = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (recovered.tag !== "list.ready.rows") throw new Error("expected exact recovered rows");
+  expect(recovered.fact.rows).toBe(refreshed);
+  expect(recovered.fact.rows[0]).toBe(records.growth);
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(update).toHaveBeenCalledTimes(1);
+});
+
+test("not_found retains the exact source until explicit dirty discard and then lists without replay", async () => {
+  const refreshed = Object.freeze([records.growth]);
+  const list = jest.fn().mockResolvedValueOnce([records.growth]).mockResolvedValueOnce(refreshed);
+  const getById = jest.fn(async () => records.growth);
+  const update = jest.fn(async () => { throw new ManualTrackerConflictError("not_found"); });
+  const service = createServiceMock({ list, getById, update } as Partial<ManualTrackerServicePort>);
+  await openEditor("growth", "生长", service);
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+  expect(await screen.findByText("这条记录已不存在，不能继续保存或删除。")).toBeTruthy();
+  const conflict = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  expect(conflict.tag).toBe("conflict.notFound");
+  expect(screen.queryByRole("button", { name: "重新读取记录" })).toBeNull();
+  expect(list).toHaveBeenCalledTimes(1);
+  fireEvent.press(screen.getByRole("button", { name: "返回列表" }));
+  expect(await screen.findByRole("header", { name: "放弃未保存的更改？" })).toBeTruthy();
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  expect(mockTrackerReducerObserver.mock.calls.at(-1)?.[1]).toBe(conflict);
+  fireEvent.press(screen.getByRole("button", { name: "返回列表" }));
+  fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+  await screen.findByRole("header", { name: "生长记录" });
+  expect(list.mock.calls).toEqual([["growth", 100], ["growth", 100]]);
+  expect(getById).toHaveBeenCalledTimes(1);
+  expect(update).toHaveBeenCalledTimes(1);
+  const recovered = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (recovered.tag !== "list.ready.rows") throw new Error("expected standalone not-found rows");
+  expect(recovered.fact.rows).toBe(refreshed);
+  expect(recovered.fact.rows[0]).toBe(records.growth);
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(update).toHaveBeenCalledTimes(1);
+  expect(service.create).not.toHaveBeenCalled();
+  expect(service.delete).not.toHaveBeenCalled();
+});
+
+test.each(["list", "get"] as const)("stale accepted %s discard decision cannot authorize an equivalent current destination or start a service read", async (kind) => {
+  const initialRows = Object.freeze([records.growth]);
+  const refreshedRows = Object.freeze([records.growth]);
+  const list = jest.fn().mockResolvedValueOnce(initialRows).mockResolvedValueOnce(refreshedRows);
+  const getById = jest.fn(async () => records.growth);
+  const update = jest.fn(async () => { throw new ManualTrackerConflictError("stale_write"); });
+  const service = createServiceMock({ list, getById, update } as Partial<ManualTrackerServicePort>);
+  await openEditor("growth", "生长", service);
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+  await screen.findByRole("header", { name: "记录冲突" });
+
+  const initiate = () => fireEvent.press(screen.getByRole("button", { name: kind === "get" ? "重新读取记录" : "返回列表" }));
+  initiate();
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const oldConfirmation = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (oldConfirmation.tag !== "confirm.discard") throw new Error("expected old discard confirmation");
+  const oldAcceptButton = screen.getByRole("button", { name: "放弃更改" });
+  const staleAccept = [
+    oldAcceptButton.props.onPress,
+    oldAcceptButton.parent?.props.onPress,
+    oldAcceptButton.parent?.parent?.props.onPress,
+  ].find((candidate): candidate is () => void => typeof candidate === "function");
+  if (staleAccept === undefined) throw new Error("expected stale accept callback");
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  initiate();
+  const currentConfirmation = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (currentConfirmation.tag !== "confirm.discard") throw new Error("expected current discard confirmation");
+  expect(currentConfirmation.decision).not.toBe(oldConfirmation.decision);
+  const oldDestination = oldConfirmation.decision.destination;
+  const currentDestination = currentConfirmation.decision.destination;
+  if (!("kind" in oldDestination) || !("kind" in currentDestination)) throw new Error("expected reload destinations");
+  expect(oldDestination.kind).toBe(kind === "get" ? "reload-record" : "reload-list");
+  expect(currentDestination.kind).toBe(oldDestination.kind);
+  if (oldDestination.kind === "reload-record" && currentDestination.kind === "reload-record") {
+    expect(currentDestination.domain).toBe(oldDestination.domain);
+    expect(currentDestination.id).toBe(oldDestination.id);
+    expect(currentDestination.prior).toBe(oldDestination.prior);
+  } else if (oldDestination.kind === "reload-list" && currentDestination.kind === "reload-list") {
+    expect(currentDestination.fact).toBe(oldDestination.fact);
+  } else {
+    throw new Error("expected destination-equivalent decisions");
+  }
+  const readCounts = Object.freeze({ list: list.mock.calls.length, get: getById.mock.calls.length });
+  act(() => staleAccept());
+  await act(async () => {
+    jest.runOnlyPendingTimers();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(mockTrackerReducerObserver.mock.calls.at(-1)?.[1]).toBe(currentConfirmation);
+  expect(list).toHaveBeenCalledTimes(readCounts.list);
+  expect(getById).toHaveBeenCalledTimes(readCounts.get);
+
+  fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+  if (kind === "get") {
+    await waitFor(() => expect(getById).toHaveBeenCalledTimes(readCounts.get + 1));
+    expect(list).toHaveBeenCalledTimes(readCounts.list);
+  } else {
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(readCounts.list + 1));
+    expect(getById).toHaveBeenCalledTimes(readCounts.get);
+  }
+  expect(update).toHaveBeenCalledTimes(1);
+});
+
+const aggregateFormByField = Object.freeze({
+  measurements: GrowthTrackerForm,
+  feedTime: FeedingTrackerForm,
+  sleepStart: SleepTrackerForm,
+  sleepEnd: SleepTrackerForm,
+  diaperTime: DiaperTrackerForm,
+});
+
+test.each([
+  ["update", "probe", "stale_write"], ["update", "confirmed", "stale_write"],
+  ["delete", "probe", "stale_write"], ["delete", "confirmed", "stale_write"],
+  ["update", "probe", "not_found"], ["update", "confirmed", "not_found"],
+  ["delete", "probe", "not_found"], ["delete", "confirmed", "not_found"],
+] as const)("%s %s %s conflict preserves exact tuples and recovers to exact rows without mutation deltas", async (kind, phase, code) => {
+  const initialRows = Object.freeze([records.growth]);
+  const refreshedFirst = Object.freeze({ ...records.growth, id: "refreshed-first", updatedAt: "2026-07-20T00:20:00.000Z" });
+  const refreshedSecond = Object.freeze({ ...records.growth, id: "refreshed-second", updatedAt: "2026-07-20T00:21:00.000Z" });
+  const refreshedRows = Object.freeze([refreshedFirst, refreshedSecond]);
+  const updateInput = Object.freeze({ ...expectedUpdateInputs.growth, weightG: 7300 });
+  const summary = kind === "update"
+    ? Object.freeze({ action: "update" as const, domain: "growth" as const, id: records.growth.id, expectedUpdatedAt: records.growth.updatedAt, input: updateInput })
+    : Object.freeze({ action: "delete" as const, domain: "growth" as const, id: records.growth.id, expectedUpdatedAt: records.growth.updatedAt });
+  const conflictError = new ManualTrackerConflictError(code);
+  const mutation = phase === "probe"
+    ? jest.fn().mockRejectedValueOnce(conflictError)
+    : jest.fn().mockResolvedValueOnce(Object.freeze({ status: "confirmation_required", summary })).mockRejectedValueOnce(conflictError);
+  const list = jest.fn().mockResolvedValueOnce(initialRows).mockResolvedValueOnce(refreshedRows);
+  const getById = jest.fn(async () => records.growth);
+  const create = jest.fn(async () => { throw new Error("unexpected create"); });
+  const otherMutation = jest.fn(async () => { throw new Error("unexpected other mutation"); });
+  const service = createServiceMock({
+    list: list as ManualTrackerServicePort["list"],
+    getById: getById as ManualTrackerServicePort["getById"],
+    create: create as ManualTrackerServicePort["create"],
+    update: (kind === "update" ? mutation : otherMutation) as ManualTrackerServicePort["update"],
+    delete: (kind === "delete" ? mutation : otherMutation) as ManualTrackerServicePort["delete"],
+  });
+  await openEditor("growth", "生长", service);
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  const editor = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  fireEvent.press(screen.getByRole("button", { name: kind === "update" ? "保存修改" : "删除这条记录" }));
+  if (phase === "confirmed") fireEvent.press(await screen.findByRole("button", { name: kind === "update" ? "确认保存" : "确认删除" }));
+  await screen.findByRole("header", { name: "记录冲突" });
+  const conflict = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if ((conflict.tag !== "conflict.stale" && conflict.tag !== "conflict.notFound") || editor.tag !== "edit.editing") throw new Error("expected conflict");
+  expect(conflict.source.prior).toBe(editor.editor);
+  expect(conflict.source.phase).toBe(phase);
+  expect(conflict.source.owner.kind).toBe(kind);
+  if (phase === "confirmed") expect(conflict.source.decision?.serviceSummary).toBe(summary);
+  const expectedProbe = kind === "update"
+    ? ["growth", records.growth.id, updateInput, records.growth.updatedAt]
+    : ["growth", records.growth.id, records.growth.updatedAt];
+  expect(mutation.mock.calls[0]).toEqual(expectedProbe);
+  if (phase === "confirmed") expect(mutation.mock.calls[1]).toEqual([...expectedProbe, "confirmed"]);
+
+  const mutationCounts = [service.create, service.update, service.delete].map((fn) => (fn as jest.Mock).mock.calls.length);
+  fireEvent.press(screen.getByRole("button", { name: "返回列表" }));
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const discard = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (discard.tag !== "confirm.discard") throw new Error("expected discard");
+  expect(discard.decision.prior).toBe(conflict);
+  expect("kind" in discard.decision.destination && discard.decision.destination.kind).toBe("reload-list");
+  const initiatingControlRef = discard.decision.initiatingControlRef;
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  expect(mockTrackerReducerObserver.mock.calls.at(-1)?.[1]).toBe(conflict);
+  fireEvent.press(screen.getByRole("button", { name: "返回列表" }));
+  const repeatedDiscard = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (repeatedDiscard.tag !== "confirm.discard") throw new Error("expected repeated discard");
+  expect(repeatedDiscard.decision.initiatingControlRef).toBe(initiatingControlRef);
+  fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+  await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+  const ready = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (ready.tag !== "list.ready.rows") throw new Error("expected rows");
+  expect(ready.fact.rows).toBe(refreshedRows);
+  expect(ready.fact.rows[0]).toBe(refreshedFirst);
+  expect(ready.fact.rows[1]).toBe(refreshedSecond);
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect([service.create, service.update, service.delete].map((fn) => (fn as jest.Mock).mock.calls.length)).toEqual(mutationCounts);
+  expect(list.mock.invocationCallOrder[1]).toBeGreaterThan(mutation.mock.invocationCallOrder.at(-1)!);
+});
+
+test.each([
+  [new RuntimeClosingError(), "本机记录服务暂不可用，请返回后重试。"],
+  [new Error("SQL tracker_records growth-private-id 2026-07-20T00:02:00.000Z"), "删除失败，本机记录没有更改。"],
+  [{ name: "ManualTrackerConflictError", code: "stale_write", message: "private-id" }, "删除失败，本机记录没有更改。"],
+] as const)("classifies delete failures nominally and privately", async (failure, copy) => {
+  const deleteRecord = jest.fn(async () => { throw failure; });
+  const service = createServiceMock({
+    list: jest.fn(async () => [records.growth]) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+    delete: deleteRecord as ManualTrackerServicePort["delete"],
+  });
+  await openEditor("growth", "生长", service);
+  fireEvent.press(screen.getByRole("button", { name: "删除这条记录" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(copy);
+  expect(screen.queryByText(/tracker_records|growth-private-id|private-id|stale_write|SQL/)).toBeNull();
+  expect(deleteRecord).toHaveBeenCalledTimes(1);
+  expect(service.create).not.toHaveBeenCalled();
+  expect(service.update).not.toHaveBeenCalled();
+});
+
+test.each([
+  ["probe", new RuntimeClosingError(), "本机记录服务暂不可用，请返回后重试。"],
+  ["probe", new Error("private health probe"), "保存失败，本机记录没有更改。"],
+  ["probe", { name: "ManualTrackerConflictError", code: "stale_write", message: "private health probe impostor" }, "保存失败，本机记录没有更改。"],
+  ["confirmed", new RuntimeClosingError(), "本机记录服务暂不可用，请返回后重试。"],
+  ["confirmed", new Error("private health confirmed"), "保存失败，本机记录没有更改。"],
+  ["confirmed", { name: "ManualTrackerConflictError", code: "stale_write", message: "private health confirmed impostor" }, "保存失败，本机记录没有更改。"],
+] as const)("health create %s failure is retained without replay and retries with a fresh probe", async (phase, failure, copy) => {
+  const input = Object.freeze({ recordDate: "2026-07-20", recordType: "illness" as const, title: "轻微咳嗽", description: "居家观察", sourceMessageId: null });
+  const summary: TrackerCreateSummary<"health"> = Object.freeze({ action: "create", domain: "health", input });
+  const create = phase === "probe"
+    ? jest.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce(Object.freeze({ status: "confirmation_required", summary }))
+    : jest.fn().mockResolvedValueOnce(Object.freeze({ status: "confirmation_required", summary })).mockRejectedValueOnce(failure).mockResolvedValueOnce(Object.freeze({ status: "confirmation_required", summary }));
+  const service = createServiceMock({ create: create as ManualTrackerServicePort["create"] });
+  renderTracker(service);
+  await openHealthCreate();
+  fireEvent.press(screen.getByRole("button", { name: "保存健康记录" }));
+  let confirmedDecision: unknown;
+  if (phase === "confirmed") {
+    const confirmButton = await screen.findByRole("button", { name: "确认保存" });
+    const confirmation = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (confirmation.tag !== "confirm.healthCreate") throw new Error("expected health confirmation");
+    confirmedDecision = confirmation.decision;
+    fireEvent.press(confirmButton);
+  }
+  expect(await screen.findByRole("alert")).toHaveTextContent(copy);
+  const failed = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (failed.tag !== "mutation.error") throw new Error("expected mutation error");
+  const failedOwner = failed.source.owner;
+  const failedPrior = failed.source.prior;
+  expect(create.mock.calls[0]).toEqual(["health", input]);
+  if (phase === "confirmed") {
+    expect(create.mock.calls[1]).toEqual(["health", input, "confirmed"]);
+    expect(failed.source.decision).toBe(confirmedDecision);
+    expect(failed.source.decision?.serviceSummary).toBe(summary);
+    expect(failed.source.decision && failed.source.decision.kind === "healthCreate" ? failed.source.decision.serviceSummary : null).toBe(summary);
+  } else {
+    expect(failed.source.decision).toBeUndefined();
+  }
+  const beforeRetryCalls = create.mock.calls.length;
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(create).toHaveBeenCalledTimes(beforeRetryCalls);
+  fireEvent.press(screen.getByRole("button", { name: "保存健康记录" }));
+  await screen.findByRole("header", { name: "确认新增健康记录" });
+  const retried = mockTrackerReducerObserver.mock.calls.findLast((call) => call[1].tag === "mutation.submitting")?.[1] as TrackerScreenState;
+  if (retried.tag !== "mutation.submitting") throw new Error("expected retry");
+  expect(retried.prior).toBe(failedPrior);
+  expect(retried.owner).not.toBe(failedOwner);
+  expect(retried.owner.mountEpoch).toBe(failedOwner.mountEpoch);
+  expect(retried.owner.operationId).toBeGreaterThan(failedOwner.operationId);
+  expect(retried.phase).toBe("probe");
+  expect(retried.decision).toBeUndefined();
+  expect(create.mock.calls.at(-1)).toEqual(["health", input]);
+});
+
+test.each([
+  ["update", "probe", new RuntimeClosingError(), "本机记录服务暂不可用，请返回后重试。"],
+  ["update", "probe", new Error("private update probe"), "保存失败，本机记录没有更改。"],
+  ["update", "probe", { name: "ManualTrackerConflictError", code: "stale_write", message: "private update impostor" }, "保存失败，本机记录没有更改。"],
+  ["update", "confirmed", new RuntimeClosingError(), "本机记录服务暂不可用，请返回后重试。"],
+  ["update", "confirmed", new Error("private update confirmed"), "保存失败，本机记录没有更改。"],
+  ["update", "confirmed", { name: "ManualTrackerConflictError", code: "stale_write", message: "private update confirmed impostor" }, "保存失败，本机记录没有更改。"],
+  ["delete", "probe", new RuntimeClosingError(), "本机记录服务暂不可用，请返回后重试。"],
+  ["delete", "probe", new Error("private delete probe"), "删除失败，本机记录没有更改。"],
+  ["delete", "confirmed", new RuntimeClosingError(), "本机记录服务暂不可用，请返回后重试。"],
+  ["delete", "confirmed", new Error("private delete confirmed"), "删除失败，本机记录没有更改。"],
+  ["delete", "confirmed", { name: "ManualTrackerConflictError", code: "not_found", message: "private delete confirmed impostor" }, "删除失败，本机记录没有更改。"],
+] as const)("%s %s failure preserves exact facts, never replays, and retries through one fresh probe", async (kind, phase, failure, copy) => {
+  const updateInput = Object.freeze({ ...expectedUpdateInputs.growth, weightG: 7300 });
+  const updateSummary: TrackerUpdateSummary<"growth"> = Object.freeze({ action: "update", domain: "growth", id: records.growth.id, expectedUpdatedAt: records.growth.updatedAt, input: updateInput });
+  const deleteSummary: TrackerDeleteSummary<"growth"> = Object.freeze({ action: "delete", domain: "growth", id: records.growth.id, expectedUpdatedAt: records.growth.updatedAt });
+  const summaryResult = Object.freeze({ status: "confirmation_required" as const, summary: kind === "update" ? updateSummary : deleteSummary });
+  const mutation = phase === "probe"
+    ? jest.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce(summaryResult)
+    : jest.fn().mockResolvedValueOnce(summaryResult).mockRejectedValueOnce(failure).mockResolvedValueOnce(summaryResult);
+  const service = createServiceMock({
+    list: jest.fn(async () => [records.growth]) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+    [kind]: mutation,
+  });
+  await openEditor("growth", "生长", service);
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  fireEvent.press(screen.getByRole("button", { name: kind === "update" ? "保存修改" : "删除这条记录" }));
+  let confirmedDecision: unknown;
+  if (phase === "confirmed") {
+    const confirmButton = await screen.findByRole("button", { name: kind === "update" ? "确认保存" : "确认删除" });
+    const confirmation = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (confirmation.tag !== (kind === "update" ? "confirm.update" : "confirm.delete")) throw new Error("expected mutation confirmation");
+    confirmedDecision = confirmation.decision;
+    fireEvent.press(confirmButton);
+  }
+  expect(await screen.findByRole("alert")).toHaveTextContent(copy);
+  const failed = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (failed.tag !== "mutation.error") throw new Error("expected mutation error");
+  const { baseline, draft, initialDraft, prior } = failed.source.prior;
+  const expectedTuple = kind === "update"
+    ? ["growth", records.growth.id, updateInput, records.growth.updatedAt]
+    : ["growth", records.growth.id, records.growth.updatedAt];
+  expect(mutation.mock.calls[0]).toEqual(expectedTuple);
+  if (phase === "confirmed") {
+    expect(mutation.mock.calls[1]).toEqual([...expectedTuple, "confirmed"]);
+    expect(failed.source.decision).toBe(confirmedDecision);
+    expect(failed.source.decision?.serviceSummary).toBe(kind === "update" ? updateSummary : deleteSummary);
+  } else {
+    expect(failed.source.decision).toBeUndefined();
+  }
+  const beforeRetryCalls = mutation.mock.calls.length;
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(mutation).toHaveBeenCalledTimes(beforeRetryCalls);
+  fireEvent.press(screen.getByRole("button", { name: kind === "update" ? "保存修改" : "删除这条记录" }));
+  await screen.findByRole("button", { name: kind === "update" ? "确认保存" : "确认删除" });
+  const retry = mockTrackerReducerObserver.mock.calls.findLast((call) => call[1].tag === "mutation.submitting")?.[1] as TrackerScreenState;
+  if (retry.tag !== "mutation.submitting") throw new Error("expected retry");
+  expect(retry.prior.baseline).toBe(baseline);
+  expect(retry.prior.draft).toBe(draft);
+  expect(retry.prior.initialDraft).toBe(initialDraft);
+  expect(retry.prior.prior).toBe(prior);
+  expect(retry.owner.operationId).not.toBe(failed.source.owner.operationId);
+  expect(retry.owner.kind).toBe(kind);
+  expect(retry.owner.mountEpoch).toBe(failed.source.owner.mountEpoch);
+  expect(retry.owner.operationId).toBeGreaterThan(failed.source.owner.operationId);
+  expect(retry.phase).toBe("probe");
+  expect(retry.decision).toBeUndefined();
+  expect(mutation.mock.calls.at(-1)).toEqual(expectedTuple);
+});
+
+test.each([
+  ["growth", "生长", "measurementDate", "测量日期", "体重（克）", "7300", "请检查标出的内容后再保存。"],
+  ["growth", "生长", "measurements", "体重（克）", "体重（克）", "7300", "体重、身长、头围请至少填写一项。"],
+  ["growth", "生长", "weightG", "体重（克）", "体重（克）", "7300", "请检查标出的内容后再保存。"],
+  ["growth", "生长", "heightCm", "身长（厘米）", "体重（克）", "7300", "请检查标出的内容后再保存。"],
+  ["growth", "生长", "headCm", "头围（厘米）", "体重（克）", "7300", "请检查标出的内容后再保存。"],
+  ["growth", "生长", "notes", "备注", "体重（克）", "7300", "请检查标出的内容后再保存。"],
+  ["feeding", "喂养", "feedTime", "喂养时间", "备注", "更新喂养备注", "请检查标出的内容后再保存。"],
+  ["feeding", "喂养", "feedType", "喂养类型", "备注", "更新喂养备注", "请检查标出的内容后再保存。"],
+  ["feeding", "喂养", "amountMl", "量（毫升）", "备注", "更新喂养备注", "配方奶需要填写量。"],
+  ["feeding", "喂养", "durationMin", "时长（分钟）", "备注", "更新喂养备注", "母乳需要填写时长。"],
+  ["feeding", "喂养", "notes", "备注", "备注", "更新喂养备注", "请检查标出的内容后再保存。"],
+  ["sleep", "睡眠", "sleepStart", "开始时间", "夜醒次数", "03", "请检查标出的内容后再保存。"],
+  ["sleep", "睡眠", "sleepEnd", "结束时间", "夜醒次数", "03", "结束时间需要晚于开始时间。"],
+  ["sleep", "睡眠", "sleepType", "睡眠类型", "夜醒次数", "03", "请检查标出的内容后再保存。"],
+  ["sleep", "睡眠", "nightWakings", "夜醒次数", "夜醒次数", "03", "请检查标出的内容后再保存。"],
+  ["sleep", "睡眠", "notes", "备注", "夜醒次数", "03", "请检查标出的内容后再保存。"],
+  ["diaper", "大小便", "diaperTime", "记录时间", "备注", "更换后备注", "请检查标出的内容后再保存。"],
+  ["diaper", "大小便", "diaperType", "类型", "备注", "更换后备注", "请检查标出的内容后再保存。"],
+  ["diaper", "大小便", "notes", "备注", "备注", "更换后备注", "请检查标出的内容后再保存。"],
+  ["health", "健康", "recordDate", "记录日期", "标题", "复查", "请检查标出的内容后再保存。"],
+  ["health", "健康", "recordType", "健康记录类型", "标题", "复查", "请检查标出的内容后再保存。"],
+  ["health", "健康", "title", "标题", "标题", "复查", "标题需要填写，且最多 200 个字符。"],
+  ["health", "健康", "description", "说明", "标题", "复查", "请检查标出的内容后再保存。"],
+] as const)("maps %s (%s) service field %s adjacent to its exact field/group", async (domain, label, field, targetLabel, changeLabel, changeValue, message) => {
+  const update = jest.fn(async () => { throw new TrackerValidationError(domain, field, "private validation detail"); });
+  const service = createServiceMock({
+    list: jest.fn(async (requested) => requested === domain ? [records[domain]] : []) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records[domain]) as ManualTrackerServicePort["getById"],
+    update: update as ManualTrackerServicePort["update"],
+  });
+  await openEditor(domain, label, service);
+  fireEvent.changeText(screen.getByLabelText(changeLabel), changeValue);
+  const before = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+  const alert = await screen.findByRole("alert", { name: message });
+  const target = screen.getByLabelText(field === "measurements" ? "头围（厘米）" : targetLabel);
+  expect(alert).toHaveTextContent(message);
+  expect(alert.props.accessibilityRole).toBe("alert");
+  const expectedAggregateForm = aggregateFormByField[field as keyof typeof aggregateFormByField];
+  if (expectedAggregateForm !== undefined) {
+    let targetGroup = target;
+    let alertParent: typeof target.parent = null;
+    while (targetGroup.parent !== null) {
+      const parent = targetGroup.parent;
+      if (parent.type === expectedAggregateForm) {
+        throw new Error(`expected ${field} alert before its exact form boundary`);
+      }
+      const targetGroupIndex = parent.children.indexOf(targetGroup);
+      const alertSibling = parent.children[targetGroupIndex + 1];
+      if (
+        alertSibling !== undefined
+        && typeof alertSibling !== "string"
+        && within(alertSibling).queryByRole("alert", { name: message }) === alert
+      ) {
+        alertParent = parent;
+        break;
+      }
+      targetGroup = targetGroup.parent;
+    }
+    if (alertParent === null) throw new Error("expected target group beside aggregate alert");
+    const targetGroupIndex = alertParent.children.indexOf(targetGroup);
+    expect(targetGroupIndex).toBeGreaterThanOrEqual(0);
+    const alertSibling = alertParent.children[targetGroupIndex + 1];
+    if (alertSibling === undefined || typeof alertSibling === "string") throw new Error("expected exact aggregate alert sibling");
+    expect(within(alertSibling).getByRole("alert", { name: message })).toBe(alert);
+    expect(within(targetGroup).getByLabelText(field === "measurements" ? "头围（厘米）" : targetLabel)).toBe(target);
+  } else {
+    const fieldContainer = target.parent?.parent;
+    if (fieldContainer === null || fieldContainer === undefined) throw new Error("expected field/group container");
+    expect(within(fieldContainer).getByRole("alert")).toBe(alert);
+  }
+  const failed = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (before.tag !== "edit.editing" || failed.tag !== "mutation.error") throw new Error("expected retained validation error");
+  expect(failed.source.prior.draft).toBe(before.editor.draft);
+  expect(failed.source.prior.initialDraft).toBe(before.editor.initialDraft);
+  expect(failed.source.prior.baseline).toBe(before.editor.baseline);
+  expect(failed.source.prior.prior).toBe(before.editor.prior);
+  const expectedTuple = [domain, records[domain].id, expectedUpdateInputs[domain], records[domain].updatedAt];
+  expect(update.mock.calls[0]).toEqual(expectedTuple);
+  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(update).toHaveBeenCalledTimes(1);
+  fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+  await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+  expect(update.mock.calls[1]).toEqual(expectedTuple);
+  expect(screen.queryByText("private validation detail")).toBeNull();
 });

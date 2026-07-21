@@ -1,12 +1,16 @@
 import type { TrackerDeletion, TrackerDomain, TrackerRecordByDomain } from "../../domain/tracker/types";
+import type { ManualTrackerConflictCode } from "../../application/tracker/manualTrackerService";
 import { normalizePersistedTrackerRecord } from "../../domain/tracker/validation";
-import type { TrackerEditorDraftByDomain } from "./trackerEditorModel";
+import { isDraftDirty, type TrackerEditorDraftByDomain } from "./trackerEditorModel";
 import type {
+  TrackerDiscardDecision,
   TrackerHealthCreateDecision,
   TrackerUpdateDecision,
   TrackerDeleteDecision,
 } from "./InlineTrackerConfirmation";
 import type { TrackerFormErrors } from "./TrackerEditor";
+import type { TrackerFocusRef } from "./trackerAccessibility";
+import type { View } from "react-native";
 
 export type DomainRows<D extends TrackerDomain> = readonly TrackerRecordByDomain[D][];
 
@@ -75,7 +79,7 @@ export type AnyEditorSnapshot = {
   [D in TrackerDomain]: CreateEditorSnapshot<D> | EditEditorSnapshot<D>;
 }[TrackerDomain];
 
-type OrdinaryListLoading<D extends TrackerDomain> = Readonly<{
+export type OrdinaryListLoading<D extends TrackerDomain> = Readonly<{
   tag: "list.loading";
   source: "ordinary";
   owner: ReadOwner<D, "list">;
@@ -135,7 +139,7 @@ type RefreshListError<D extends TrackerDomain> = {
 
 type ListError<D extends TrackerDomain> = InitialListError<D> | RefreshListError<D>;
 
-type EditLoading<D extends TrackerDomain> = Readonly<{
+export type EditLoading<D extends TrackerDomain> = Readonly<{
   tag: "edit.loading";
   owner: ReadOwner<D, "get">;
   id: string;
@@ -156,11 +160,6 @@ type SuspendedRead<D extends TrackerDomain> = Readonly<{
     | Readonly<{ kind: "list"; prior: ListFact<D>; notice?: string }>
     | Readonly<{ kind: "get"; id: string; capturedZone: string; prior: ListFact<D> }>;
 }>;
-
-export type ScreenTrackerDecision =
-  | TrackerHealthCreateDecision<CreateEditorSnapshot<"health">>
-  | { [D in TrackerDomain]: TrackerUpdateDecision<D, EditEditorSnapshot<D>> }[TrackerDomain]
-  | { [D in TrackerDomain]: TrackerDeleteDecision<D, EditEditorSnapshot<D>> }[TrackerDomain];
 
 type HealthCreateConfirmation = Readonly<{
     tag: "confirm.healthCreate";
@@ -255,6 +254,73 @@ interface MutationSubmittingByDomain {
 
 type MutationSubmitting<D extends TrackerDomain> = MutationSubmittingByDomain[D];
 
+export type AnyMutationSubmitting = MutationSubmittingByDomain[TrackerDomain];
+
+type EditingStateByDomain = {
+  [D in TrackerDomain]:
+    | Readonly<{ tag: "create.editing"; editor: CreateEditorSnapshot<D>; notice?: string }>
+    | Readonly<{ tag: "edit.editing"; editor: EditEditorSnapshot<D>; notice?: string }>;
+};
+
+export type ConflictStateByDomain = {
+  [D in TrackerDomain]: Readonly<{
+    tag: "conflict.stale" | "conflict.notFound";
+    source: MutationSubmitting<D>;
+  }>;
+};
+
+export type ConflictState = ConflictStateByDomain[TrackerDomain];
+
+type MutationErrorByDomain = {
+  [D in TrackerDomain]: Readonly<{
+    tag: "mutation.error";
+    source: MutationSubmitting<D>;
+    field?: string;
+    message: string;
+  }>;
+};
+
+type MutationError = MutationErrorByDomain[TrackerDomain];
+
+export interface DiscardPriorByDomain {
+  readonly growth: EditingStateByDomain["growth"] | ConflictStateByDomain["growth"] | MutationErrorByDomain["growth"];
+  readonly feeding: EditingStateByDomain["feeding"] | ConflictStateByDomain["feeding"] | MutationErrorByDomain["feeding"];
+  readonly sleep: EditingStateByDomain["sleep"] | ConflictStateByDomain["sleep"] | MutationErrorByDomain["sleep"];
+  readonly diaper: EditingStateByDomain["diaper"] | ConflictStateByDomain["diaper"] | MutationErrorByDomain["diaper"];
+  readonly health: EditingStateByDomain["health"] | ConflictStateByDomain["health"] | MutationErrorByDomain["health"];
+}
+
+export type DiscardPrior = DiscardPriorByDomain[TrackerDomain];
+
+type DomainDiscardDestination<D extends TrackerDomain> = {
+  [Target in Exclude<TrackerDomain, D>]: Readonly<{ kind: "domain"; fact: ListFact<Target> }>;
+}[Exclude<TrackerDomain, D>];
+
+export type DiscardDestinationByDomain<D extends TrackerDomain> =
+  | ListFact<D>
+  | DomainDiscardDestination<D>
+  | Readonly<{ kind: "reload-list"; fact: ListFact<D> }>
+  | Readonly<{ kind: "reload-record"; domain: D; id: string; prior: ListFact<D> }>;
+
+export type DiscardDestination = {
+  [D in TrackerDomain]: DiscardDestinationByDomain<D>;
+}[TrackerDomain];
+
+export type ScreenDiscardDecision = {
+  [D in TrackerDomain]: TrackerDiscardDecision<D, DiscardPriorByDomain[D], DiscardDestinationByDomain<D>>;
+}[TrackerDomain];
+
+export type ScreenTrackerDecision =
+  | TrackerHealthCreateDecision<CreateEditorSnapshot<"health">>
+  | { [D in TrackerDomain]: TrackerUpdateDecision<D, EditEditorSnapshot<D>> }[TrackerDomain]
+  | { [D in TrackerDomain]: TrackerDeleteDecision<D, EditEditorSnapshot<D>> }[TrackerDomain]
+  | ScreenDiscardDecision;
+
+type DiscardConfirmation = Readonly<{
+  tag: "confirm.discard";
+  decision: ScreenDiscardDecision;
+}>;
+
 type MutationCompleted<D extends TrackerDomain> = {
   [K in MutationKind]: Readonly<{
     tag: "mutation.completed";
@@ -287,12 +353,30 @@ export interface TrackerScreenStateByDomain {
 }
 
 export type CorrelatedTrackerScreenState = TrackerScreenStateByDomain[TrackerDomain];
-export type TrackerScreenState = CorrelatedTrackerScreenState;
+export type TrackerScreenState = CorrelatedTrackerScreenState | ConflictState | MutationError | DiscardConfirmation;
 
-type ListStartedAction<D extends TrackerDomain> = Readonly<{
-  type: "LIST_STARTED";
-  next: OrdinaryListLoading<D>;
-}>;
+export type ListDiscardDecisionForDestination<D extends TrackerDomain> = {
+  [P in TrackerDomain]: TrackerDiscardDecision<
+    P,
+    DiscardPriorByDomain[P],
+    | Extract<DiscardDestinationByDomain<P>, Readonly<{ kind: "domain"; fact: ListFact<D> }>>
+    | Extract<DiscardDestinationByDomain<P>, Readonly<{ kind: "reload-list"; fact: ListFact<D> }>>
+  >;
+}[TrackerDomain];
+
+type ListStartedAction<D extends TrackerDomain> =
+  | Readonly<{
+    type: "LIST_STARTED";
+    source: TrackerScreenState;
+    next: OrdinaryListLoading<D>;
+    decision?: undefined;
+  }>
+  | Readonly<{
+    type: "LIST_STARTED";
+    source: DiscardConfirmation;
+    next: OrdinaryListLoading<D>;
+    decision: ListDiscardDecisionForDestination<D>;
+  }>;
 
 type ListSucceededAction<D extends TrackerDomain> = Readonly<{
   type: "LIST_SUCCEEDED";
@@ -305,10 +389,25 @@ type ListFailedAction<D extends TrackerDomain> = Readonly<{
   owner: ReadOwner<D, "list">;
 }>;
 
-type GetStartedAction<D extends TrackerDomain> = Readonly<{
-  type: "GET_STARTED";
-  next: EditLoading<D>;
-}>;
+export type GetDiscardDecisionForDestination<D extends TrackerDomain> = TrackerDiscardDecision<
+  D,
+  DiscardPriorByDomain[D],
+  Extract<DiscardDestinationByDomain<D>, Readonly<{ kind: "reload-record"; domain: D }>>
+>;
+
+type GetStartedAction<D extends TrackerDomain> =
+  | Readonly<{
+    type: "GET_STARTED";
+    source: TrackerScreenState;
+    next: EditLoading<D>;
+    decision?: undefined;
+  }>
+  | Readonly<{
+    type: "GET_STARTED";
+    source: DiscardConfirmation;
+    next: EditLoading<D>;
+    decision: GetDiscardDecisionForDestination<D>;
+  }>;
 
 type GetSucceededAction<D extends TrackerDomain> = Readonly<{
   type: "GET_SUCCEEDED";
@@ -330,6 +429,7 @@ type GetMissingReloadAction<D extends TrackerDomain> = Readonly<{
 
 type CreateRequestedAction<D extends TrackerDomain> = Readonly<{
   type: "CREATE_REQUESTED";
+  source: TrackerScreenState;
   editor: CreateEditorSnapshot<D>;
 }>;
 
@@ -411,21 +511,16 @@ interface MutationStartedActionByDomain {
 
 type MutationStartedAction<D extends TrackerDomain> = MutationStartedActionByDomain[D];
 
-interface ConfirmationRequiredActionByDomain {
-  readonly growth: Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"growth", "update">; next: UpdateConfirmation<"growth"> }>
-    | Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"growth", "delete">; next: DeleteConfirmation<"growth"> }>;
-  readonly feeding: Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"feeding", "update">; next: UpdateConfirmation<"feeding"> }>
-    | Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"feeding", "delete">; next: DeleteConfirmation<"feeding"> }>;
-  readonly sleep: Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"sleep", "update">; next: UpdateConfirmation<"sleep"> }>
-    | Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"sleep", "delete">; next: DeleteConfirmation<"sleep"> }>;
-  readonly diaper: Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"diaper", "update">; next: UpdateConfirmation<"diaper"> }>
-    | Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"diaper", "delete">; next: DeleteConfirmation<"diaper"> }>;
-  readonly health: Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"health", "create">; next: HealthCreateConfirmation }>
-    | Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"health", "update">; next: UpdateConfirmation<"health"> }>
-    | Readonly<{ type: "CONFIRMATION_REQUIRED"; owner: OperationOwner<"health", "delete">; next: DeleteConfirmation<"health"> }>;
-}
+type ConfirmationRequiredFor<C extends ConfirmationState<TrackerDomain>> = C extends ConfirmationState<TrackerDomain>
+  ? Readonly<{
+    type: "CONFIRMATION_REQUIRED";
+    owner: C["owner"];
+    next: C;
+    summary: C["decision"]["serviceSummary"];
+  }>
+  : never;
 
-type ConfirmationRequiredAction<D extends TrackerDomain> = ConfirmationRequiredActionByDomain[D];
+type ConfirmationRequiredAction<D extends TrackerDomain> = ConfirmationRequiredFor<ConfirmationState<D>>;
 
 type ConfirmationCancelledAction = Readonly<{
   type: "CONFIRMATION_CANCELLED";
@@ -444,6 +539,20 @@ type MutationRejectedAction<D extends TrackerDomain> = Readonly<{
   field?: string;
   message: string;
 }>;
+
+type MutationConflictAction = Readonly<{
+  type: "MUTATION_CONFLICT";
+  source: AnyMutationSubmitting;
+  conflictCode: ManualTrackerConflictCode;
+}>;
+
+type DiscardRequestedAction = {
+  [D in TrackerDomain]: Readonly<{
+    type: "DISCARD_REQUESTED";
+    prior: DiscardPriorByDomain[D];
+    decision: TrackerDiscardDecision<D, DiscardPriorByDomain[D], DiscardDestinationByDomain<D>>;
+  }>;
+}[TrackerDomain];
 
 type MutationCompletedAction<D extends TrackerDomain> = {
   [K in MutationKind]: Readonly<{
@@ -510,7 +619,17 @@ export type CorrelatedTrackerScreenAction = TrackerScreenActionByDomain[TrackerD
 export type GlobalTrackerScreenAction =
   | Readonly<{ type: "BLURRED"; focusSession: number }>
   | Readonly<{ type: "VALIDATION_FAILED"; field: string; message: string }>
-  | Readonly<{ type: "RETURN_TO_LIST" }>;
+  | Readonly<{ type: "RETURN_TO_LIST" }>
+  | MutationConflictAction
+  | DiscardRequestedAction
+  | Readonly<{
+    type: "DISCARD_CANCELLED";
+    decision: ScreenDiscardDecision;
+  }>
+  | Readonly<{
+    type: "DISCARD_COMPLETED";
+    decision: ScreenDiscardDecision;
+  }>;
 
 export type TrackerScreenAction = CorrelatedTrackerScreenAction | GlobalTrackerScreenAction;
 
@@ -572,6 +691,169 @@ export function correlatedAction<D extends TrackerDomain>(action: DomainAction<D
   return action as CorrelatedTrackerScreenAction;
 }
 
+export function listStartedAction<D extends TrackerDomain>(
+  source: TrackerScreenState,
+  next: OrdinaryListLoading<D>,
+): CorrelatedTrackerScreenAction;
+export function listStartedAction<D extends TrackerDomain>(
+  source: DiscardConfirmation,
+  next: OrdinaryListLoading<D>,
+  decision: ListDiscardDecisionForDestination<NoInfer<D>>,
+): CorrelatedTrackerScreenAction;
+export function listStartedAction<D extends TrackerDomain>(
+  source: TrackerScreenState,
+  next: OrdinaryListLoading<D>,
+  decision?: ListDiscardDecisionForDestination<D>,
+): CorrelatedTrackerScreenAction {
+  return { type: "LIST_STARTED", source, next, decision } as CorrelatedTrackerScreenAction;
+}
+
+export function listSucceededAction<D extends TrackerDomain>(
+  owner: ReadOwner<D, "list">,
+  fact: ListFact<NoInfer<D>>,
+): CorrelatedTrackerScreenAction {
+  return { type: "LIST_SUCCEEDED", owner, fact } as CorrelatedTrackerScreenAction;
+}
+
+export function listFailedAction<D extends TrackerDomain>(
+  owner: ReadOwner<D, "list">,
+): CorrelatedTrackerScreenAction {
+  return { type: "LIST_FAILED", owner } as CorrelatedTrackerScreenAction;
+}
+
+export function getStartedAction<D extends TrackerDomain>(
+  source: TrackerScreenState,
+  next: EditLoading<D>,
+): CorrelatedTrackerScreenAction;
+export function getStartedAction<D extends TrackerDomain>(
+  source: DiscardConfirmation,
+  next: EditLoading<D>,
+  decision: GetDiscardDecisionForDestination<NoInfer<D>>,
+): CorrelatedTrackerScreenAction;
+export function getStartedAction<D extends TrackerDomain>(
+  source: TrackerScreenState,
+  next: EditLoading<D>,
+  decision?: GetDiscardDecisionForDestination<D>,
+): CorrelatedTrackerScreenAction {
+  return { type: "GET_STARTED", source, next, decision } as CorrelatedTrackerScreenAction;
+}
+
+export function isListDiscardDecisionForDestination<D extends TrackerDomain>(
+  decision: ScreenDiscardDecision,
+  fact: ListFact<D>,
+): decision is ScreenDiscardDecision & ListDiscardDecisionForDestination<D> {
+  const destination = decision.destination;
+  return "kind" in destination
+    && (destination.kind === "domain" || destination.kind === "reload-list")
+    && destination.fact === fact;
+}
+
+export function isGetDiscardDecisionForDestination<D extends TrackerDomain>(
+  decision: ScreenDiscardDecision,
+  domain: D,
+  id: string,
+  prior: ListFact<D>,
+): decision is ScreenDiscardDecision & GetDiscardDecisionForDestination<D> {
+  const destination = decision.destination;
+  return "kind" in destination
+    && destination.kind === "reload-record"
+    && destination.domain === domain
+    && destination.id === id
+    && destination.prior === prior;
+}
+
+export function acceptedDiscardListStartedAction<D extends TrackerDomain>(
+  source: TrackerScreenState,
+  next: OrdinaryListLoading<D>,
+  decision: ListDiscardDecisionForDestination<NoInfer<D>>,
+): CorrelatedTrackerScreenAction | null {
+  if (source.tag !== "confirm.discard" || source.decision !== decision) return null;
+  const destination = decision.destination;
+  if (
+    !("kind" in destination)
+    || (destination.kind !== "domain" && destination.kind !== "reload-list")
+    || destination.fact !== next.prior
+  ) return null;
+  return { type: "LIST_STARTED", source, next, decision } as CorrelatedTrackerScreenAction;
+}
+
+export function acceptedDiscardGetStartedAction<D extends TrackerDomain>(
+  source: TrackerScreenState,
+  next: EditLoading<D>,
+  decision: GetDiscardDecisionForDestination<NoInfer<D>>,
+): CorrelatedTrackerScreenAction | null {
+  if (source.tag !== "confirm.discard" || source.decision !== decision) return null;
+  const destination = decision.destination;
+  if (
+    !("kind" in destination)
+    || destination.kind !== "reload-record"
+    || destination.domain !== next.owner.domain
+    || destination.id !== next.id
+    || destination.prior !== next.prior
+  ) return null;
+  return { type: "GET_STARTED", source, next, decision } as CorrelatedTrackerScreenAction;
+}
+
+export function getSucceededAction<D extends TrackerDomain>(
+  owner: ReadOwner<D, "get">,
+  editor: EditEditorSnapshot<NoInfer<D>>,
+): CorrelatedTrackerScreenAction {
+  return { type: "GET_SUCCEEDED", owner, editor } as CorrelatedTrackerScreenAction;
+}
+
+export function getFailedAction<D extends TrackerDomain>(
+  owner: ReadOwner<D, "get">,
+  message: string,
+): CorrelatedTrackerScreenAction {
+  return { type: "GET_FAILED", owner, message } as CorrelatedTrackerScreenAction;
+}
+
+export function getMissingReloadStartedAction<D extends TrackerDomain>(
+  owner: ReadOwner<D, "get">,
+  next: OrdinaryListLoading<NoInfer<D>>,
+): CorrelatedTrackerScreenAction {
+  return { type: "GET_MISSING_RELOAD_STARTED", owner, next } as CorrelatedTrackerScreenAction;
+}
+
+export function discardRequestedAction(decision: ScreenDiscardDecision): GlobalTrackerScreenAction {
+  return { type: "DISCARD_REQUESTED", prior: decision.prior, decision } as GlobalTrackerScreenAction;
+}
+
+export function createRequestedAction<D extends TrackerDomain>(
+  source: TrackerScreenState,
+  editor: CreateEditorSnapshot<D>,
+): CorrelatedTrackerScreenAction {
+  return { type: "CREATE_REQUESTED", source, editor } as CorrelatedTrackerScreenAction;
+}
+
+export function mutationRejectedAction<D extends TrackerDomain>(
+  owner: OperationOwner<D>,
+  message: string,
+  field?: string,
+): CorrelatedTrackerScreenAction {
+  return { type: "MUTATION_REJECTED", owner, field, message } as CorrelatedTrackerScreenAction;
+}
+
+export function normalizedNoopAction<D extends TrackerDomain>(
+  owner: OperationOwner<D, "update">,
+  editor: EditEditorSnapshot<NoInfer<D>>,
+): CorrelatedTrackerScreenAction {
+  return { type: "NORMALIZED_NOOP", owner, editor } as CorrelatedTrackerScreenAction;
+}
+
+export function operationRefreshSucceededAction<D extends TrackerDomain>(
+  owner: OperationOwner<D>,
+  fact: ListFact<NoInfer<D>>,
+): CorrelatedTrackerScreenAction {
+  return { type: "OPERATION_REFRESH_SUCCEEDED", owner, fact } as CorrelatedTrackerScreenAction;
+}
+
+export function operationRefreshFailedAction<D extends TrackerDomain>(
+  owner: OperationOwner<D>,
+): CorrelatedTrackerScreenAction {
+  return { type: "OPERATION_REFRESH_FAILED", owner } as CorrelatedTrackerScreenAction;
+}
+
 export function directCreateStartedAction(
   ...[owner, prior]: DirectCreateStartedArgs
 ): CorrelatedTrackerScreenAction {
@@ -597,6 +879,7 @@ export function updateConfirmationRequiredAction(
     type: "CONFIRMATION_REQUIRED",
     owner,
     next: Object.freeze({ tag: "confirm.update", owner, decision }),
+    summary: decision.serviceSummary,
   } as CorrelatedTrackerScreenAction;
 }
 
@@ -607,6 +890,7 @@ export function deleteConfirmationRequiredAction(
     type: "CONFIRMATION_REQUIRED",
     owner,
     next: Object.freeze({ tag: "confirm.delete", owner, decision }),
+    summary: decision.serviceSummary,
   } as CorrelatedTrackerScreenAction;
 }
 
@@ -642,6 +926,105 @@ export function operationRefreshStartedAction(
   } as CorrelatedTrackerScreenAction;
 }
 
+type DecisionControlRef = TrackerFocusRef<View>;
+
+function isDiscardPriorForDomain<D extends TrackerDomain>(
+  prior: DiscardPrior,
+  domain: D,
+): prior is DiscardPriorByDomain[D] {
+  return listDomain(prior) === domain;
+}
+
+function priorEditor(prior: DiscardPrior): AnyEditorSnapshot {
+  return "source" in prior ? prior.source.prior : prior.editor;
+}
+
+export function backDiscardDecision(
+  prior: DiscardPrior,
+  initiatingControlRef: DecisionControlRef,
+): ScreenDiscardDecision | null {
+  const editor = priorEditor(prior);
+  switch (editor.domain) {
+    case "growth": return isDiscardPriorForDomain(prior, "growth") ? Object.freeze({ kind: "discard", domain: "growth", prior, destination: editor.prior, initiatingControlRef }) : null;
+    case "feeding": return isDiscardPriorForDomain(prior, "feeding") ? Object.freeze({ kind: "discard", domain: "feeding", prior, destination: editor.prior, initiatingControlRef }) : null;
+    case "sleep": return isDiscardPriorForDomain(prior, "sleep") ? Object.freeze({ kind: "discard", domain: "sleep", prior, destination: editor.prior, initiatingControlRef }) : null;
+    case "diaper": return isDiscardPriorForDomain(prior, "diaper") ? Object.freeze({ kind: "discard", domain: "diaper", prior, destination: editor.prior, initiatingControlRef }) : null;
+    case "health": return isDiscardPriorForDomain(prior, "health") ? Object.freeze({ kind: "discard", domain: "health", prior, destination: editor.prior, initiatingControlRef }) : null;
+  }
+}
+
+export function domainDiscardDecision(
+  prior: DiscardPrior,
+  fact: AnyListFact,
+  initiatingControlRef: DecisionControlRef,
+): ScreenDiscardDecision | null {
+  const domain = listDomain(prior);
+  if (domain === fact.domain) return null;
+  switch (domain) {
+    case "growth":
+      if (!isDiscardPriorForDomain(prior, "growth")) return null;
+      switch (fact.domain) {
+        case "feeding": return Object.freeze({ kind: "discard", domain: "growth", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "sleep": return Object.freeze({ kind: "discard", domain: "growth", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "diaper": return Object.freeze({ kind: "discard", domain: "growth", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "health": return Object.freeze({ kind: "discard", domain: "growth", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "growth": return null;
+      }
+    case "feeding":
+      if (!isDiscardPriorForDomain(prior, "feeding")) return null;
+      switch (fact.domain) {
+        case "growth": return Object.freeze({ kind: "discard", domain: "feeding", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "sleep": return Object.freeze({ kind: "discard", domain: "feeding", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "diaper": return Object.freeze({ kind: "discard", domain: "feeding", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "health": return Object.freeze({ kind: "discard", domain: "feeding", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "feeding": return null;
+      }
+    case "sleep":
+      if (!isDiscardPriorForDomain(prior, "sleep")) return null;
+      switch (fact.domain) {
+        case "growth": return Object.freeze({ kind: "discard", domain: "sleep", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "feeding": return Object.freeze({ kind: "discard", domain: "sleep", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "diaper": return Object.freeze({ kind: "discard", domain: "sleep", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "health": return Object.freeze({ kind: "discard", domain: "sleep", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "sleep": return null;
+      }
+    case "diaper":
+      if (!isDiscardPriorForDomain(prior, "diaper")) return null;
+      switch (fact.domain) {
+        case "growth": return Object.freeze({ kind: "discard", domain: "diaper", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "feeding": return Object.freeze({ kind: "discard", domain: "diaper", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "sleep": return Object.freeze({ kind: "discard", domain: "diaper", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "health": return Object.freeze({ kind: "discard", domain: "diaper", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "diaper": return null;
+      }
+    case "health":
+      if (!isDiscardPriorForDomain(prior, "health")) return null;
+      switch (fact.domain) {
+        case "growth": return Object.freeze({ kind: "discard", domain: "health", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "feeding": return Object.freeze({ kind: "discard", domain: "health", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "sleep": return Object.freeze({ kind: "discard", domain: "health", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "diaper": return Object.freeze({ kind: "discard", domain: "health", prior, destination: Object.freeze({ kind: "domain", fact }), initiatingControlRef });
+        case "health": return null;
+      }
+  }
+}
+
+export function conflictDiscardDecision(
+  prior: ConflictState,
+  kind: "reload-list" | "reload-record",
+  initiatingControlRef: DecisionControlRef,
+): ScreenDiscardDecision | null {
+  const editor = prior.source.prior;
+  if (editor.mode !== "edit" || (kind === "reload-record" && prior.tag !== "conflict.stale")) return null;
+  switch (editor.domain) {
+    case "growth": return isDiscardPriorForDomain(prior, "growth") ? Object.freeze({ kind: "discard", domain: "growth", prior, destination: kind === "reload-list" ? Object.freeze({ kind, fact: editor.prior }) : Object.freeze({ kind, domain: "growth", id: editor.baseline.id, prior: editor.prior }), initiatingControlRef }) : null;
+    case "feeding": return isDiscardPriorForDomain(prior, "feeding") ? Object.freeze({ kind: "discard", domain: "feeding", prior, destination: kind === "reload-list" ? Object.freeze({ kind, fact: editor.prior }) : Object.freeze({ kind, domain: "feeding", id: editor.baseline.id, prior: editor.prior }), initiatingControlRef }) : null;
+    case "sleep": return isDiscardPriorForDomain(prior, "sleep") ? Object.freeze({ kind: "discard", domain: "sleep", prior, destination: kind === "reload-list" ? Object.freeze({ kind, fact: editor.prior }) : Object.freeze({ kind, domain: "sleep", id: editor.baseline.id, prior: editor.prior }), initiatingControlRef }) : null;
+    case "diaper": return isDiscardPriorForDomain(prior, "diaper") ? Object.freeze({ kind: "discard", domain: "diaper", prior, destination: kind === "reload-list" ? Object.freeze({ kind, fact: editor.prior }) : Object.freeze({ kind, domain: "diaper", id: editor.baseline.id, prior: editor.prior }), initiatingControlRef }) : null;
+    case "health": return isDiscardPriorForDomain(prior, "health") ? Object.freeze({ kind: "discard", domain: "health", prior, destination: kind === "reload-list" ? Object.freeze({ kind, fact: editor.prior }) : Object.freeze({ kind, domain: "health", id: editor.baseline.id, prior: editor.prior }), initiatingControlRef }) : null;
+  }
+}
+
 export function sameReadOwner(left: ReadOwner, right: ReadOwner): boolean {
   return left.mountEpoch === right.mountEpoch
     && left.generation === right.generation
@@ -669,11 +1052,15 @@ function listDomain(state: TrackerScreenState): TrackerDomain {
     case "confirm.healthCreate":
     case "confirm.update":
     case "confirm.delete": return state.decision.domain;
+    case "confirm.discard": return state.decision.domain;
     case "edit.loading":
     case "edit.error": return state.prior.domain;
     case "read.suspended": return state.request.prior.domain;
     case "mutation.submitting": return state.prior.domain;
     case "mutation.completed": return state.prior.domain;
+    case "conflict.stale":
+    case "conflict.notFound":
+    case "mutation.error": return state.source.prior.domain;
   }
 }
 
@@ -713,13 +1100,143 @@ function isRecordForDomain(domain: TrackerDomain, record: unknown): boolean {
   }
 }
 
+function discardDestinationMatches(prior: DiscardPrior, destination: DiscardDestination): boolean {
+  const editor = "source" in prior ? prior.source.prior : prior.editor;
+  if (!("kind" in destination)) return destination === editor.prior;
+  if (destination.kind === "domain") return destination.fact.domain !== editor.domain;
+  if (prior.tag !== "conflict.stale" && prior.tag !== "conflict.notFound") return false;
+  if (destination.kind === "reload-list") return destination.fact === editor.prior;
+  return editor.mode === "edit"
+    && destination.domain === editor.domain
+    && destination.id === editor.baseline.id
+    && destination.prior === editor.prior;
+}
+
+function discardPriorIsDirty(prior: DiscardPrior): boolean {
+  const editor = "source" in prior ? prior.source.prior : prior.editor;
+  switch (editor.domain) {
+    case "growth": return isDraftDirty("growth", editor.draft, editor.initialDraft);
+    case "feeding": return isDraftDirty("feeding", editor.draft, editor.initialDraft);
+    case "sleep": return isDraftDirty("sleep", editor.draft, editor.initialDraft);
+    case "diaper": return isDraftDirty("diaper", editor.draft, editor.initialDraft);
+    case "health": return isDraftDirty("health", editor.draft, editor.initialDraft);
+  }
+}
+
+function listStartAuthorized(
+  state: TrackerScreenState,
+  source: TrackerScreenState,
+  next: OrdinaryListLoading<TrackerDomain>,
+  decision: ScreenDiscardDecision | undefined,
+): boolean {
+  if (state !== source || next.owner.domain !== next.prior.domain) return false;
+  if (decision !== undefined) {
+    if (state.tag !== "confirm.discard" || state.decision !== decision) return false;
+    const destination = decision.destination;
+    return "kind" in destination
+      && (destination.kind === "domain" || destination.kind === "reload-list")
+      && destination.fact === next.prior;
+  }
+  if (state.tag === "conflict.stale" || state.tag === "conflict.notFound") {
+    return !discardPriorIsDirty(state) && next.prior === state.source.prior.prior;
+  }
+  if (state.tag === "create.editing" || state.tag === "edit.editing" || state.tag === "mutation.error") {
+    return !discardPriorIsDirty(state) && next.prior.domain !== listDomain(state);
+  }
+  return state.tag === "list.loading"
+    || state.tag === "list.ready.empty"
+    || state.tag === "list.ready.rows"
+    || state.tag === "list.error"
+    || state.tag === "read.suspended";
+}
+
+function getStartAuthorized(
+  state: TrackerScreenState,
+  source: TrackerScreenState,
+  next: EditLoading<TrackerDomain>,
+  decision: ScreenDiscardDecision | undefined,
+): boolean {
+  if (
+    state !== source
+    || next.owner.domain !== next.prior.domain
+    || next.owner.recordId !== next.id
+  ) return false;
+  if (decision !== undefined) {
+    if (state.tag !== "confirm.discard" || state.decision !== decision) return false;
+    const destination = decision.destination;
+    return "kind" in destination
+      && destination.kind === "reload-record"
+      && destination.domain === next.owner.domain
+      && destination.id === next.id
+      && destination.prior === next.prior;
+  }
+  if (state.tag === "conflict.stale") {
+    const editor = state.source.prior;
+    return !discardPriorIsDirty(state)
+      && editor.mode === "edit"
+      && editor.domain === next.owner.domain
+      && editor.baseline.id === next.id
+      && editor.prior === next.prior;
+  }
+  if (state.tag === "edit.error") return state.id === next.id && state.prior === next.prior;
+  if (state.tag === "read.suspended") {
+    return state.request.kind === "get"
+      && state.request.id === next.id
+      && state.request.prior === next.prior;
+  }
+  return (state.tag === "list.ready.empty" || state.tag === "list.ready.rows")
+    && state.fact === next.prior;
+}
+
+function confirmationMatchesSubmitting(
+  source: AnyMutationSubmitting,
+  owner: OperationOwner,
+  next: ConfirmationState<TrackerDomain>,
+  expectedSummary: ConfirmationState<TrackerDomain>["decision"]["serviceSummary"],
+): boolean {
+  if (
+    source.phase !== "probe"
+    || next.owner !== owner
+    || !sameOperationOwner(source.owner, owner)
+    || next.decision.serviceSummary !== expectedSummary
+    || next.decision.prior !== source.prior
+    || next.decision.domain !== owner.domain
+  ) return false;
+  if (next.tag === "confirm.healthCreate") {
+    const summary = next.decision.serviceSummary;
+    return owner.kind === "create"
+      && owner.domain === "health"
+      && source.prior.mode === "create"
+      && source.prior.domain === "health"
+      && next.decision.kind === "healthCreate"
+      && summary.action === "create"
+      && summary.domain === "health";
+  }
+  if (source.prior.mode !== "edit" || next.decision.baseline !== source.prior.baseline) return false;
+  const summary = next.decision.serviceSummary;
+  if (next.tag === "confirm.update") {
+    return owner.kind === "update"
+      && next.decision.kind === "update"
+      && summary.action === "update"
+      && summary.domain === owner.domain
+      && summary.id === source.prior.baseline.id
+      && summary.expectedUpdatedAt === source.prior.baseline.updatedAt;
+  }
+  return owner.kind === "delete"
+    && next.decision.kind === "delete"
+    && summary.action === "delete"
+    && summary.domain === owner.domain
+    && summary.id === source.prior.baseline.id
+    && summary.expectedUpdatedAt === source.prior.baseline.updatedAt;
+}
+
 export function trackerScreenReducer(
   state: TrackerScreenState,
   action: TrackerScreenAction,
 ): TrackerScreenState {
   switch (action.type) {
     case "LIST_STARTED":
-      if (action.next.owner.domain !== action.next.prior.domain) return state;
+      if (!listStartAuthorized(state, action.source, action.next, action.decision)) return state;
       return correlatedState(action.next);
     case "LIST_SUCCEEDED":
       if (
@@ -741,10 +1258,7 @@ export function trackerScreenReducer(
       ) return state;
       return correlatedState(Object.freeze({ tag: "list.error", kind: "initial", fact: state.prior }));
     case "GET_STARTED":
-      if (
-        action.next.owner.domain !== action.next.prior.domain
-        || action.next.owner.recordId !== action.next.id
-      ) return state;
+      if (!getStartAuthorized(state, action.source, action.next, action.decision)) return state;
       return correlatedState(action.next);
     case "GET_SUCCEEDED":
       if (
@@ -768,9 +1282,28 @@ export function trackerScreenReducer(
       ) return state;
       return correlatedState(action.next);
     case "CREATE_REQUESTED":
-      if (action.editor.mode !== "create" || action.editor.baseline !== null) return state;
+      if (
+        state !== action.source
+        || (state.tag !== "list.ready.empty" && state.tag !== "list.ready.rows")
+        || action.editor.mode !== "create"
+        || action.editor.baseline !== null
+        || action.editor.prior !== state.fact
+      ) return state;
       return correlatedState(Object.freeze({ tag: "create.editing", editor: action.editor }));
     case "DRAFT_CHANGED":
+      if (state.tag === "mutation.error") {
+        const editor = state.source.prior;
+        if (editor.domain !== action.domain || action.draft.domain !== action.domain) return state;
+        return editor.mode === "create"
+          ? correlatedState(Object.freeze({
+            tag: "create.editing",
+            editor: Object.freeze({ ...editor, draft: frozenDraft(action.draft), errors: Object.freeze({}) }),
+          }))
+          : correlatedState(Object.freeze({
+            tag: "edit.editing",
+            editor: Object.freeze({ ...editor, draft: frozenDraft(action.draft), errors: Object.freeze({}) }),
+          }));
+      }
       if (
         (state.tag !== "create.editing" && state.tag !== "edit.editing")
         || state.editor.domain !== action.domain
@@ -786,6 +1319,12 @@ export function trackerScreenReducer(
           editor: Object.freeze({ ...state.editor, draft: frozenDraft(action.draft), errors: Object.freeze({}) }),
         }));
     case "VALIDATION_FAILED":
+      if (state.tag === "mutation.error") {
+        return editorWithErrors(
+          state.source.prior,
+          Object.freeze({ ...state.source.prior.errors, [action.field]: action.message }),
+        );
+      }
       if (state.tag !== "create.editing" && state.tag !== "edit.editing") return state;
       return editorWithErrors(
         state.editor,
@@ -815,8 +1354,20 @@ export function trackerScreenReducer(
         && state.decision.prior === action.prior
         && state.decision.kind === (action.owner.kind === "create" ? "healthCreate" : action.owner.kind)
         && sameOperationOwner(state.owner, action.owner);
+      const startingFreshAfterError = state.tag === "mutation.error"
+        && state.source.prior === action.prior
+        && action.decision === undefined
+        && state.source.owner.domain === action.owner.domain
+        && state.source.owner.kind === action.owner.kind
+        && state.source.owner.mountEpoch === action.owner.mountEpoch
+        && action.owner.operationId > state.source.owner.operationId
+        && (action.owner.kind === "create"
+          ? action.owner.domain === "health"
+            ? action.phase === "probe"
+            : action.phase === undefined || action.phase === "direct"
+          : action.phase === "probe");
       if (
-        (!startingDirectCreate && !startingHealthCreateProbe && !startingEditProbe && !startingFromDecision)
+        (!startingDirectCreate && !startingHealthCreateProbe && !startingEditProbe && !startingFromDecision && !startingFreshAfterError)
         || action.owner.domain !== action.prior.domain
         || (action.owner.kind === "create") !== (action.prior.mode === "create")
         || (action.owner.kind !== "create") !== (action.prior.mode === "edit")
@@ -829,11 +1380,7 @@ export function trackerScreenReducer(
     case "CONFIRMATION_REQUIRED":
       if (
         state.tag !== "mutation.submitting"
-        || state.phase !== "probe"
-        || !sameOperationOwner(state.owner, action.owner)
-        || action.next.owner !== action.owner
-        || action.next.decision.prior !== state.prior
-        || action.next.decision.domain !== action.owner.domain
+        || !confirmationMatchesSubmitting(state, action.owner, action.next, action.summary)
       ) return state;
       return correlatedState(action.next);
     case "CONFIRMATION_CANCELLED": {
@@ -868,10 +1415,18 @@ export function trackerScreenReducer(
         || !sameOperationOwner(state.owner, action.owner)
         || state.prior.domain !== action.owner.domain
       ) return state;
-      return editorWithErrors(
-        state.prior,
-        Object.freeze({ ...state.prior.errors, [action.field ?? "form"]: action.message }),
-      );
+      return correlatedState(Object.freeze({
+        tag: "mutation.error",
+        source: state,
+        field: action.field,
+        message: action.message,
+      }));
+    case "MUTATION_CONFLICT":
+      if (state !== action.source || state.tag !== "mutation.submitting" || state.owner.kind === "create") return state;
+      return correlatedState(Object.freeze({
+        tag: action.conflictCode === "stale_write" ? "conflict.stale" : "conflict.notFound",
+        source: action.source,
+      }));
     case "MUTATION_COMPLETED": {
       if (
         state.tag !== "mutation.submitting"
@@ -965,13 +1520,44 @@ export function trackerScreenReducer(
         }));
       }
       if (state.tag === "create.editing" || state.tag === "edit.editing") {
+        if (discardPriorIsDirty(state)) return state;
         return correlatedState(Object.freeze({
           tag: state.editor.prior.rows.length === 0 ? "list.ready.empty" : "list.ready.rows",
           fact: state.editor.prior,
         }));
       }
+      if (state.tag === "mutation.error") {
+        if (discardPriorIsDirty(state)) return state;
+        return correlatedState(Object.freeze({
+          tag: state.source.prior.prior.rows.length === 0 ? "list.ready.empty" : "list.ready.rows",
+          fact: state.source.prior.prior,
+        }));
+      }
       return state;
     }
+    case "DISCARD_REQUESTED":
+      if (
+        state !== action.prior
+        || action.decision.prior !== action.prior
+        || action.decision.kind !== "discard"
+        || action.decision.domain !== listDomain(state)
+        || !discardPriorIsDirty(state)
+        || !discardDestinationMatches(action.prior, action.decision.destination)
+      ) return state;
+      return correlatedState(Object.freeze({ tag: "confirm.discard", decision: action.decision }));
+    case "DISCARD_CANCELLED":
+      if (state.tag !== "confirm.discard" || state.decision !== action.decision) return state;
+      return action.decision.prior;
+    case "DISCARD_COMPLETED":
+      if (state.tag !== "confirm.discard" || state.decision !== action.decision) return state;
+      if (!("kind" in action.decision.destination)) {
+        const fact = action.decision.destination;
+        return correlatedState(Object.freeze({
+          tag: fact.rows.length === 0 ? "list.ready.empty" : "list.ready.rows",
+          fact,
+        }));
+      }
+      return state;
   }
 }
 

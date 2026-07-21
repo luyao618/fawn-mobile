@@ -4,6 +4,8 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import { ScrollView } from "react-native";
 
 import type { ManualTrackerServicePort } from "../../../../src/application/tracker/manualTrackerService";
+import { ManualTrackerConflictError } from "../../../../src/application/tracker/manualTrackerService";
+import { RuntimeClosingError } from "../../../../src/application/bootstrap/appRuntime";
 import type {
   TrackerCreateInputByDomain,
   TrackerDomain,
@@ -23,6 +25,22 @@ import {
   type TrackerScreenAction,
   type TrackerScreenState,
 } from "../../../../src/features/tracker/trackerScreenState";
+
+const mockTrackerReducerObserver = jest.fn(
+  (_action: TrackerScreenAction, _state: TrackerScreenState): void => undefined,
+);
+
+jest.mock("../../../../src/features/tracker/trackerScreenState", () => {
+  const actual = jest.requireActual("../../../../src/features/tracker/trackerScreenState");
+  return {
+    ...actual,
+    trackerScreenReducer: (state: TrackerScreenState, action: TrackerScreenAction) => {
+      const next = actual.trackerScreenReducer(state, action) as TrackerScreenState;
+      mockTrackerReducerObserver(action, next);
+      return next;
+    },
+  };
+});
 
 const mismatchedCreateDraft = Object.freeze({
   domain: "feeding" as const,
@@ -281,6 +299,63 @@ test("switching domains starts only the selected-domain read and ignores the old
   expect(screen.queryByText(/体重 7200/)).toBeNull();
 });
 
+test("a rejected stale get cannot invalidate an accepted pending list", async () => {
+  const feeding = deferred<readonly TrackerRecordByDomain["feeding"][]>();
+  const list = jest.fn((domain: TrackerDomain) => domain === "growth"
+    ? Promise.resolve(Object.freeze([records.growth]))
+    : feeding.promise);
+  const getById = jest.fn(async () => records.growth);
+  const service = createServiceMock({
+    list: list as ManualTrackerServicePort["list"],
+    getById: getById as ManualTrackerServicePort["getById"],
+  });
+  renderTracker(service);
+  const staleRow = await screen.findByRole("button", { name: /生长记录，/ });
+
+  fireEvent.press(screen.getByRole("tab", { name: "喂养" }));
+  expect(list.mock.calls).toEqual([["growth", 100], ["feeding", 100]]);
+  fireEvent.press(staleRow);
+  await act(async () => {
+    jest.runOnlyPendingTimers();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(getById).not.toHaveBeenCalled();
+
+  await act(async () => feeding.resolve(Object.freeze([records.feeding])));
+  expect(screen.getByRole("header", { name: "喂养记录" })).toBeTruthy();
+  expect(screen.getByText("配方奶 · 量 0 毫升")).toBeTruthy();
+});
+
+test("rejected stale list and get callbacks cannot invalidate an accepted pending get", async () => {
+  const selected = deferred<TrackerRecordByDomain["growth"] | null>();
+  const list = jest.fn(async (domain: TrackerDomain) => domain === "growth" ? Object.freeze([records.growth]) : Object.freeze([]));
+  const getById = jest.fn(() => selected.promise);
+  const service = createServiceMock({
+    list: list as ManualTrackerServicePort["list"],
+    getById: getById as ManualTrackerServicePort["getById"],
+  });
+  renderTracker(service);
+  const staleRow = await screen.findByRole("button", { name: /生长记录，/ });
+  const staleDomain = screen.getByRole("tab", { name: "健康" });
+
+  fireEvent.press(staleRow);
+  expect(getById).toHaveBeenCalledTimes(1);
+  fireEvent.press(staleDomain);
+  fireEvent.press(staleRow);
+  await act(async () => {
+    jest.runOnlyPendingTimers();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(list.mock.calls).toEqual([["growth", 100]]);
+  expect(getById.mock.calls).toEqual([["growth", records.growth.id]]);
+
+  await act(async () => selected.resolve(records.growth));
+  expect(screen.getByRole("header", { name: "编辑生长记录" })).toBeTruthy();
+  expect(screen.getByLabelText("体重（克）").props.value).toBe("7200");
+});
+
 test("blur invalidates an ordinary list owner before its completion can commit", async () => {
   const older = deferred<readonly TrackerRecordByDomain["growth"][]>();
   const current = deferred<readonly TrackerRecordByDomain["growth"][]>();
@@ -338,6 +413,8 @@ test("list read failure with no committed rows offers only read retry", async ()
   expect(list.mock.calls).toEqual([["growth", 100], ["growth", 100]]);
   expect(service.getById).not.toHaveBeenCalled();
   expect(service.create).not.toHaveBeenCalled();
+  expect(service.update).not.toHaveBeenCalled();
+  expect(service.delete).not.toHaveBeenCalled();
 });
 
 test("edit loading disables back until get settles, and failure offers retry plus return without a stale draft", async () => {
@@ -810,4 +887,426 @@ test("the reducer rejects mismatched mutation owner, prior identity, and domain 
       success: "生长记录已保存",
     }),
   })).toBe(submitting);
+});
+
+test("dirty create back is interlocked, continue restores exact editor, and discard restores exact list without reads or writes", async () => {
+  const list = jest.fn(async () => []);
+  const service = createServiceMock({ list: list as ManualTrackerServicePort["list"] });
+  renderTracker(service);
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  const editor = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  expect(editor.tag).toBe("create.editing");
+
+  fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+  expect(await screen.findByRole("header", { name: "放弃未保存的更改？" })).toBeTruthy();
+  const discard = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  expect(discard.tag).toBe("confirm.discard");
+  if (discard.tag !== "confirm.discard" || editor.tag !== "create.editing") throw new Error("expected discard");
+  expect(discard.decision.prior).toBe(editor);
+  expect(discard.decision.destination).toBe(editor.editor.prior);
+  expect(Object.isFrozen(discard.decision)).toBe(true);
+  expect(screen.queryByRole("tab")).toBeNull();
+  expect(list).toHaveBeenCalledTimes(1);
+
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  expect(mockTrackerReducerObserver.mock.calls.at(-1)?.[1]).toBe(editor);
+  expect(screen.getByLabelText("体重（克）").props.value).toBe("7200");
+  fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+  fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+  await screen.findByRole("header", { name: "生长记录" });
+  expect(list).toHaveBeenCalledTimes(1);
+  expect(service.getById).not.toHaveBeenCalled();
+  expect(service.create).not.toHaveBeenCalled();
+  expect(service.update).not.toHaveBeenCalled();
+  expect(service.delete).not.toHaveBeenCalled();
+});
+
+test("dirty domain switch freezes its destination and performs no premature read", async () => {
+  const list = jest.fn(async () => []);
+  const service = createServiceMock({ list: list as ManualTrackerServicePort["list"] });
+  renderTracker(service);
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("tab", { name: "健康" }));
+  expect(await screen.findByRole("header", { name: "放弃未保存的更改？" })).toBeTruthy();
+  expect(list.mock.calls).toEqual([["growth", 100]]);
+  fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+  await screen.findByText("还没有健康记录");
+  expect(list.mock.calls).toEqual([["growth", 100], ["health", 100]]);
+  expect(service.create).not.toHaveBeenCalled();
+  expect(service.update).not.toHaveBeenCalled();
+  expect(service.delete).not.toHaveBeenCalled();
+});
+
+test.each([
+  [new RuntimeClosingError(), "本机记录服务暂不可用，请返回后重试。"],
+  [new Error("SQL tracker_records growth-private-id 2026-07-20T00:02:00.000Z"), "保存失败，本机记录没有更改。"],
+  [{ name: "ManualTrackerConflictError", code: "stale_write", message: "private create impostor" }, "保存失败，本机记录没有更改。"],
+] as const)("classifies direct create failures privately", async (failure, copy) => {
+  const create = jest.fn(async () => { throw failure; });
+  const service = createServiceMock({ create: create as ManualTrackerServicePort["create"] });
+  renderTracker(service);
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(copy);
+  expect(screen.queryByText(/tracker_records|growth-private-id|updatedAt|SQL/)).toBeNull();
+  expect(create).toHaveBeenCalledTimes(1);
+});
+
+test("same-domain selection is a no-op in clean, dirty, and mutation-error editors", async () => {
+  const create = jest.fn()
+    .mockRejectedValueOnce(new Error("private failure"));
+  const list = jest.fn(async () => []);
+  const service = createServiceMock({ create: create as ManualTrackerServicePort["create"], list });
+  renderTracker(service);
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+
+  fireEvent.press(screen.getByRole("tab", { name: "生长" }));
+  expect(screen.getByRole("header", { name: "新增生长记录" })).toBeTruthy();
+  expect(list).toHaveBeenCalledTimes(1);
+
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  const dirty = mockTrackerReducerObserver.mock.calls.at(-1)?.[1];
+  fireEvent.press(screen.getByRole("tab", { name: "生长" }));
+  expect(mockTrackerReducerObserver.mock.calls.at(-1)?.[1]).toBe(dirty);
+  expect(screen.queryByRole("header", { name: "放弃未保存的更改？" })).toBeNull();
+
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  await screen.findByText("保存失败，本机记录没有更改。");
+  const failed = mockTrackerReducerObserver.mock.calls.at(-1)?.[1];
+  fireEvent.press(screen.getByRole("tab", { name: "生长" }));
+  expect(mockTrackerReducerObserver.mock.calls.at(-1)?.[1]).toBe(failed);
+  expect(create).toHaveBeenCalledTimes(1);
+  expect(list).toHaveBeenCalledTimes(1);
+});
+
+test.each(["back", "domain"] as const)("restoring create defaults makes %s clean without losing the original list fact", async (route) => {
+  const rows = Object.freeze([records.growth]);
+  const list = jest.fn(async (domain: TrackerDomain) => domain === "growth" ? rows : []);
+  const service = createServiceMock({ list: list as ManualTrackerServicePort["list"] });
+  renderTracker(service);
+  await screen.findByRole("button", { name: /生长记录，/ });
+  const ready = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "");
+
+  if (route === "back") {
+    fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+    expect(screen.queryByRole("header", { name: "放弃未保存的更改？" })).toBeNull();
+    expect(screen.getByRole("button", { name: /生长记录，/ })).toBeTruthy();
+    const restored = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    expect(restored.tag === "list.ready.rows" ? restored.fact : null).toBe(ready.tag === "list.ready.rows" ? ready.fact : null);
+    expect(list).toHaveBeenCalledTimes(1);
+  } else {
+    fireEvent.press(screen.getByRole("tab", { name: "健康" }));
+    await screen.findByText("还没有健康记录");
+    expect(screen.queryByRole("header", { name: "放弃未保存的更改？" })).toBeNull();
+    expect(list.mock.calls).toEqual([["growth", 100], ["health", 100]]);
+  }
+});
+
+test.each(["back", "domain"] as const)("pristine create %s navigation is clean and preserves the exact frozen source fact", async (route) => {
+  const rows = Object.freeze([records.growth]);
+  const healthRows = Object.freeze([]);
+  const list = jest.fn(async (domain: TrackerDomain) => domain === "growth" ? rows : healthRows);
+  const service = createServiceMock({ list: list as ManualTrackerServicePort["list"] });
+  renderTracker(service);
+  await screen.findByRole("button", { name: /生长记录，/ });
+  const ready = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (ready.tag !== "list.ready.rows") throw new Error("expected exact growth rows");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  const editing = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (editing.tag !== "create.editing") throw new Error("expected pristine create");
+  expect(editing.editor.draft).toStrictEqual(editing.editor.initialDraft);
+  expect(editing.editor.prior).toBe(ready.fact);
+  expect(editing.editor.prior.rows).toBe(rows);
+  expect(editing.editor.prior.rows[0]).toBe(records.growth);
+
+  fireEvent.press(route === "back"
+    ? screen.getByRole("button", { name: "返回生长列表" })
+    : screen.getByRole("tab", { name: "健康" }));
+  expect(screen.queryByRole("header", { name: "放弃未保存的更改？" })).toBeNull();
+  if (route === "back") {
+    const restored = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (restored.tag !== "list.ready.rows") throw new Error("expected restored growth rows");
+    expect(restored.fact).toBe(ready.fact);
+    expect(restored.fact.rows).toBe(rows);
+    expect(restored.fact.rows[0]).toBe(records.growth);
+  } else {
+    await screen.findByText("还没有健康记录");
+    const healthReady = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (healthReady.tag !== "list.ready.empty") throw new Error("expected exact empty health list");
+    expect(healthReady.fact.domain).toBe("health");
+    expect(healthReady.fact.rows).toBe(healthRows);
+    expect(list.mock.calls).toEqual([["growth", 100], ["health", 100]]);
+  }
+  expect(service.create).not.toHaveBeenCalled();
+  expect(service.update).not.toHaveBeenCalled();
+  expect(service.delete).not.toHaveBeenCalled();
+});
+
+test.each(["back", "domain"] as const)("clean edit %s navigation ignores hidden metadata and retains exact list and row identity", async (route) => {
+  const rows = Object.freeze([records.growth]);
+  const healthRows = Object.freeze([]);
+  const list = jest.fn(async (domain: TrackerDomain) => domain === "growth" ? rows : healthRows);
+  const service = createServiceMock({
+    list: list as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+  });
+  renderTracker(service);
+  fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
+  await screen.findByRole("header", { name: "编辑生长记录" });
+  const editing = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (editing.tag !== "edit.editing") throw new Error("expected clean edit");
+  expect(editing.editor.draft).toStrictEqual(editing.editor.initialDraft);
+  expect(editing.editor.baseline).toBe(records.growth);
+  expect(editing.editor.baseline.updatedAt).toBe(baseMetadata.updatedAt);
+  expect(editing.editor.prior.rows).toBe(rows);
+
+  fireEvent.press(route === "back"
+    ? screen.getByRole("button", { name: "返回生长列表" })
+    : screen.getByRole("tab", { name: "健康" }));
+  expect(screen.queryByRole("header", { name: "放弃未保存的更改？" })).toBeNull();
+  if (route === "back") {
+    const restored = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (restored.tag !== "list.ready.rows") throw new Error("expected exact restored rows");
+    expect(restored.fact).toBe(editing.editor.prior);
+    expect(restored.fact.rows).toBe(rows);
+    expect(restored.fact.rows[0]).toBe(records.growth);
+  } else {
+    await screen.findByText("还没有健康记录");
+    const healthReady = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (healthReady.tag !== "list.ready.empty") throw new Error("expected exact empty health list");
+    expect(healthReady.fact.domain).toBe("health");
+    expect(healthReady.fact.rows).toBe(healthRows);
+    expect(list.mock.calls).toEqual([["growth", 100], ["health", 100]]);
+  }
+  expect(service.create).not.toHaveBeenCalled();
+  expect(service.update).not.toHaveBeenCalled();
+  expect(service.delete).not.toHaveBeenCalled();
+});
+
+test.each(["back", "domain"] as const)("dirty edit %s freezes exact editor and destination identities across continue and accept", async (route) => {
+  const rows = Object.freeze([records.growth]);
+  const list = jest.fn(async (domain: TrackerDomain) => domain === "growth" ? rows : Object.freeze([]));
+  const service = createServiceMock({
+    list: list as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+  });
+  renderTracker(service);
+  fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
+  await screen.findByRole("header", { name: "编辑生长记录" });
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  const editor = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (editor.tag !== "edit.editing") throw new Error("expected dirty edit");
+  const initiate = () => fireEvent.press(route === "back"
+    ? screen.getByRole("button", { name: "返回生长列表" })
+    : screen.getByRole("tab", { name: "健康" }));
+
+  initiate();
+  const first = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (first.tag !== "confirm.discard") throw new Error("expected dirty discard");
+  expect(first.decision.prior).toBe(editor);
+  if (first.decision.prior.tag !== "edit.editing") throw new Error("expected exact edit prior");
+  expect(first.decision.prior.editor.draft).toBe(editor.editor.draft);
+  expect(first.decision.prior.editor.initialDraft).toBe(editor.editor.initialDraft);
+  expect(first.decision.prior.editor.baseline).toBe(records.growth);
+  expect(first.decision.prior.editor.baseline.updatedAt).toBe(baseMetadata.updatedAt);
+  expect(first.decision.prior.editor.prior.rows).toBe(rows);
+  const destination = first.decision.destination;
+  const controlRef = first.decision.initiatingControlRef;
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  expect(mockTrackerReducerObserver.mock.calls.at(-1)?.[1]).toBe(editor);
+  expect(screen.getByLabelText("体重（克）").props.value).toBe("7300");
+
+  initiate();
+  const second = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (second.tag !== "confirm.discard") throw new Error("expected repeated dirty discard");
+  expect(second.decision.initiatingControlRef).toBe(controlRef);
+  expect(second.decision.destination).toBe(destination);
+  if (route === "domain") expect(list).toHaveBeenCalledTimes(1);
+  fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+  if (route === "back") {
+    const restored = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (restored.tag !== "list.ready.rows") throw new Error("expected restored rows");
+    expect(restored.fact).toBe(editor.editor.prior);
+    expect(restored.fact.rows).toBe(rows);
+  } else {
+    await screen.findByText("还没有健康记录");
+    expect(list.mock.calls).toEqual([["growth", 100], ["health", 100]]);
+    const acceptedStart = mockTrackerReducerObserver.mock.calls.find((call) => (
+      call[0].type === "LIST_STARTED"
+      && "decision" in call[0]
+      && call[0].decision === second.decision
+    ));
+    expect(acceptedStart).toBeDefined();
+    const destinationFact = "kind" in destination && (destination.kind === "domain" || destination.kind === "reload-list")
+      ? destination.fact
+      : null;
+    expect(acceptedStart?.[1].tag === "list.loading" ? acceptedStart[1].prior : null).toBe(destinationFact);
+  }
+  expect(service.create).not.toHaveBeenCalled();
+  expect(service.update).not.toHaveBeenCalled();
+  expect(service.delete).not.toHaveBeenCalled();
+});
+
+test("initiating controls use pairwise distinct refs while each control keeps its ref across retries", async () => {
+  const input = Object.freeze({
+    measurementDate: records.growth.measurementDate,
+    weightG: 7300,
+    heightCm: records.growth.heightCm,
+    headCm: records.growth.headCm,
+    weightPercentile: records.growth.weightPercentile,
+    heightPercentile: records.growth.heightPercentile,
+    headPercentile: records.growth.headPercentile,
+    notes: records.growth.notes,
+  });
+  const summary = Object.freeze({
+    action: "update" as const,
+    domain: "growth" as const,
+    id: records.growth.id,
+    expectedUpdatedAt: records.growth.updatedAt,
+    input,
+  });
+  const confirmation = Object.freeze({ status: "confirmation_required" as const, summary });
+  const deleteSummary = Object.freeze({
+    action: "delete" as const,
+    domain: "growth" as const,
+    id: records.growth.id,
+    expectedUpdatedAt: records.growth.updatedAt,
+  });
+  const deleteConfirmation = Object.freeze({ status: "confirmation_required" as const, summary: deleteSummary });
+  const update = jest.fn()
+    .mockResolvedValueOnce(confirmation)
+    .mockResolvedValueOnce(confirmation)
+    .mockRejectedValueOnce(new ManualTrackerConflictError("stale_write"));
+  const remove = jest.fn()
+    .mockResolvedValueOnce(deleteConfirmation)
+    .mockResolvedValueOnce(deleteConfirmation);
+  const service = createServiceMock({
+    list: jest.fn(async (domain) => domain === "growth" ? Object.freeze([records.growth]) : Object.freeze([])) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+    update: update as ManualTrackerServicePort["update"],
+    delete: remove as ManualTrackerServicePort["delete"],
+  });
+  renderTracker(service);
+  fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
+  await screen.findByRole("header", { name: "编辑生长记录" });
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+
+  const saveRef = await (async () => {
+    fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+    await screen.findByRole("header", { name: "确认保存修改" });
+    const first = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (first.tag !== "confirm.update") throw new Error("expected first save confirmation");
+    fireEvent.press(screen.getByRole("button", { name: "返回修改" }));
+    fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+    await screen.findByRole("header", { name: "确认保存修改" });
+    const second = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (second.tag !== "confirm.update") throw new Error("expected second save confirmation");
+    expect(second.decision.initiatingControlRef).toBe(first.decision.initiatingControlRef);
+    fireEvent.press(screen.getByRole("button", { name: "返回修改" }));
+    return first.decision.initiatingControlRef;
+  })();
+
+  const deleteRef = await (async () => {
+    fireEvent.press(screen.getByRole("button", { name: "删除这条记录" }));
+    await screen.findByRole("header", { name: "确认删除这条生长记录" });
+    const first = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (first.tag !== "confirm.delete") throw new Error("expected first delete confirmation");
+    fireEvent.press(screen.getByRole("button", { name: "取消" }));
+    fireEvent.press(screen.getByRole("button", { name: "删除这条记录" }));
+    await screen.findByRole("header", { name: "确认删除这条生长记录" });
+    const second = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (second.tag !== "confirm.delete") throw new Error("expected second delete confirmation");
+    expect(second.decision.initiatingControlRef).toBe(first.decision.initiatingControlRef);
+    fireEvent.press(screen.getByRole("button", { name: "取消" }));
+    return first.decision.initiatingControlRef;
+  })();
+
+  const captureDiscardRef = (control: () => void) => {
+    control();
+    const first = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (first.tag !== "confirm.discard") throw new Error("expected first discard confirmation");
+    fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+    control();
+    const second = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+    if (second.tag !== "confirm.discard") throw new Error("expected second discard confirmation");
+    expect(second.decision.initiatingControlRef).toBe(first.decision.initiatingControlRef);
+    fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+    return first.decision.initiatingControlRef;
+  };
+
+  const backRef = captureDiscardRef(() => fireEvent.press(screen.getByRole("button", { name: "返回生长列表" })));
+  const domainRefs = ["喂养", "睡眠", "大小便", "健康"].map((name) => (
+    captureDiscardRef(() => fireEvent.press(screen.getByRole("tab", { name })))
+  ));
+
+  fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+  await screen.findByRole("header", { name: "记录冲突" });
+  const conflictReloadRef = captureDiscardRef(() => fireEvent.press(screen.getByRole("button", { name: "重新读取记录" })));
+  const conflictListRef = captureDiscardRef(() => fireEvent.press(screen.getByRole("button", { name: "返回列表" })));
+
+  const refs = [saveRef, deleteRef, backRef, ...domainRefs, conflictReloadRef, conflictListRef];
+  expect(new Set(refs).size).toBe(refs.length);
+  expect(update).toHaveBeenCalledTimes(3);
+  expect(remove).toHaveBeenCalledTimes(2);
+});
+
+test("dirty edit survives bottom-tab blur/refocus with exact draft, baseline, token, rows, and prior identities", async () => {
+  const rows = Object.freeze([records.growth]);
+  const service = createServiceMock({
+    list: jest.fn(async () => rows) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+  });
+  renderTracker(service);
+  fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
+  await screen.findByRole("header", { name: "编辑生长记录" });
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  const before = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (before.tag !== "edit.editing") throw new Error("expected edit");
+  blurTracker();
+  refocusTracker();
+  const after = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  expect(after).toBe(before);
+  expect(after.tag === "edit.editing" ? after.editor.draft : null).toBe(before.editor.draft);
+  expect(before.editor.initialDraft).not.toBe(before.editor.draft);
+  expect(before.editor.baseline).toBe(records.growth);
+  expect(before.editor.baseline.updatedAt).toBe(records.growth.updatedAt);
+  expect(before.editor.prior.rows).toBe(rows);
+  expect(screen.getByLabelText("体重（克）").props.value).toBe("7300");
+});
+
+test("a queued record-start callback rejected from a dirty editor performs zero service reads", async () => {
+  const rows = Object.freeze([records.growth]);
+  const getById = jest.fn(async () => records.growth);
+  const service = createServiceMock({
+    list: jest.fn(async () => rows) as ManualTrackerServicePort["list"],
+    getById: getById as ManualTrackerServicePort["getById"],
+  });
+  renderTracker(service);
+  const queuedRow = await screen.findByRole("button", { name: /生长记录，/ });
+  const queuedStart = () => fireEvent.press(queuedRow);
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  const dirty = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (dirty.tag !== "create.editing") throw new Error("expected dirty create");
+
+  act(() => queuedStart());
+  await act(async () => {
+    jest.runOnlyPendingTimers();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(mockTrackerReducerObserver.mock.calls.at(-1)?.[1]).toBe(dirty);
+  expect(getById).not.toHaveBeenCalled();
+  expect(screen.getByRole("header", { name: "新增生长记录" })).toBeTruthy();
 });
