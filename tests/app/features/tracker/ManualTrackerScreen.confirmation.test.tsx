@@ -255,10 +255,8 @@ test("rejected missing-record reload transition suppresses its fallback list", a
   });
   fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
   expect(getById).toHaveBeenCalledTimes(1);
-  await act(async () => {
-    missingRecord.resolve(null);
-    await rejectedReloadSettled.promise;
-  });
+  missingRecord.resolve(null);
+  await rejectedReloadSettled.promise;
   expect(mockTrackerReducerRejector).toHaveBeenCalledWith(
     expect.objectContaining({ type: "GET_MISSING_RELOAD_STARTED" }),
     expect.objectContaining({ tag: "edit.loading" }),
