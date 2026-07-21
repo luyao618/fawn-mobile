@@ -79,6 +79,40 @@ export type AnyEditorSnapshot = {
   [D in TrackerDomain]: CreateEditorSnapshot<D> | EditEditorSnapshot<D>;
 }[TrackerDomain];
 
+export type InstantDomain = "feeding" | "sleep" | "diaper";
+
+export type AnyInstantEditorSnapshot = {
+  [D in InstantDomain]: CreateEditorSnapshot<D> | EditEditorSnapshot<D>;
+}[InstantDomain];
+
+export type ExactEditableState<D extends InstantDomain> = {
+  [Domain in D]:
+    | Readonly<{ tag: "create.editing"; editor: CreateEditorSnapshot<Domain>; notice?: string }>
+    | Readonly<{ tag: "edit.editing"; editor: EditEditorSnapshot<Domain>; notice?: string }>;
+}[D];
+
+export type ZoneEntryIntent<D extends InstantDomain> =
+  | Readonly<{ kind: "list-load"; fact: ListFact<D>; notice?: string }>
+  | Readonly<{ kind: "list-restore"; fact: ListFact<D> }>
+  | Readonly<{ kind: "create"; fact: ListFact<D> }>
+  | Readonly<{ kind: "get"; id: string; fact: ListFact<D> }>;
+
+export type ZoneBlockedEntry<D extends InstantDomain> = Readonly<{
+  tag: "zone.blocked.entry";
+  domain: D;
+  intent: ZoneEntryIntent<D>;
+}>;
+
+export type ZoneBlockedSave<D extends InstantDomain> = Readonly<{
+  tag: "zone.blocked.save";
+  domain: D;
+  source: ExactEditableState<D>;
+}>;
+
+export type ZoneBlockedState = {
+  [D in InstantDomain]: ZoneBlockedEntry<D> | ZoneBlockedSave<D>;
+}[InstantDomain];
+
 export type OrdinaryListLoading<D extends TrackerDomain> = Readonly<{
   tag: "list.loading";
   source: "ordinary";
@@ -316,10 +350,12 @@ export type ScreenTrackerDecision =
   | { [D in TrackerDomain]: TrackerDeleteDecision<D, EditEditorSnapshot<D>> }[TrackerDomain]
   | ScreenDiscardDecision;
 
-type DiscardConfirmation = Readonly<{
-  tag: "confirm.discard";
-  decision: ScreenDiscardDecision;
-}>;
+type DiscardConfirmation = {
+  [D in TrackerDomain]: Readonly<{
+    tag: "confirm.discard";
+    decision: TrackerDiscardDecision<D, DiscardPriorByDomain[D], DiscardDestinationByDomain<D>>;
+  }>;
+}[TrackerDomain];
 
 type MutationCompleted<D extends TrackerDomain> = {
   [K in MutationKind]: Readonly<{
@@ -353,7 +389,7 @@ export interface TrackerScreenStateByDomain {
 }
 
 export type CorrelatedTrackerScreenState = TrackerScreenStateByDomain[TrackerDomain];
-export type TrackerScreenState = CorrelatedTrackerScreenState | ConflictState | MutationError | DiscardConfirmation;
+export type TrackerScreenState = CorrelatedTrackerScreenState | ConflictState | MutationError | DiscardConfirmation | ZoneBlockedState;
 
 export type ListDiscardDecisionForDestination<D extends TrackerDomain> = {
   [P in TrackerDomain]: TrackerDiscardDecision<
@@ -616,10 +652,132 @@ export interface TrackerScreenActionByDomain {
 }
 
 export type CorrelatedTrackerScreenAction = TrackerScreenActionByDomain[TrackerDomain];
+export type DecisionlessZoneGetSource<D extends InstantDomain> =
+  | ListReady<D>
+  | EditError<D>
+  | SuspendedRead<D>
+  | ConflictStateByDomain[D]
+  | ZoneBlockedEntry<D>;
+
+type ZoneListRestoreDecisionForDestination<D extends InstantDomain> = TrackerDiscardDecision<
+  D,
+  DiscardPriorByDomain[D],
+  ListFact<D>
+>;
+
+type ZoneListLoadIntent<D extends InstantDomain> = Extract<ZoneEntryIntent<D>, Readonly<{ kind: "list-load" }>>;
+type ZoneListRestoreIntent<D extends InstantDomain> = Extract<ZoneEntryIntent<D>, Readonly<{ kind: "list-restore" }>>;
+type ZoneCreateIntent<D extends InstantDomain> = Extract<ZoneEntryIntent<D>, Readonly<{ kind: "create" }>>;
+type ZoneGetIntent<D extends InstantDomain> = Extract<ZoneEntryIntent<D>, Readonly<{ kind: "get" }>>;
+
+type ZoneEntryBlockedArgs = {
+  [D in InstantDomain]:
+    | readonly [source: TrackerScreenState, domain: D, intent: ZoneListLoadIntent<D>, decision?: undefined]
+    | readonly [source: ListReady<D>, domain: D, intent: ZoneCreateIntent<D>, decision?: undefined]
+    | readonly [source: DecisionlessZoneGetSource<D>, domain: D, intent: ZoneGetIntent<D>, decision?: undefined]
+    | readonly [source: DiscardConfirmation, domain: D, intent: ZoneListLoadIntent<D>, decision: ListDiscardDecisionForDestination<D>]
+    | readonly [source: DiscardConfirmation, domain: D, intent: ZoneListRestoreIntent<D>, decision: ZoneListRestoreDecisionForDestination<D>]
+    | readonly [source: DiscardConfirmation, domain: D, intent: ZoneGetIntent<D>, decision: GetDiscardDecisionForDestination<D>];
+}[InstantDomain];
+
+type ZoneListLoadBlockedArgs = {
+  [D in InstantDomain]:
+    | readonly [source: TrackerScreenState, fact: ListFact<D>, notice?: string, decision?: undefined]
+    | readonly [source: DiscardConfirmation, fact: ListFact<D>, notice: string | undefined, decision: ListDiscardDecisionForDestination<D>];
+}[InstantDomain];
+
+type ZoneListRestoreBlockedArgs = {
+  [D in InstantDomain]: readonly [
+    source: DiscardConfirmation,
+    fact: ListFact<D>,
+    decision: ZoneListRestoreDecisionForDestination<D>,
+  ];
+}[InstantDomain];
+
+type ZoneCreateBlockedArgs = {
+  [D in InstantDomain]: readonly [source: ListReady<D>, fact: ListFact<D>];
+}[InstantDomain];
+
+type ZoneGetBlockedArgs = {
+  [D in InstantDomain]:
+    | readonly [source: DecisionlessZoneGetSource<D>, id: string, fact: ListFact<D>, decision?: undefined]
+    | readonly [source: DiscardConfirmation, id: string, fact: ListFact<D>, decision: GetDiscardDecisionForDestination<D>];
+}[InstantDomain];
+
+type ZoneSaveBlockedArgs = {
+  [D in InstantDomain]: readonly [
+    source: ExactEditableState<D> | MutationErrorByDomain[D],
+    editor: CreateEditorSnapshot<D> | EditEditorSnapshot<D>,
+  ];
+}[InstantDomain];
+
+type ZoneSaveRestoredArgs = {
+  [D in InstantDomain]: readonly [source: ZoneBlockedSave<D>, next: ExactEditableState<D>];
+}[InstantDomain];
+
+type ZoneEntryBlockedAction = {
+  [D in InstantDomain]:
+    | Readonly<{
+      type: "ZONE_ENTRY_BLOCKED";
+      source: TrackerScreenState;
+      next: ZoneBlockedEntry<D> & Readonly<{ intent: Extract<ZoneEntryIntent<D>, Readonly<{ kind: "list-load" }>> }>;
+      decision?: undefined;
+    }>
+    | Readonly<{
+      type: "ZONE_ENTRY_BLOCKED";
+      source: ListReady<D>;
+      next: ZoneBlockedEntry<D> & Readonly<{ intent: Extract<ZoneEntryIntent<D>, Readonly<{ kind: "create" }>> }>;
+      decision?: undefined;
+    }>
+    | Readonly<{
+      type: "ZONE_ENTRY_BLOCKED";
+      source: DecisionlessZoneGetSource<D>;
+      next: ZoneBlockedEntry<D> & Readonly<{ intent: Extract<ZoneEntryIntent<D>, Readonly<{ kind: "get" }>> }>;
+      decision?: undefined;
+    }>
+    | Readonly<{
+      type: "ZONE_ENTRY_BLOCKED";
+      source: DiscardConfirmation & Readonly<{ decision: ListDiscardDecisionForDestination<D> }>;
+      next: ZoneBlockedEntry<D> & Readonly<{ intent: Extract<ZoneEntryIntent<D>, Readonly<{ kind: "list-load" }>> }>;
+      decision: ListDiscardDecisionForDestination<D>;
+    }>
+    | Readonly<{
+      type: "ZONE_ENTRY_BLOCKED";
+      source: DiscardConfirmation & Readonly<{ decision: ZoneListRestoreDecisionForDestination<D> }>;
+      next: ZoneBlockedEntry<D> & Readonly<{ intent: Extract<ZoneEntryIntent<D>, Readonly<{ kind: "list-restore" }>> }>;
+      decision: ZoneListRestoreDecisionForDestination<D>;
+    }>
+    | Readonly<{
+      type: "ZONE_ENTRY_BLOCKED";
+      source: DiscardConfirmation & Readonly<{ decision: GetDiscardDecisionForDestination<D> }>;
+      next: ZoneBlockedEntry<D> & Readonly<{ intent: Extract<ZoneEntryIntent<D>, Readonly<{ kind: "get" }>> }>;
+      decision: GetDiscardDecisionForDestination<D>;
+    }>;
+}[InstantDomain];
+
+type ZoneSaveBlockedAction = {
+  [D in InstantDomain]: Readonly<{
+    type: "ZONE_SAVE_BLOCKED";
+    source: ExactEditableState<D> | MutationErrorByDomain[D];
+    next: ZoneBlockedSave<D>;
+  }>;
+}[InstantDomain];
+
+type ZoneSaveRestoredAction = {
+  [D in InstantDomain]: Readonly<{
+    type: "ZONE_SAVE_RESTORED";
+    source: ZoneBlockedSave<D>;
+    next: ExactEditableState<D>;
+  }>;
+}[InstantDomain];
+
 export type GlobalTrackerScreenAction =
   | Readonly<{ type: "BLURRED"; focusSession: number }>
   | Readonly<{ type: "VALIDATION_FAILED"; field: string; message: string }>
   | Readonly<{ type: "RETURN_TO_LIST" }>
+  | ZoneEntryBlockedAction
+  | ZoneSaveBlockedAction
+  | ZoneSaveRestoredAction
   | MutationConflictAction
   | DiscardRequestedAction
   | Readonly<{
@@ -632,6 +790,77 @@ export type GlobalTrackerScreenAction =
   }>;
 
 export type TrackerScreenAction = CorrelatedTrackerScreenAction | GlobalTrackerScreenAction;
+
+function zoneEntryBlockedAction(
+  ...[source, domain, intent, decision]: ZoneEntryBlockedArgs
+): ZoneEntryBlockedAction {
+  const next = Object.freeze({ tag: "zone.blocked.entry" as const, domain, intent });
+  return { type: "ZONE_ENTRY_BLOCKED", source, next, decision } as ZoneEntryBlockedAction;
+}
+
+export function zoneListLoadBlockedAction(
+  ...[source, fact, notice, decision]: ZoneListLoadBlockedArgs
+): GlobalTrackerScreenAction | null {
+  switch (fact.domain) {
+    case "feeding": return zoneEntryBlockedAction(...[source, "feeding", Object.freeze({ kind: "list-load", fact, notice }), decision] as ZoneEntryBlockedArgs);
+    case "sleep": return zoneEntryBlockedAction(...[source, "sleep", Object.freeze({ kind: "list-load", fact, notice }), decision] as ZoneEntryBlockedArgs);
+    case "diaper": return zoneEntryBlockedAction(...[source, "diaper", Object.freeze({ kind: "list-load", fact, notice }), decision] as ZoneEntryBlockedArgs);
+  }
+  return null;
+}
+
+export function zoneListRestoreBlockedAction(
+  ...[source, fact, decision]: ZoneListRestoreBlockedArgs
+): GlobalTrackerScreenAction | null {
+  switch (fact.domain) {
+    case "feeding": return zoneEntryBlockedAction(...[source, "feeding", Object.freeze({ kind: "list-restore", fact }), decision] as ZoneEntryBlockedArgs);
+    case "sleep": return zoneEntryBlockedAction(...[source, "sleep", Object.freeze({ kind: "list-restore", fact }), decision] as ZoneEntryBlockedArgs);
+    case "diaper": return zoneEntryBlockedAction(...[source, "diaper", Object.freeze({ kind: "list-restore", fact }), decision] as ZoneEntryBlockedArgs);
+  }
+  return null;
+}
+
+export function zoneCreateBlockedAction(
+  ...[source, fact]: ZoneCreateBlockedArgs
+): GlobalTrackerScreenAction | null {
+  switch (fact.domain) {
+    case "feeding": return zoneEntryBlockedAction(...[source, "feeding", Object.freeze({ kind: "create", fact })] as ZoneEntryBlockedArgs);
+    case "sleep": return zoneEntryBlockedAction(...[source, "sleep", Object.freeze({ kind: "create", fact })] as ZoneEntryBlockedArgs);
+    case "diaper": return zoneEntryBlockedAction(...[source, "diaper", Object.freeze({ kind: "create", fact })] as ZoneEntryBlockedArgs);
+  }
+  return null;
+}
+
+export function zoneGetBlockedAction(
+  ...[source, id, fact, decision]: ZoneGetBlockedArgs
+): GlobalTrackerScreenAction | null {
+  switch (fact.domain) {
+    case "feeding": return zoneEntryBlockedAction(...[source, "feeding", Object.freeze({ kind: "get", id, fact }), decision] as ZoneEntryBlockedArgs);
+    case "sleep": return zoneEntryBlockedAction(...[source, "sleep", Object.freeze({ kind: "get", id, fact }), decision] as ZoneEntryBlockedArgs);
+    case "diaper": return zoneEntryBlockedAction(...[source, "diaper", Object.freeze({ kind: "get", id, fact }), decision] as ZoneEntryBlockedArgs);
+  }
+  return null;
+}
+
+export function zoneSaveBlockedAction(
+  ...[source, editor]: ZoneSaveBlockedArgs
+): GlobalTrackerScreenAction | null {
+  const runtimeEditor = editor as AnyEditorSnapshot;
+  if (runtimeEditor.domain === "growth" || runtimeEditor.domain === "health") return null;
+  const editable = (source.tag === "create.editing" || source.tag === "edit.editing") && source.editor === editor
+    ? source
+    : editor.mode === "create"
+      ? Object.freeze({ tag: "create.editing" as const, editor })
+      : Object.freeze({ tag: "edit.editing" as const, editor });
+  const next = Object.freeze({ tag: "zone.blocked.save" as const, domain: editor.domain, source: editable });
+  return { type: "ZONE_SAVE_BLOCKED", source, next } as ZoneSaveBlockedAction;
+}
+
+export function zoneSaveRestoredAction(
+  ...[source, next]: ZoneSaveRestoredArgs
+): GlobalTrackerScreenAction {
+  return { type: "ZONE_SAVE_RESTORED", source, next } as ZoneSaveRestoredAction;
+}
 
 type DirectCreateStartedArgs = {
   [D in LowRiskDomain]: readonly [
@@ -685,6 +914,22 @@ type OperationRefreshStartedArgs = {
       success: string,
     ];
   }[MutationKind];
+}[TrackerDomain];
+
+type AcceptedDiscardListStartedArgs = {
+  [D in TrackerDomain]: readonly [
+    source: DiscardConfirmation,
+    next: OrdinaryListLoading<D>,
+    decision: ListDiscardDecisionForDestination<D>,
+  ];
+}[TrackerDomain];
+
+type AcceptedDiscardGetStartedArgs = {
+  [D in TrackerDomain]: readonly [
+    source: DiscardConfirmation,
+    next: EditLoading<D>,
+    decision: GetDiscardDecisionForDestination<D>,
+  ];
 }[TrackerDomain];
 
 export function correlatedAction<D extends TrackerDomain>(action: DomainAction<D>): CorrelatedTrackerScreenAction {
@@ -762,10 +1007,8 @@ export function isGetDiscardDecisionForDestination<D extends TrackerDomain>(
     && destination.prior === prior;
 }
 
-export function acceptedDiscardListStartedAction<D extends TrackerDomain>(
-  source: TrackerScreenState,
-  next: OrdinaryListLoading<D>,
-  decision: ListDiscardDecisionForDestination<NoInfer<D>>,
+export function acceptedDiscardListStartedAction(
+  ...[source, next, decision]: AcceptedDiscardListStartedArgs
 ): CorrelatedTrackerScreenAction | null {
   if (source.tag !== "confirm.discard" || source.decision !== decision) return null;
   const destination = decision.destination;
@@ -777,10 +1020,8 @@ export function acceptedDiscardListStartedAction<D extends TrackerDomain>(
   return { type: "LIST_STARTED", source, next, decision } as CorrelatedTrackerScreenAction;
 }
 
-export function acceptedDiscardGetStartedAction<D extends TrackerDomain>(
-  source: TrackerScreenState,
-  next: EditLoading<D>,
-  decision: GetDiscardDecisionForDestination<NoInfer<D>>,
+export function acceptedDiscardGetStartedAction(
+  ...[source, next, decision]: AcceptedDiscardGetStartedArgs
 ): CorrelatedTrackerScreenAction | null {
   if (source.tag !== "confirm.discard" || source.decision !== decision) return null;
   const destination = decision.destination;
@@ -1043,6 +1284,8 @@ export function sameOperationOwner(left: OperationOwner, right: OperationOwner):
 
 function listDomain(state: TrackerScreenState): TrackerDomain {
   switch (state.tag) {
+    case "zone.blocked.entry":
+    case "zone.blocked.save": return state.domain;
     case "list.loading": return state.prior.domain;
     case "list.ready.empty":
     case "list.ready.rows":
@@ -1123,31 +1366,86 @@ function discardPriorIsDirty(prior: DiscardPrior): boolean {
   }
 }
 
+export function listEntryAuthorized(
+  source: TrackerScreenState,
+  fact: ListFact<TrackerDomain>,
+  decision: ScreenDiscardDecision | undefined,
+): boolean {
+  if (source.tag === "zone.blocked.entry") {
+    return source.domain === fact.domain
+      && (source.intent.kind === "list-load" || source.intent.kind === "list-restore")
+      && source.intent.fact === fact;
+  }
+  if (decision !== undefined) {
+    if (source.tag !== "confirm.discard" || source.decision !== decision) return false;
+    const destination = decision.destination;
+    return "kind" in destination
+      && (destination.kind === "domain" || destination.kind === "reload-list")
+      && destination.fact === fact;
+  }
+  if (source.tag === "conflict.stale" || source.tag === "conflict.notFound") {
+    return !discardPriorIsDirty(source) && fact === source.source.prior.prior;
+  }
+  if (source.tag === "edit.loading") return source.prior === fact;
+  if (source.tag === "create.editing" || source.tag === "edit.editing" || source.tag === "mutation.error") {
+    return !discardPriorIsDirty(source) && fact.domain !== listDomain(source);
+  }
+  if (source.tag === "list.loading") return source.source === "ordinary" && (source.prior === fact || source.prior.domain !== fact.domain);
+  if (source.tag === "list.ready.empty" || source.tag === "list.ready.rows") return source.fact === fact || source.fact.domain !== fact.domain;
+  if (source.tag === "list.error") return source.fact === fact || source.fact.domain !== fact.domain;
+  return source.tag === "read.suspended" && source.request.kind === "list" && source.request.prior === fact;
+}
+
+export function getEntryAuthorized(
+  source: TrackerScreenState,
+  domain: TrackerDomain,
+  id: string,
+  prior: ListFact<TrackerDomain>,
+  decision: ScreenDiscardDecision | undefined,
+): boolean {
+  if (domain !== prior.domain) return false;
+  if (source.tag === "zone.blocked.entry") {
+    return source.domain === domain
+      && source.intent.kind === "get"
+      && source.intent.id === id
+      && source.intent.fact === prior;
+  }
+  if (decision !== undefined) {
+    if (source.tag !== "confirm.discard" || source.decision !== decision) return false;
+    const destination = decision.destination;
+    return "kind" in destination
+      && destination.kind === "reload-record"
+      && destination.domain === domain
+      && destination.id === id
+      && destination.prior === prior;
+  }
+  if (source.tag === "conflict.stale") {
+    const editor = source.source.prior;
+    return !discardPriorIsDirty(source)
+      && editor.mode === "edit"
+      && editor.domain === domain
+      && editor.baseline.id === id
+      && editor.prior === prior;
+  }
+  if (source.tag === "edit.error") return source.id === id && source.prior === prior;
+  if (source.tag === "read.suspended") {
+    return source.request.kind === "get"
+      && source.request.id === id
+      && source.request.prior === prior;
+  }
+  return (source.tag === "list.ready.empty" || source.tag === "list.ready.rows")
+    && source.fact === prior;
+}
+
 function listStartAuthorized(
   state: TrackerScreenState,
   source: TrackerScreenState,
   next: OrdinaryListLoading<TrackerDomain>,
   decision: ScreenDiscardDecision | undefined,
 ): boolean {
-  if (state !== source || next.owner.domain !== next.prior.domain) return false;
-  if (decision !== undefined) {
-    if (state.tag !== "confirm.discard" || state.decision !== decision) return false;
-    const destination = decision.destination;
-    return "kind" in destination
-      && (destination.kind === "domain" || destination.kind === "reload-list")
-      && destination.fact === next.prior;
-  }
-  if (state.tag === "conflict.stale" || state.tag === "conflict.notFound") {
-    return !discardPriorIsDirty(state) && next.prior === state.source.prior.prior;
-  }
-  if (state.tag === "create.editing" || state.tag === "edit.editing" || state.tag === "mutation.error") {
-    return !discardPriorIsDirty(state) && next.prior.domain !== listDomain(state);
-  }
-  return state.tag === "list.loading"
-    || state.tag === "list.ready.empty"
-    || state.tag === "list.ready.rows"
-    || state.tag === "list.error"
-    || state.tag === "read.suspended";
+  return state === source
+    && next.owner.domain === next.prior.domain
+    && listEntryAuthorized(source, next.prior, decision);
 }
 
 function getStartAuthorized(
@@ -1156,36 +1454,10 @@ function getStartAuthorized(
   next: EditLoading<TrackerDomain>,
   decision: ScreenDiscardDecision | undefined,
 ): boolean {
-  if (
-    state !== source
-    || next.owner.domain !== next.prior.domain
-    || next.owner.recordId !== next.id
-  ) return false;
-  if (decision !== undefined) {
-    if (state.tag !== "confirm.discard" || state.decision !== decision) return false;
-    const destination = decision.destination;
-    return "kind" in destination
-      && destination.kind === "reload-record"
-      && destination.domain === next.owner.domain
-      && destination.id === next.id
-      && destination.prior === next.prior;
-  }
-  if (state.tag === "conflict.stale") {
-    const editor = state.source.prior;
-    return !discardPriorIsDirty(state)
-      && editor.mode === "edit"
-      && editor.domain === next.owner.domain
-      && editor.baseline.id === next.id
-      && editor.prior === next.prior;
-  }
-  if (state.tag === "edit.error") return state.id === next.id && state.prior === next.prior;
-  if (state.tag === "read.suspended") {
-    return state.request.kind === "get"
-      && state.request.id === next.id
-      && state.request.prior === next.prior;
-  }
-  return (state.tag === "list.ready.empty" || state.tag === "list.ready.rows")
-    && state.fact === next.prior;
+  return state === source
+    && next.owner.domain === next.prior.domain
+    && next.owner.recordId === next.id
+    && getEntryAuthorized(source, next.owner.domain, next.id, next.prior, decision);
 }
 
 function confirmationMatchesSubmitting(
@@ -1235,6 +1507,56 @@ export function trackerScreenReducer(
   action: TrackerScreenAction,
 ): TrackerScreenState {
   switch (action.type) {
+    case "ZONE_ENTRY_BLOCKED": {
+      if (state !== action.source || action.next.tag !== "zone.blocked.entry") return state;
+      const intent = action.next.intent;
+      if (intent.fact.domain !== action.next.domain) return state;
+      if (intent.kind === "list-load" && !listEntryAuthorized(action.source, intent.fact, action.decision)) return state;
+      if (intent.kind === "get" && !getEntryAuthorized(action.source, action.next.domain, intent.id, intent.fact, action.decision)) return state;
+      if (action.decision !== undefined) {
+        if (state.tag !== "confirm.discard" || state.decision !== action.decision) return state;
+        const destination = action.decision.destination;
+        if (intent.kind === "list-restore") {
+          if ("kind" in destination || destination !== intent.fact) return state;
+        } else if (intent.kind === "list-load") {
+          if (!("kind" in destination) || (destination.kind !== "domain" && destination.kind !== "reload-list") || destination.fact !== intent.fact) return state;
+        } else if (intent.kind === "get") {
+          if (!("kind" in destination) || destination.kind !== "reload-record" || destination.domain !== action.next.domain || destination.id !== intent.id || destination.prior !== intent.fact) return state;
+        } else return state;
+      } else if (intent.kind === "list-restore") return state;
+      else if (intent.kind === "create") {
+        if ((state.tag !== "list.ready.empty" && state.tag !== "list.ready.rows") || state.fact !== intent.fact) return state;
+      }
+      return correlatedState(action.next);
+    }
+    case "ZONE_SAVE_BLOCKED": {
+      if (state !== action.source || action.next.tag !== "zone.blocked.save") return state;
+      const editor = action.next.source.editor;
+      if (editor.domain !== action.next.domain) return state;
+      if (state.tag === "create.editing" || state.tag === "edit.editing") {
+        if (state !== action.next.source) return state;
+      } else if (state.tag === "mutation.error") {
+        if (state.source.prior !== editor) return state;
+      } else return state;
+      return correlatedState(action.next);
+    }
+    case "ZONE_SAVE_RESTORED":
+      if (state !== action.source || state.tag !== "zone.blocked.save") return state;
+      if (action.next !== state.source) {
+        const retained = state.source.editor;
+        const restored = action.next.editor;
+        if (
+          action.next.tag !== state.source.tag
+          || restored.mode !== retained.mode
+          || restored.domain !== retained.domain
+          || restored.draft !== retained.draft
+          || restored.initialDraft !== retained.initialDraft
+          || restored.baseline !== retained.baseline
+          || restored.prior !== retained.prior
+          || restored.capturedZone !== retained.capturedZone
+        ) return state;
+      }
+      return correlatedState(action.next);
     case "LIST_STARTED":
       if (!listStartAuthorized(state, action.source, action.next, action.decision)) return state;
       return correlatedState(action.next);
@@ -1278,17 +1600,19 @@ export function trackerScreenReducer(
         state.tag !== "edit.loading"
         || !sameReadOwner(state.owner, action.owner)
         || action.next.owner.domain !== state.prior.domain
-        || action.next.prior !== state.prior
+        || action.next.prior.domain !== state.prior.domain
+        || action.next.prior.rows !== state.prior.rows
       ) return state;
       return correlatedState(action.next);
     case "CREATE_REQUESTED":
       if (
         state !== action.source
-        || (state.tag !== "list.ready.empty" && state.tag !== "list.ready.rows")
         || action.editor.mode !== "create"
         || action.editor.baseline !== null
-        || action.editor.prior !== state.fact
       ) return state;
+      if (state.tag === "zone.blocked.entry") {
+        if (state.intent.kind !== "create" || state.domain !== action.editor.domain || state.intent.fact !== action.editor.prior) return state;
+      } else if ((state.tag !== "list.ready.empty" && state.tag !== "list.ready.rows") || action.editor.prior !== state.fact) return state;
       return correlatedState(Object.freeze({ tag: "create.editing", editor: action.editor }));
     case "DRAFT_CHANGED":
       if (state.tag === "mutation.error") {

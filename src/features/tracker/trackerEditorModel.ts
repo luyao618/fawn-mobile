@@ -133,12 +133,24 @@ function localDefault(now: string | Date, zone: string) {
   return instant === null ? Object.freeze({ status: "invalid_instant" as const }) : formatInstantForDeviceZone(instant, zone);
 }
 
+function deviceLocalDateDefault(now: string | Date): Readonly<{ status: "formatted"; dateText: string; timeText: "" }> | Readonly<{ status: "invalid_instant" }> {
+  const instant = minuteInstant(now);
+  if (instant === null) return Object.freeze({ status: "invalid_instant" as const });
+  const date = new Date(instant);
+  const year = String(date.getFullYear()).padStart(4, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return Object.freeze({ status: "formatted" as const, dateText: `${year}-${month}-${day}`, timeText: "" as const });
+}
+
 export function createInitialDraft<D extends TrackerDomain>(
   domain: D,
   now: string | Date,
   zone: string,
 ): DraftBuildResult<D> {
-  const local = localDefault(now, zone);
+  const local = domain === "growth" || domain === "health"
+    ? deviceLocalDateDefault(now)
+    : localDefault(now, zone);
   if (local.status !== "formatted") return invalidBuild(local.status) as DraftBuildResult<D>;
   const base = { domain, timeZone: zone, dateText: local.dateText };
   switch (domain) {

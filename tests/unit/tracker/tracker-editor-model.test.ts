@@ -362,3 +362,17 @@ test("sleep pairing, DST errors, and all-domain no-op behavior remain explicit",
   }
   assert.equal(isNormalizedUpdateNoop("growth", records.growth, { ...records.growth, weightPercentile: 99 }), true);
 });
+
+test("date-only draft defaults use device calendar fields without requiring an IANA zone", () => {
+  const now = new Date(2026, 6, 20, 0, 10, 45, 123);
+  const expectedDate = `${String(now.getFullYear()).padStart(4, "0")}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  for (const domain of ["growth", "health"] as const) {
+    const built = createInitialDraft(domain, now, "not-an-iana-zone");
+    assert.equal(built.status, "ready", domain);
+    if (built.status !== "ready") continue;
+    assert.equal(built.draft.dateText, expectedDate);
+    assert.equal(built.draft.timeZone, "not-an-iana-zone");
+  }
+
+  assert.equal(createInitialDraft("feeding", now, "not-an-iana-zone").status, "invalid");
+});
