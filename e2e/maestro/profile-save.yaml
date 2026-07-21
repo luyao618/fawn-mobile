@@ -199,4 +199,8 @@ appId: com.luyao618.formobile
       text: "G031LeapBaby"
     direction: UP
 - assertVisible: "G031LeapBaby"
+- scrollUntilVisible:
+    element:
+      text: "${AGE_DISPLAY}"
+    direction: UP
 - assertVisible: "${AGE_DISPLAY}"
