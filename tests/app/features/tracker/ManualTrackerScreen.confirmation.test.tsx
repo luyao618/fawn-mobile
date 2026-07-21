@@ -243,17 +243,26 @@ afterEach(() => {
 test("rejected missing-record reload transition suppresses its fallback list", async () => {
   const rows = Object.freeze([records.growth]);
   const list = jest.fn(async () => rows);
-  const getById = jest.fn(async () => null);
+  const missingRecord = deferred<null>();
+  const rejectedReloadSettled = deferred<void>();
+  const getById = jest.fn(() => missingRecord.promise);
   const service = createServiceMock({ list: list as ManualTrackerServicePort["list"], getById: getById as ManualTrackerServicePort["getById"] });
   renderTracker(service);
-  mockTrackerReducerRejector.mockImplementation((action) => action.type === "GET_MISSING_RELOAD_STARTED");
+  mockTrackerReducerRejector.mockImplementation((action) => {
+    if (action.type !== "GET_MISSING_RELOAD_STARTED") return false;
+    rejectedReloadSettled.resolve(undefined);
+    return true;
+  });
   fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
   expect(getById).toHaveBeenCalledTimes(1);
   await act(async () => {
-    await Promise.resolve();
-    await jest.runOnlyPendingTimersAsync();
-    await Promise.resolve();
+    missingRecord.resolve(null);
+    await rejectedReloadSettled.promise;
   });
+  expect(mockTrackerReducerRejector).toHaveBeenCalledWith(
+    expect.objectContaining({ type: "GET_MISSING_RELOAD_STARTED" }),
+    expect.objectContaining({ tag: "edit.loading" }),
+  );
   expect(list).toHaveBeenCalledTimes(1);
   expect(screen.getByRole("header", { name: "编辑生长记录" })).toBeTruthy();
 });
