@@ -135,6 +135,7 @@ const styles = StyleSheet.create({
     gap: spacing.xs,
     justifyContent: "center",
     minHeight: 48,
+    minWidth: 44,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
   },

@@ -857,6 +857,7 @@ test("keeps controls 320-compatible through wrapping, scalable text, and minimum
   expect(StyleSheet.flatten(view.getByTestId("tracker-editor-actions").props.style)?.flexWrap).toBe("wrap");
   for (const control of [...screen.getAllByRole("button"), ...screen.getAllByRole("radio")]) {
     expect(StyleSheet.flatten(control.props.style)?.minHeight).toBeGreaterThanOrEqual(44);
+    expect(StyleSheet.flatten(control.props.style)?.minWidth).toBeGreaterThanOrEqual(44);
   }
   expectScalableTree(view);
 });

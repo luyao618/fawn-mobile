@@ -138,6 +138,7 @@ test("preserves service order, forwards list/action refs, and selects rows by ID
     expect(style?.borderRadius).toBe(12);
     expect(style?.borderWidth).toBe(1);
     expect(style?.minHeight).toBeGreaterThanOrEqual(48);
+    expect(style?.minWidth).toBeGreaterThanOrEqual(44);
     expect(row.findAllByType(View)).toHaveLength(0);
   }
 

@@ -104,7 +104,11 @@ import {
   type TrackerGroupRefs,
   type TrackerInputRefs,
 } from "./TrackerEditor";
-import { PrimaryAction, SecondaryAction } from "./TrackerFormPrimitives";
+import {
+  PrimaryAction,
+  SecondaryAction,
+  TrackerErrorAnnouncementScope,
+} from "./TrackerFormPrimitives";
 import { TrackerRecordList } from "./TrackerRecordList";
 
 const EMPTY_GROWTH_ROWS: DomainRows<"growth"> = Object.freeze([]);
@@ -122,6 +126,28 @@ type ListRetryFocusCapability = Readonly<{
   destination: Extract<TrackerScreenState, { tag: "list.ready.empty" | "list.ready.rows" | "list.error" }>;
 }>;
 type ListRetryFocusAttempt = Omit<ListRetryFocusCapability, "destination">;
+type PendingCancelFocusCapability = Readonly<{
+  decision: ScreenTrackerDecision;
+  destination: TrackerScreenState;
+}>;
+type MutationSuccessCapability = Readonly<{
+  id: number;
+  owner: OperationOwner;
+  destination: TrackerScreenState;
+  success: string;
+}>;
+type MutationIssueFocusTarget =
+  | Readonly<{ kind: "list-heading" }>
+  | Readonly<{ kind: "editor-heading" }>
+  | Readonly<{ kind: "conflict-heading" }>
+  | Readonly<{ field: FocusField; kind: "validation-field" }>;
+type MutationIssueCapability = Readonly<{
+  destination: TrackerScreenState;
+  focusTarget: MutationIssueFocusTarget;
+  id: number;
+  message: string;
+  owner?: OperationOwner;
+}>;
 const DELETE_FAILURE = "删除失败，本机记录没有更改。";
 const RUNTIME_FAILURE = "本机记录服务暂不可用，请返回后重试。";
 const INVALID_ZONE = "无法确认本机时区，暂不能显示或编辑这类记录。";
@@ -558,6 +584,77 @@ function serviceValidationFailure(error: TrackerValidationError): Readonly<{ fie
     : Object.freeze({ field: "form", message: "请检查标出的内容后再保存。" });
 }
 
+function focusableDecision(state: TrackerScreenState): ScreenTrackerDecision | null {
+  return state.tag === "confirm.healthCreate"
+    || state.tag === "confirm.update"
+    || state.tag === "confirm.delete"
+    || state.tag === "confirm.discard"
+    ? state.decision
+    : null;
+}
+
+function reconcileMutationSuccessCapability(
+  capability: MutationSuccessCapability,
+  previous: TrackerScreenState,
+  state: TrackerScreenState,
+  action: TrackerScreenAction,
+): MutationSuccessCapability | null {
+  if (state === capability.destination) return capability;
+  if (previous !== capability.destination
+    || previous.tag !== "list.loading"
+    || previous.source !== "mutation-refresh"
+    || !sameOperationOwner(previous.owner, capability.owner)
+    || (action.type !== "OPERATION_REFRESH_SUCCEEDED" && action.type !== "OPERATION_REFRESH_FAILED")
+    || !sameOperationOwner(action.owner, capability.owner)
+    || (state.tag !== "list.ready.empty" && state.tag !== "list.ready.rows"
+      && !(state.tag === "list.error" && state.kind === "refresh"))) return null;
+  return Object.freeze({ ...capability, destination: state });
+}
+
+function mutationFocusField(field: string): FocusField | undefined {
+  const aliases: Readonly<Record<string, FocusField>> = Object.freeze({
+    measurementDate: "measurementDate", weightG: "weightG", heightCm: "heightCm", headCm: "headCm",
+    measurements: "weightG", feedTime: "feedTime", feedType: "feedType", amountMl: "amountMl",
+    durationMin: "durationMin", sleepStart: "sleepStart", sleepEnd: "sleepEnd", sleepType: "sleepType",
+    nightWakings: "nightWakings", diaperTime: "diaperTime", diaperType: "diaperType",
+    recordDate: "recordDate", recordType: "recordType", title: "title", notes: "notes", description: "description",
+  });
+  return aliases[field];
+}
+
+function mutationIssueForDestination(id: number, state: TrackerScreenState): MutationIssueCapability | null {
+  if (state.tag === "list.error" && state.kind === "refresh") {
+    return Object.freeze({
+      destination: state,
+      focusTarget: Object.freeze({ kind: "list-heading" }),
+      id,
+      message: "记录可能不是最新内容。",
+    });
+  }
+  if (state.tag === "mutation.error") {
+    const field = state.field === undefined ? undefined : mutationFocusField(state.field);
+    return Object.freeze({
+      destination: state,
+      focusTarget: field === undefined
+        ? Object.freeze({ kind: "editor-heading" })
+        : Object.freeze({ field, kind: "validation-field" }),
+      id,
+      message: state.message,
+    });
+  }
+  if (state.tag === "conflict.stale" || state.tag === "conflict.notFound") {
+    return Object.freeze({
+      destination: state,
+      focusTarget: Object.freeze({ kind: "conflict-heading" }),
+      id,
+      message: state.tag === "conflict.stale"
+        ? "这条记录已在其他位置更新。为避免覆盖，请重新读取后再修改。"
+        : "这条记录已不存在，不能继续保存或删除。",
+    });
+  }
+  return null;
+}
+
 export function ManualTrackerScreen() {
   const service = useManualTrackerService();
   const [state, setState] = useState(initialState);
@@ -569,13 +666,25 @@ export function ManualTrackerScreen() {
   const operationIdRef = useRef(0);
   const [focusRequest, setFocusRequest] = useState<Readonly<{ id: number; field: FocusField }> | null>(null);
   const [listFocusRequest, setListFocusRequest] = useState(0);
+  const [accessibilityDeliveryRequest, setAccessibilityDeliveryRequest] = useState(0);
+  const [recordsFocused, setRecordsFocused] = useState(false);
+  const [activeSuccessAnnouncement, setActiveSuccessAnnouncement] = useState<MutationSuccessCapability | null>(null);
+  const [activeMutationIssue, setActiveMutationIssue] = useState<MutationIssueCapability | null>(null);
   const [getRetryFocusRequest, setGetRetryFocusRequest] = useState(0);
   const [listRetryFocusRequest, setListRetryFocusRequest] = useState(0);
   const pendingGetRetryFocusRef = useRef<GetRetryFocusCapability | null>(null);
   const pendingListRetryFocusRef = useRef<ListRetryFocusCapability | null>(null);
+  const successCapabilityIdRef = useRef(0);
+  const pendingMutationSuccessRef = useRef<MutationSuccessCapability | null>(null);
+  const activeSuccessAnnouncementRef = useRef<MutationSuccessCapability | null>(null);
+  const mutationIssueIdRef = useRef(0);
+  const pendingMutationIssueRef = useRef<MutationIssueCapability | null>(null);
+  const activeMutationIssueRef = useRef<MutationIssueCapability | null>(null);
+  const focusedMutationSuccessOwnerRef = useRef<OperationOwner | null>(null);
   const consumedListFocusRef = useRef(0);
   const listHeadingRef = useRef<Text>(null);
   const editorHeadingRef = useRef<Text>(null);
+  const conflictHeadingRef = useRef<Text>(null);
   const saveActionRef = useRef<View>(null);
   const backActionRef = useRef<View>(null);
   const deleteActionRef = useRef<View>(null);
@@ -584,6 +693,9 @@ export function ManualTrackerScreen() {
   const decisionHeadingRef = useRef<Text>(null);
   const decisionCancelRef = useRef<View>(null);
   const decisionAcceptRef = useRef<View>(null);
+  const recordsFocusedRef = useRef(false);
+  const focusedDecisionRef = useRef<ScreenTrackerDecision | null>(null);
+  const pendingCancelFocusRef = useRef<PendingCancelFocusCapability | null>(null);
   const zoneBlockedHeadingRef = useRef<Text>(null);
   const zoneRetryActionRef = useRef<View>(null);
   const previousStateRef = useRef<TrackerScreenState>(state);
@@ -643,9 +755,59 @@ export function ManualTrackerScreen() {
     const previous = stateRef.current;
     const next = trackerScreenReducer(previous, action);
     if (next === previous) return false;
+    const pendingMutationSuccess = pendingMutationSuccessRef.current;
+    if (pendingMutationSuccess !== null) {
+      pendingMutationSuccessRef.current = reconcileMutationSuccessCapability(
+        pendingMutationSuccess,
+        previous,
+        next,
+        action,
+      );
+    }
+    const pendingMutationIssue = pendingMutationIssueRef.current;
+    if (pendingMutationIssue !== null && next !== pendingMutationIssue.destination) {
+      pendingMutationIssueRef.current = null;
+    }
+    const activeMutationSuccess = activeSuccessAnnouncementRef.current;
+    if (activeMutationSuccess !== null && next !== activeMutationSuccess.destination) {
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+    }
+    const activeMutationIssue = activeMutationIssueRef.current;
+    if (activeMutationIssue !== null && next !== activeMutationIssue.destination) {
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+    }
     stateRef.current = next;
     setState(next);
+    if (
+      action.type === "OPERATION_REFRESH_FAILED"
+      || action.type === "MUTATION_REJECTED"
+      || action.type === "MUTATION_CONFLICT"
+    ) {
+      mutationIssueIdRef.current += 1;
+      const issue = mutationIssueForDestination(mutationIssueIdRef.current, next);
+      pendingMutationIssueRef.current = issue !== null && action.type === "OPERATION_REFRESH_FAILED"
+        ? Object.freeze({ ...issue, owner: action.owner })
+        : issue;
+      if (issue !== null && recordsFocusedRef.current) {
+        activeMutationIssueRef.current = pendingMutationIssueRef.current;
+        setActiveMutationIssue(pendingMutationIssueRef.current);
+      }
+    }
     return true;
+  }, []);
+
+  const focusDecisionHeadingOnce = useCallback(() => {
+    const decision = focusableDecision(stateRef.current);
+    if (decision === null) {
+      focusedDecisionRef.current = null;
+      return;
+    }
+    if (!recordsFocusedRef.current) return;
+    if (focusedDecisionRef.current === decision || decisionHeadingRef.current === null) return;
+    focusedDecisionRef.current = decision;
+    focusRefIfAvailable(decisionHeadingRef);
   }, []);
 
   useEffect(() => {
@@ -657,10 +819,52 @@ export function ManualTrackerScreen() {
   }, [focusRequest, groupRefObjects, inputRefObjects]);
 
   useEffect(() => {
-    if (listFocusRequest <= consumedListFocusRef.current || listHeadingRef.current === null) return;
+    if (
+      listFocusRequest <= consumedListFocusRef.current
+      || !recordsFocusedRef.current
+      || listHeadingRef.current === null
+    ) return;
     consumedListFocusRef.current = listFocusRequest;
     focusRefIfAvailable(listHeadingRef);
-  }, [listFocusRequest, state]);
+  }, [accessibilityDeliveryRequest, listFocusRequest, state]);
+
+  const deliverPendingAccessibility = useCallback((): boolean => {
+    const current = stateRef.current;
+    const success = pendingMutationSuccessRef.current;
+    const issue = pendingMutationIssueRef.current;
+    const deliverSuccess = success !== null && current === success.destination;
+    const deliverIssue = issue !== null && current === issue.destination;
+    if (!recordsFocusedRef.current || (!deliverSuccess && !deliverIssue)) return false;
+
+    const focusTarget = deliverIssue ? issue.focusTarget : Object.freeze({ kind: "list-heading" as const });
+    const target = focusTarget.kind === "list-heading" ? listHeadingRef
+      : focusTarget.kind === "editor-heading" ? editorHeadingRef
+        : focusTarget.kind === "conflict-heading" ? conflictHeadingRef
+          : focusTarget.field in groupRefObjects
+            ? groupRefObjects[focusTarget.field as keyof typeof groupRefObjects]
+            : inputRefObjects[focusTarget.field as keyof typeof inputRefObjects];
+    if (deliverSuccess) pendingMutationSuccessRef.current = null;
+    if (deliverIssue) pendingMutationIssueRef.current = null;
+    const listFocusAlreadyDelivered = deliverIssue
+      && issue.owner !== undefined
+      && focusedMutationSuccessOwnerRef.current !== null
+      && sameOperationOwner(issue.owner, focusedMutationSuccessOwnerRef.current);
+    if (!listFocusAlreadyDelivered) focusRefIfAvailable(target);
+    if (deliverSuccess) {
+      focusedMutationSuccessOwnerRef.current = success.owner;
+      activeSuccessAnnouncementRef.current = success;
+      setActiveSuccessAnnouncement(success);
+    }
+    if (deliverIssue && activeMutationIssueRef.current !== issue) {
+      activeMutationIssueRef.current = issue;
+      setActiveMutationIssue(issue);
+    }
+    return true;
+  }, [groupRefObjects, inputRefObjects]);
+
+  useEffect(() => {
+    deliverPendingAccessibility();
+  }, [accessibilityDeliveryRequest, deliverPendingAccessibility, state]);
 
   useEffect(() => {
     const capability = pendingGetRetryFocusRef.current;
@@ -701,10 +905,28 @@ export function ManualTrackerScreen() {
     }
   }, [state]);
 
+  useEffect(() => {
+    focusDecisionHeadingOnce();
+    const capability = pendingCancelFocusRef.current;
+    if (capability === null) return;
+    if (state !== capability.destination) {
+      pendingCancelFocusRef.current = null;
+      return;
+    }
+    if (!recordsFocusedRef.current || capability.decision.initiatingControlRef.current === null) return;
+    pendingCancelFocusRef.current = null;
+    focusRefIfAvailable(capability.decision.initiatingControlRef);
+  }, [focusDecisionHeadingOnce, state]);
+
   useEffect(() => () => {
     mountedRef.current = false;
     mountEpochRef.current += 1;
     generationRef.current += 1;
+    pendingMutationSuccessRef.current = null;
+    pendingMutationIssueRef.current = null;
+    activeSuccessAnnouncementRef.current = null;
+    activeMutationIssueRef.current = null;
+    focusedMutationSuccessOwnerRef.current = null;
   }, []);
 
   const makeListOwner = useCallback(<D extends TrackerDomain,>(domain: D): ReadOwner<D, "list"> => {
@@ -1023,14 +1245,52 @@ export function ManualTrackerScreen() {
 
   useFocusEffect(useCallback(() => {
     mountedRef.current = true;
+    recordsFocusedRef.current = true;
+    setRecordsFocused(true);
     focusSessionRef.current += 1;
+    focusDecisionHeadingOnce();
+    const cancelCapability = pendingCancelFocusRef.current;
+    if (cancelCapability !== null && stateRef.current !== cancelCapability.destination) {
+      pendingCancelFocusRef.current = null;
+    } else if (cancelCapability !== null && cancelCapability.decision.initiatingControlRef.current !== null) {
+      pendingCancelFocusRef.current = null;
+      focusRefIfAvailable(cancelCapability.decision.initiatingControlRef);
+    }
+    const deliveredAccessibility = deliverPendingAccessibility();
+    if (!deliveredAccessibility) setAccessibilityDeliveryRequest((value) => value + 1);
     const current = stateRef.current;
     if (current.tag === "mutation.submitting") return () => {
+      recordsFocusedRef.current = false;
+      setRecordsFocused(false);
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+      focusedMutationSuccessOwnerRef.current = null;
       focusSessionRef.current += 1;
       generationRef.current += 1;
       send({ type: "BLURRED", focusSession: focusSessionRef.current });
     };
     if (current.tag === "list.loading" && current.source === "mutation-refresh") return () => {
+      recordsFocusedRef.current = false;
+      setRecordsFocused(false);
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+      focusedMutationSuccessOwnerRef.current = null;
+      focusSessionRef.current += 1;
+      generationRef.current += 1;
+      send({ type: "BLURRED", focusSession: focusSessionRef.current });
+    };
+    if (deliveredAccessibility) return () => {
+      recordsFocusedRef.current = false;
+      setRecordsFocused(false);
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+      focusedMutationSuccessOwnerRef.current = null;
       focusSessionRef.current += 1;
       generationRef.current += 1;
       send({ type: "BLURRED", focusSession: focusSessionRef.current });
@@ -1047,11 +1307,18 @@ export function ManualTrackerScreen() {
       resumeList(current, stateListFact(current));
     }
     return () => {
+      recordsFocusedRef.current = false;
+      setRecordsFocused(false);
+      activeSuccessAnnouncementRef.current = null;
+      setActiveSuccessAnnouncement(null);
+      activeMutationIssueRef.current = null;
+      setActiveMutationIssue(null);
+      focusedMutationSuccessOwnerRef.current = null;
       focusSessionRef.current += 1;
       generationRef.current += 1;
       send({ type: "BLURRED", focusSession: focusSessionRef.current });
     };
-  }, [resumeGet, resumeList, send]));
+  }, [deliverPendingAccessibility, focusDecisionHeadingOnce, resumeGet, resumeList, send]));
 
   const requestDiscard = useCallback((decision: DiscardDecision | null) => {
     if (decision !== null) send(discardRequestedAction(decision));
@@ -1145,14 +1412,7 @@ export function ManualTrackerScreen() {
   }, [requestDiscard, send]);
 
   const requestFieldFocus = useCallback((field: string) => {
-    const aliases: Readonly<Record<string, FocusField>> = Object.freeze({
-      measurementDate: "measurementDate", weightG: "weightG", heightCm: "heightCm", headCm: "headCm",
-      measurements: "weightG", feedTime: "feedTime", feedType: "feedType", amountMl: "amountMl",
-      durationMin: "durationMin", sleepStart: "sleepStart", sleepEnd: "sleepEnd", sleepType: "sleepType",
-      nightWakings: "nightWakings", diaperTime: "diaperTime", diaperType: "diaperType",
-      recordDate: "recordDate", recordType: "recordType", title: "title", notes: "notes", description: "description",
-    });
-    const target = aliases[field];
+    const target = mutationFocusField(field);
     if (target !== undefined) setFocusRequest((previous) => ({ id: (previous?.id ?? 0) + 1, field: target }));
   }, []);
 
@@ -1166,7 +1426,6 @@ export function ManualTrackerScreen() {
     if (owner.kind !== "delete" && error instanceof TrackerValidationError) {
       const failure = serviceValidationFailure(error);
       send(mutationRejectedAction(owner, failure.message, failure.field));
-      requestFieldFocus(failure.field);
       return;
     }
     send(mutationRejectedAction(
@@ -1175,7 +1434,7 @@ export function ManualTrackerScreen() {
         ? RUNTIME_FAILURE
         : owner.kind === "delete" ? DELETE_FAILURE : SAVE_FAILURE,
     ));
-  }, [requestFieldFocus, send]);
+  }, [send]);
 
   const applyDiscardDestination = useCallback((decision: DiscardDecision) => {
     const source = stateRef.current;
@@ -1226,7 +1485,16 @@ export function ManualTrackerScreen() {
     const refreshAction = refreshStartedAction(owner, refreshPrior, success);
     if (completionAction === null || refreshAction === null) return;
     if (!send(completionAction) || !send(refreshAction)) return;
-    setListFocusRequest((value) => value + 1);
+    const destination = stateRef.current;
+    if (destination.tag !== "list.loading" || destination.source !== "mutation-refresh") return;
+    successCapabilityIdRef.current += 1;
+    pendingMutationSuccessRef.current = Object.freeze({
+      id: successCapabilityIdRef.current,
+      owner,
+      destination,
+      success,
+    });
+    setAccessibilityDeliveryRequest((value) => value + 1);
     void service.list(owner.domain, 100).then(
       (rows) => {
         if (!ownsOperationRefresh(owner)) return;
@@ -1486,8 +1754,10 @@ export function ManualTrackerScreen() {
   }, [requestDelete]);
 
   const cancelDecision = useCallback((decision: ScreenTrackerDecision) => {
-    if (decision.kind === "discard") send({ type: "DISCARD_CANCELLED", decision });
-    else send({ type: "CONFIRMATION_CANCELLED", decision });
+    const restored = decision.kind === "discard"
+      ? send({ type: "DISCARD_CANCELLED", decision })
+      : send({ type: "CONFIRMATION_CANCELLED", decision });
+    if (restored) pendingCancelFocusRef.current = Object.freeze({ decision, destination: stateRef.current });
   }, [send]);
 
   const acceptDecision = useCallback(async (decision: ScreenTrackerDecision) => {
@@ -1667,6 +1937,12 @@ export function ManualTrackerScreen() {
     || state.tag === "confirm.discard"
     ? state.decision
     : state.tag === "mutation.submitting" && "decision" in state ? state.decision ?? null : null;
+  const exposeSuccessAnnouncement = activeSuccessAnnouncement !== null
+    && recordsFocused
+    && state === activeSuccessAnnouncement.destination;
+  const exposeMutationIssue = activeMutationIssue !== null
+    && recordsFocused
+    && state === activeMutationIssue.destination;
   let content: ReactNode;
 
   if (state.tag === "zone.blocked.entry" || state.tag === "zone.blocked.save") {
@@ -1683,10 +1959,18 @@ export function ManualTrackerScreen() {
       <View style={{ gap: spacing.md }}>
         <TrackerDomainSwitcher disabled={state.source === "mutation-refresh"} onSelectDomain={selectDomain} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
         {renderList(state.prior, true, state)}
-        <Text accessibilityLiveRegion="polite" allowFontScaling style={{ color: colors.textSecondary }}>
+        <Text accessibilityLiveRegion={recordsFocused && !exposeSuccessAnnouncement ? "polite" : undefined} allowFontScaling style={{ color: colors.textSecondary }}>
           正在读取{label}记录…
         </Text>
-        {state.source === "mutation-refresh" ? <Text accessibilityLiveRegion="polite" allowFontScaling>{state.success}</Text> : null}
+        {state.source === "mutation-refresh" ? (
+          <Text
+            accessibilityLiveRegion={exposeSuccessAnnouncement ? "polite" : undefined}
+            allowFontScaling
+            key={exposeSuccessAnnouncement ? `success-${activeSuccessAnnouncement?.id}` : undefined}
+          >
+            {state.success}
+          </Text>
+        ) : null}
       </View>
     );
   } else if (state.tag === "list.ready.empty" || state.tag === "list.ready.rows") {
@@ -1694,7 +1978,15 @@ export function ManualTrackerScreen() {
       <View style={{ gap: spacing.md }}>
         <TrackerDomainSwitcher onSelectDomain={(domain) => selectDomainFrom(state, domain)} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
         {state.notice ? <Text accessibilityLiveRegion="assertive" accessibilityRole="alert" allowFontScaling>{state.notice}</Text> : null}
-        {state.success ? <Text accessibilityLiveRegion="polite" allowFontScaling>{state.success}</Text> : null}
+        {state.success ? (
+          <Text
+            accessibilityLiveRegion={exposeSuccessAnnouncement ? "polite" : undefined}
+            allowFontScaling
+            key={exposeSuccessAnnouncement ? `success-${activeSuccessAnnouncement?.id}` : undefined}
+          >
+            {state.success}
+          </Text>
+        ) : null}
         {renderList(state.fact, false, state)}
       </View>
     );
@@ -1705,8 +1997,21 @@ export function ManualTrackerScreen() {
         {state.kind === "refresh" && state.fact.rows.length > 0
           ? renderList(state.fact, false, state)
           : <Text accessibilityRole="header" allowFontScaling ref={listHeadingRef}>{label}记录</Text>}
-        {state.kind === "refresh" ? <Text accessibilityLiveRegion="polite" allowFontScaling>{state.success}</Text> : null}
-        <Text accessibilityLiveRegion="assertive" accessibilityRole="alert" allowFontScaling>
+        {state.kind === "refresh" ? (
+          <Text
+            accessibilityLiveRegion={exposeSuccessAnnouncement ? "polite" : undefined}
+            allowFontScaling
+            key={exposeSuccessAnnouncement ? `success-${activeSuccessAnnouncement?.id}` : undefined}
+          >
+            {state.success}
+          </Text>
+        ) : null}
+        <Text
+          accessibilityLiveRegion={state.kind === "initial" || exposeMutationIssue ? "assertive" : undefined}
+          accessibilityRole={state.kind === "initial" || exposeMutationIssue ? "alert" : undefined}
+          allowFontScaling
+          key={exposeMutationIssue ? `issue-${activeMutationIssue?.id}` : undefined}
+        >
           {state.kind === "refresh" ? "记录可能不是最新内容。" : `暂时无法读取${label}记录。本机数据没有更改。`}
         </Text>
         <PrimaryAction label="重新读取记录" onPress={() => resumeList(state, state.fact)} />
@@ -1734,8 +2039,13 @@ export function ManualTrackerScreen() {
   } else if (state.tag === "conflict.stale" || state.tag === "conflict.notFound") {
     content = (
       <View style={{ gap: spacing.md }}>
-        <Text accessibilityRole="header" allowFontScaling>记录冲突</Text>
-        <Text accessibilityLiveRegion="assertive" accessibilityRole="alert" allowFontScaling>
+        <Text accessibilityRole="header" allowFontScaling ref={conflictHeadingRef}>记录冲突</Text>
+        <Text
+          accessibilityLiveRegion={exposeMutationIssue ? "assertive" : undefined}
+          accessibilityRole={exposeMutationIssue ? "alert" : undefined}
+          allowFontScaling
+          key={exposeMutationIssue ? `issue-${activeMutationIssue?.id}` : undefined}
+        >
           {state.tag === "conflict.stale"
             ? "这条记录已在其他位置更新。为避免覆盖，请重新读取后再修改。"
             : "这条记录已不存在，不能继续保存或删除。"}
@@ -1760,17 +2070,26 @@ export function ManualTrackerScreen() {
     );
   } else if (editing !== null) {
     const notice = (state.tag === "create.editing" || state.tag === "edit.editing") ? state.notice : undefined;
+    const editorContent = renderEditor(
+      editing,
+      state.tag === "mutation.submitting",
+      state.tag === "mutation.error"
+        ? Object.freeze({ ...editing.errors, [state.field ?? "form"]: state.message })
+        : editing.errors,
+    );
     content = (
       <View style={{ gap: spacing.md }}>
         <TrackerDomainSwitcher busy={state.tag === "mutation.submitting"} onSelectDomain={(domain) => selectDomainFrom(state, domain)} selectedDomain={selectedDomain} tabRefs={domainTabRefs} />
         {notice ? <Text accessibilityLiveRegion="polite" allowFontScaling>{notice}</Text> : null}
-        {renderEditor(
-          editing,
-          state.tag === "mutation.submitting",
-          state.tag === "mutation.error"
-            ? Object.freeze({ ...editing.errors, [state.field ?? "form"]: state.message })
-            : editing.errors,
-        )}
+        {state.tag === "mutation.error" ? (
+          <TrackerErrorAnnouncementScope
+            announcement={exposeMutationIssue && activeMutationIssue !== null
+              ? Object.freeze({ id: activeMutationIssue.id, message: activeMutationIssue.message })
+              : null}
+          >
+            {editorContent}
+          </TrackerErrorAnnouncementScope>
+        ) : editorContent}
       </View>
     );
   } else {

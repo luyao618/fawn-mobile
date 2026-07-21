@@ -211,6 +211,33 @@ function refocusTracker() {
   });
 }
 
+function healthCreateConfirmationResult() {
+  const input = Object.freeze({
+    recordDate: "2026-07-20",
+    recordType: "illness" as const,
+    title: "轻微咳嗽",
+    description: null,
+    sourceMessageId: null,
+  });
+  return Object.freeze({
+    status: "confirmation_required" as const,
+    summary: Object.freeze({ action: "create" as const, domain: "health" as const, input }),
+  });
+}
+
+async function submitHealthCreateForConfirmation() {
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("tab", { name: "健康" }));
+  await screen.findByText("还没有健康记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增健康记录" }));
+  fireEvent.press(screen.getByRole("radio", { name: "健康记录类型身体不适" }));
+  fireEvent.changeText(screen.getByLabelText("标题"), "轻微咳嗽");
+  await act(async () => {
+    fireEvent.press(screen.getByRole("button", { name: "保存健康记录" }));
+    await Promise.resolve();
+  });
+}
+
 beforeEach(() => {
   jest.useFakeTimers();
   jest.setSystemTime(new Date("2026-07-20T00:10:00.000Z"));
@@ -260,6 +287,164 @@ test("defaults to growth, preserves the selected domain while mounted, and reads
     </SafeAreaProvider>,
   );
   expect(screen.getByRole("tab", { name: "大小便" }).props.accessibilityState.selected).toBe(true);
+});
+
+test("focuses a newly active decision heading exactly once while Records is focused", async () => {
+  const create = jest.fn(async () => healthCreateConfirmationResult());
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock({ create: create as ManualTrackerServicePort["create"] }));
+  await submitHealthCreateForConfirmation();
+
+  expect(await screen.findByRole("header", { name: "确认新增健康记录" })).toBeTruthy();
+  await waitFor(() => expect(focus).toHaveBeenCalledTimes(1));
+  const [headingRef] = focus.mock.calls[0]!;
+  expect(textContent((headingRef?.current as unknown as { props?: { children?: unknown } })?.props?.children)).toBe("确认新增健康记录");
+
+  blurTracker();
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+});
+
+test("cancel then reopen of one cached domain discard decision focuses once per activation", async () => {
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock());
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+
+  fireEvent.press(screen.getByRole("tab", { name: "健康" }));
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const first = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (first.tag !== "confirm.discard") throw new Error("expected first discard decision");
+  await waitFor(() => expect(focus).toHaveBeenCalledTimes(1));
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+
+  focus.mockClear();
+  fireEvent.press(screen.getByRole("tab", { name: "健康" }));
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const second = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (second.tag !== "confirm.discard") throw new Error("expected reopened discard decision");
+  expect(second.decision).toBe(first.decision);
+  await waitFor(() => expect(focus).toHaveBeenCalledTimes(1));
+
+  blurTracker();
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+});
+
+test("distinct same-title discard decisions retain exact identity and focus once each", async () => {
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock());
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+
+  fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const first = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (first.tag !== "confirm.discard") throw new Error("expected first discard decision");
+  await waitFor(() => expect(focus).toHaveBeenCalledTimes(1));
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+
+  focus.mockClear();
+  fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const second = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (second.tag !== "confirm.discard") throw new Error("expected second discard decision");
+  expect(second.decision).not.toBe(first.decision);
+  await waitFor(() => expect(focus).toHaveBeenCalledTimes(1));
+});
+
+test("defers a blurred decision heading until refocus and consumes it once", async () => {
+  const result = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const create = jest.fn(() => result.promise);
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock({ create: create as ManualTrackerServicePort["create"] }));
+  await submitHealthCreateForConfirmation();
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+  blurTracker();
+  focus.mockClear();
+
+  await act(async () => result.resolve(healthCreateConfirmationResult()));
+  expect(await screen.findByRole("header", { name: "确认新增健康记录" })).toBeTruthy();
+  expect(focus).not.toHaveBeenCalled();
+
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+  const [headingRef] = focus.mock.calls[0]!;
+  expect(textContent((headingRef?.current as unknown as { props?: { children?: unknown } })?.props?.children)).toBe("确认新增健康记录");
+  blurTracker();
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+});
+
+test("discard cancel preserves the frozen initiator and defers its exact focus while blurred", async () => {
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock());
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const confirmation = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (confirmation.tag !== "confirm.discard") throw new Error("expected discard confirmation");
+  const initiatingControlRef = confirmation.decision.initiatingControlRef;
+
+  blurTracker();
+  focus.mockClear();
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  expect(screen.getByRole("button", { name: "返回生长列表" })).toBeTruthy();
+  expect(focus).not.toHaveBeenCalled();
+  expect(initiatingControlRef.current).not.toBeNull();
+
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+  expect(focus).toHaveBeenCalledWith(initiatingControlRef);
+  expect((initiatingControlRef.current as unknown as { props?: { accessibilityLabel?: string } })?.props?.accessibilityLabel).toBe("返回生长列表");
+  blurTracker();
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+});
+
+test("a blurred cancel capability is dropped when its exact restored destination is superseded", async () => {
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock());
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const confirmation = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (confirmation.tag !== "confirm.discard") throw new Error("expected discard confirmation");
+  const staleInitiator = confirmation.decision.initiatingControlRef;
+
+  blurTracker();
+  focus.mockClear();
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+  refocusTracker();
+
+  expect(focus).not.toHaveBeenCalledWith(staleInitiator);
+  expect(focus).not.toHaveBeenCalled();
+});
+
+test("discard cancel returns focus once to the exact frozen initiator while Records is focused", async () => {
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock());
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const confirmation = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (confirmation.tag !== "confirm.discard") throw new Error("expected discard confirmation");
+  const initiatingControlRef = confirmation.decision.initiatingControlRef;
+  focus.mockClear();
+
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  await waitFor(() => expect(focus).toHaveBeenCalledTimes(1));
+  expect(focus).toHaveBeenCalledWith(initiatingControlRef);
+  expect((initiatingControlRef.current as unknown as { props?: { accessibilityLabel?: string } })?.props?.accessibilityLabel).toBe("返回生长列表");
 });
 
 test("initial and domain loading reserve heading/action geometry", async () => {
@@ -404,7 +589,9 @@ test("list read failure with no committed rows offers only read retry", async ()
   const service = createServiceMock({ list });
   renderTracker(service);
 
-  expect(await screen.findByText("暂时无法读取生长记录。本机数据没有更改。")).toBeTruthy();
+  const initialError = await screen.findByRole("alert");
+  expect(initialError).toHaveTextContent("暂时无法读取生长记录。本机数据没有更改。");
+  expect(initialError.props.accessibilityLiveRegion).toBe("assertive");
   expect(screen.getAllByRole("button").map((button) => button.props.accessibilityLabel)).toEqual([
     "重新读取记录",
   ]);
@@ -719,6 +906,282 @@ test("a pending low-risk create stays interlocked, then starts one operation-own
   expect(create).toHaveBeenCalledTimes(1);
 });
 
+test.each(["ready", "error"] as const)(
+  "blurred mutation success settled to %s delivers before any refocus read and only once",
+  async (outcome) => {
+  const createResult = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const refresh = deferred<readonly TrackerRecordByDomain["growth"][]>();
+  const laterOrdinaryRead = deferred<readonly TrackerRecordByDomain["growth"][]>();
+  const list = jest.fn()
+    .mockResolvedValueOnce([])
+    .mockReturnValueOnce(refresh.promise)
+    .mockReturnValueOnce(laterOrdinaryRead.promise);
+  const create = jest.fn((
+    _domain: TrackerDomain,
+    _input: TrackerCreateInputByDomain[TrackerDomain],
+  ) => createResult.promise);
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock({
+    list: list as ManualTrackerServicePort["list"],
+    create: create as ManualTrackerServicePort["create"],
+  }));
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+  blurTracker();
+  focus.mockClear();
+
+  const input = create.mock.calls[0]![1];
+  await act(async () => createResult.resolve({
+    status: "completed",
+    summary: Object.freeze({ action: "create", domain: "growth", input }),
+    record: records.growth,
+  }));
+  const blurredLoading = screen.getByText("正在读取生长记录…");
+  const blurredSuccess = screen.getByText("生长记录已保存");
+  expect(blurredLoading.props.accessibilityLiveRegion).toBeUndefined();
+  expect(blurredSuccess.props.accessibilityLiveRegion).toBeUndefined();
+  expect(focus).not.toHaveBeenCalled();
+
+  await act(async () => {
+    if (outcome === "ready") refresh.resolve([]);
+    else refresh.reject(new Error("refresh failed"));
+  });
+  expect(screen.queryByText("正在读取生长记录…")).toBeNull();
+  expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBeUndefined();
+  if (outcome === "error") {
+    const warning = screen.getByText("记录可能不是最新内容。");
+    expect(warning.props.accessibilityRole).toBeUndefined();
+    expect(warning.props.accessibilityLiveRegion).toBeUndefined();
+  }
+  expect(focus).not.toHaveBeenCalled();
+
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+  expect(list).toHaveBeenCalledTimes(2);
+  const deliveredHeading = focus.mock.calls[0]?.[0]?.current as unknown as { props?: { children?: unknown } };
+  expect(textContent(deliveredHeading.props?.children)).toBe("生长记录");
+  expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBe("polite");
+  if (outcome === "error") {
+    const warning = screen.getByText("记录可能不是最新内容。");
+    expect(warning.props.accessibilityRole).toBe("alert");
+    expect(warning.props.accessibilityLiveRegion).toBe("assertive");
+  }
+
+  blurTracker();
+  expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBeUndefined();
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+  expect(list).toHaveBeenCalledTimes(3);
+  expect(screen.queryByText("生长记录已保存")?.props.accessibilityLiveRegion).toBeUndefined();
+  if (outcome === "error") {
+    expect(screen.queryByRole("alert")).toBeNull();
+  }
+  },
+);
+
+test("settled blurred refresh error delivers pending accessibility before reads when the heading ref is null", async () => {
+  const firstCreate = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const secondCreate = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const failedRefresh = deferred<readonly TrackerRecordByDomain["growth"][]>();
+  const list = jest.fn()
+    .mockResolvedValueOnce([])
+    .mockResolvedValueOnce([])
+    .mockReturnValueOnce(failedRefresh.promise)
+    .mockResolvedValueOnce([]);
+  const create = jest.fn()
+    .mockReturnValueOnce(firstCreate.promise)
+    .mockReturnValueOnce(secondCreate.promise);
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock({
+    list: list as ManualTrackerServicePort["list"],
+    create: create as ManualTrackerServicePort["create"],
+  }));
+  await screen.findByText("还没有生长记录");
+
+  const submitCreate = () => {
+    fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+    fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+    fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  };
+  submitCreate();
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+  const firstInput = create.mock.calls[0]![1];
+  await act(async () => firstCreate.resolve({
+    status: "completed",
+    summary: Object.freeze({ action: "create", domain: "growth", input: firstInput }),
+    record: records.growth,
+  }));
+  await waitFor(() => expect(focus).toHaveBeenCalledTimes(1));
+  const headingRef = focus.mock.calls[0]![0]!;
+  expect(headingRef.current).not.toBeNull();
+  await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+  focus.mockClear();
+
+  submitCreate();
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+  blurTracker();
+  const secondInput = create.mock.calls[1]![1];
+  await act(async () => secondCreate.resolve({
+    status: "completed",
+    summary: Object.freeze({ action: "create", domain: "growth", input: secondInput }),
+    record: records.growth,
+  }));
+  await act(async () => failedRefresh.reject(new Error("refresh failed")));
+  expect(list).toHaveBeenCalledTimes(3);
+  expect(focus).not.toHaveBeenCalled();
+  headingRef.current = null;
+
+  refocusTracker();
+  expect(list).toHaveBeenCalledTimes(3);
+  expect(focus).toHaveBeenCalledTimes(1);
+  expect(focus.mock.calls[0]?.[0]?.current).toBeNull();
+  expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBe("polite");
+  const warning = screen.getByText("记录可能不是最新内容。");
+  expect(warning.props.accessibilityRole).toBe("alert");
+  expect(warning.props.accessibilityLiveRegion).toBe("assertive");
+
+  blurTracker();
+  refocusTracker();
+  expect(list).toHaveBeenCalledTimes(4);
+  expect(focus).toHaveBeenCalledTimes(1);
+  await waitFor(() => {
+    expect(screen.queryByText("生长记录已保存")?.props.accessibilityLiveRegion).toBeUndefined();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+test.each(["ready", "error"] as const)(
+  "focused mutation-loading success expires when its exact destination transitions to %s",
+  async (outcome) => {
+    const createResult = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+    const refresh = deferred<readonly TrackerRecordByDomain["growth"][]>();
+    const list = jest.fn().mockResolvedValueOnce([]).mockReturnValueOnce(refresh.promise);
+    const create = jest.fn((
+      _domain: TrackerDomain,
+      _input: TrackerCreateInputByDomain[TrackerDomain],
+    ) => createResult.promise);
+    const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+    renderTracker(createServiceMock({
+      list: list as ManualTrackerServicePort["list"],
+      create: create as ManualTrackerServicePort["create"],
+    }));
+    await screen.findByText("还没有生长记录");
+    fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+    fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+    fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    focus.mockClear();
+
+    const input = create.mock.calls[0]![1];
+    await act(async () => createResult.resolve({
+      status: "completed",
+      summary: Object.freeze({ action: "create", domain: "growth", input }),
+      record: records.growth,
+    }));
+    expect(focus).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBe("polite");
+    expect(screen.getByText("正在读取生长记录…").props.accessibilityLiveRegion).toBeUndefined();
+
+    await act(async () => {
+      if (outcome === "ready") refresh.resolve([]);
+      else refresh.reject(new Error("refresh failed"));
+    });
+    expect(focus).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBeUndefined();
+  },
+);
+
+test("consecutive identical success copy operations receive distinct one-shot deliveries", async () => {
+  const firstCreate = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const secondCreate = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const firstRefresh = deferred<readonly TrackerRecordByDomain["growth"][]>();
+  const secondRefresh = deferred<readonly TrackerRecordByDomain["growth"][]>();
+  const list = jest.fn()
+    .mockResolvedValueOnce([])
+    .mockReturnValueOnce(firstRefresh.promise)
+    .mockReturnValueOnce(secondRefresh.promise);
+  const create = jest.fn()
+    .mockReturnValueOnce(firstCreate.promise)
+    .mockReturnValueOnce(secondCreate.promise);
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock({
+    list: list as ManualTrackerServicePort["list"],
+    create: create as ManualTrackerServicePort["create"],
+  }));
+  await screen.findByText("还没有生长记录");
+  focus.mockClear();
+
+  const submitCreate = () => {
+    fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+    fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+    fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  };
+  submitCreate();
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+  const firstInput = create.mock.calls[0]![1];
+  await act(async () => firstCreate.resolve({
+    status: "completed",
+    summary: Object.freeze({ action: "create", domain: "growth", input: firstInput }),
+    record: records.growth,
+  }));
+  expect(focus).toHaveBeenCalledTimes(1);
+  expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBe("polite");
+  await act(async () => firstRefresh.resolve([]));
+  expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBeUndefined();
+
+  submitCreate();
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+  const secondInput = create.mock.calls[1]![1];
+  await act(async () => secondCreate.resolve({
+    status: "completed",
+    summary: Object.freeze({ action: "create", domain: "growth", input: secondInput }),
+    record: records.growth,
+  }));
+  expect(focus).toHaveBeenCalledTimes(2);
+  expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBe("polite");
+  await act(async () => secondRefresh.resolve([]));
+  expect(screen.getByText("生长记录已保存").props.accessibilityLiveRegion).toBeUndefined();
+});
+
+test("an unmounted mutation cannot reactivate success delivery after remount", async () => {
+  const createResult = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const oldList = jest.fn().mockResolvedValue([]);
+  const oldCreate = jest.fn((
+    _domain: TrackerDomain,
+    _input: TrackerCreateInputByDomain[TrackerDomain],
+  ) => createResult.promise);
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  const oldView = renderTracker(createServiceMock({
+    list: oldList as ManualTrackerServicePort["list"],
+    create: oldCreate as ManualTrackerServicePort["create"],
+  }));
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  await waitFor(() => expect(oldCreate).toHaveBeenCalledTimes(1));
+  oldView.unmount();
+
+  const newList = jest.fn().mockResolvedValue([]);
+  renderTracker(createServiceMock({ list: newList as ManualTrackerServicePort["list"] }));
+  await screen.findByText("还没有生长记录");
+  focus.mockClear();
+  const input = oldCreate.mock.calls[0]![1];
+  await act(async () => createResult.resolve({
+    status: "completed",
+    summary: Object.freeze({ action: "create", domain: "growth", input }),
+    record: records.growth,
+  }));
+
+  expect(oldList).toHaveBeenCalledTimes(1);
+  expect(newList).toHaveBeenCalledTimes(1);
+  expect(focus).not.toHaveBeenCalled();
+  expect(screen.queryByText("生长记录已保存")).toBeNull();
+});
+
 test("validation focuses the first invalid field and keeps safe adjacent copy", async () => {
   const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
   const service = createServiceMock();
@@ -775,6 +1238,218 @@ test.each([
   const rendered = JSON.stringify(view.toJSON());
   expect(rendered).not.toContain("private raw validation detail");
   expect(rendered).not.toContain("privateRawField");
+});
+
+test.each([
+  [new Error("private failure"), "保存失败，本机记录没有更改。", "新增生长记录"],
+  [new TrackerValidationError("growth", "weightG", "private detail"), "请检查标出的内容后再保存。", "体重（克）"],
+] as const)("a blurred direct-create issue defers exact focus and assertive exposure", async (failure, copy, focusLabel) => {
+  const result = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const create = jest.fn(() => result.promise);
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock({ create: create as ManualTrackerServicePort["create"] }));
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+  blurTracker();
+  focus.mockClear();
+  await act(async () => result.reject(failure));
+
+  const blurredError = screen.getByText(copy);
+  expect(blurredError.props.accessibilityRole).toBeUndefined();
+  expect(blurredError.props.accessibilityLiveRegion).toBeUndefined();
+  expect(focus).not.toHaveBeenCalled();
+
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+  const target = focus.mock.calls[0]?.[0]?.current as unknown as { props?: { accessibilityLabel?: string; children?: unknown } };
+  expect(target.props?.accessibilityLabel ?? textContent(target.props?.children)).toBe(focusLabel);
+  expect(screen.getByRole("alert")).toHaveTextContent(copy);
+  expect(screen.getByText(copy).props.accessibilityLiveRegion).toBe("assertive");
+
+  blurTracker();
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+  expect(screen.getByText(copy).props.accessibilityRole).toBeUndefined();
+});
+
+test.each(["update", "delete"] as const)("a blurred %s conflict defers conflict-heading focus and never replays", async (kind) => {
+  const updateConflict = deferred<Awaited<ReturnType<ManualTrackerServicePort["update"]>>>();
+  const deleteConflict = deferred<Awaited<ReturnType<ManualTrackerServicePort["delete"]>>>();
+  const updateInput = Object.freeze({
+    measurementDate: records.growth.measurementDate,
+    weightG: 7300,
+    heightCm: records.growth.heightCm,
+    headCm: records.growth.headCm,
+    weightPercentile: records.growth.weightPercentile,
+    heightPercentile: records.growth.heightPercentile,
+    headPercentile: records.growth.headPercentile,
+    notes: records.growth.notes,
+  });
+  const update = jest.fn()
+    .mockResolvedValueOnce(Object.freeze({
+      status: "confirmation_required" as const,
+      summary: Object.freeze({
+        action: "update" as const,
+        domain: "growth" as const,
+        id: records.growth.id,
+        expectedUpdatedAt: records.growth.updatedAt,
+        input: updateInput,
+      }),
+    }))
+    .mockReturnValueOnce(updateConflict.promise);
+  const remove = jest.fn(() => deleteConflict.promise);
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock({
+    list: jest.fn(async () => [records.growth]) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.growth) as ManualTrackerServicePort["getById"],
+    update: update as ManualTrackerServicePort["update"],
+    delete: remove as ManualTrackerServicePort["delete"],
+  }));
+  fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
+  await screen.findByRole("header", { name: "编辑生长记录" });
+  if (kind === "update") {
+    fireEvent.changeText(screen.getByLabelText("体重（克）"), "7300");
+    fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+    await screen.findByRole("header", { name: "确认保存修改" });
+    fireEvent.press(screen.getByRole("button", { name: "确认保存" }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+  } else {
+    fireEvent.press(screen.getByRole("button", { name: "删除这条记录" }));
+    await waitFor(() => expect(remove).toHaveBeenCalledTimes(1));
+  }
+  blurTracker();
+  focus.mockClear();
+  await act(async () => {
+    const failure = new ManualTrackerConflictError("stale_write");
+    if (kind === "update") updateConflict.reject(failure);
+    else deleteConflict.reject(failure);
+  });
+
+  const copy = "这条记录已在其他位置更新。为避免覆盖，请重新读取后再修改。";
+  expect(screen.getByText(copy).props.accessibilityRole).toBeUndefined();
+  expect(focus).not.toHaveBeenCalled();
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+  const heading = focus.mock.calls[0]?.[0]?.current as unknown as { props?: { children?: unknown } };
+  expect(textContent(heading.props?.children)).toBe("记录冲突");
+  expect(screen.getByText(copy).props.accessibilityLiveRegion).toBe("assertive");
+  blurTracker();
+  refocusTracker();
+  expect(focus).toHaveBeenCalledTimes(1);
+  expect(screen.getByText(copy).props.accessibilityRole).toBeUndefined();
+});
+
+test("pending and active mutation issues are dropped on exact destination supersession", async () => {
+  const first = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  const view = renderTracker(createServiceMock({
+    create: jest.fn(() => first.promise) as ManualTrackerServicePort["create"],
+  }));
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  blurTracker();
+  focus.mockClear();
+  await act(async () => first.reject(new Error("private failure")));
+  expect(screen.getByText("保存失败，本机记录没有更改。").props.accessibilityRole).toBeUndefined();
+
+  fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+  expect(await screen.findByRole("header", { name: "放弃未保存的更改？" })).toBeTruthy();
+  refocusTracker();
+  expect(screen.queryByText("保存失败，本机记录没有更改。")).toBeNull();
+  expect(screen.queryByRole("alert")).toBeNull();
+  const focusedCopy = focus.mock.calls.map(([target]) => textContent((target?.current as unknown as { props?: { children?: unknown } })?.props?.children));
+  expect(focusedCopy).not.toContain("新增生长记录");
+
+  view.unmount();
+
+  const activeFailure = jest.fn(async () => { throw new Error("private active failure"); });
+  renderTracker(createServiceMock({ create: activeFailure as ManualTrackerServicePort["create"] }));
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  focus.mockClear();
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("保存失败，本机记录没有更改。");
+  expect(focus).toHaveBeenCalledTimes(1);
+  fireEvent.press(screen.getByRole("button", { name: "返回生长列表" }));
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const confirmation = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
+  if (confirmation.tag !== "confirm.discard") throw new Error("expected discard confirmation");
+  const initiatingControlRef = confirmation.decision.initiatingControlRef;
+  expect(screen.queryByText("保存失败，本机记录没有更改。")).toBeNull();
+  focus.mockClear();
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  await waitFor(() => expect(focus).toHaveBeenCalledTimes(1));
+  const restoredError = screen.getByText("保存失败，本机记录没有更改。");
+  expect(restoredError.props.accessibilityRole).toBeUndefined();
+  expect(restoredError.props.accessibilityLiveRegion).toBeUndefined();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(focus).toHaveBeenCalledWith(initiatingControlRef);
+});
+
+test("an unmounted pending mutation issue cannot expose or focus after remount", async () => {
+  const result = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  const view = renderTracker(createServiceMock({
+    create: jest.fn(() => result.promise) as ManualTrackerServicePort["create"],
+  }));
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  blurTracker();
+  await act(async () => result.reject(new Error("private failure")));
+  expect(screen.getByText("保存失败，本机记录没有更改。").props.accessibilityRole).toBeUndefined();
+  view.unmount();
+  focus.mockClear();
+  renderTracker(createServiceMock());
+  await screen.findByText("还没有生长记录");
+  expect(focus).not.toHaveBeenCalled();
+  expect(screen.queryByText("保存失败，本机记录没有更改。")).toBeNull();
+});
+
+test("identical mutation issues from later operations have distinct one-shot announcement identities", async () => {
+  const first = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const second = deferred<Awaited<ReturnType<ManualTrackerServicePort["create"]>>>();
+  const create = jest.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
+  renderTracker(createServiceMock({ create: create as ManualTrackerServicePort["create"] }));
+  await screen.findByText("还没有生长记录");
+  fireEvent.press(screen.getByRole("button", { name: "新增生长记录" }));
+  fireEvent.changeText(screen.getByLabelText("体重（克）"), "7200");
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+  blurTracker();
+  focus.mockClear();
+  await act(async () => first.reject(new Error("private first")));
+  refocusTracker();
+  const firstAnnouncement = screen.getByRole("alert");
+  expect(firstAnnouncement).toHaveTextContent("保存失败，本机记录没有更改。");
+  expect(focus).toHaveBeenCalledTimes(1);
+  blurTracker();
+  refocusTracker();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(focus).toHaveBeenCalledTimes(1);
+
+  fireEvent.press(screen.getByRole("button", { name: "保存生长记录" }));
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+  blurTracker();
+  await act(async () => second.reject(new Error("private second")));
+  expect(screen.queryByRole("alert")).toBeNull();
+  refocusTracker();
+  const secondAnnouncement = screen.getByRole("alert");
+  expect(secondAnnouncement).toHaveTextContent("保存失败，本机记录没有更改。");
+  expect(secondAnnouncement).not.toBe(firstAnnouncement);
+  expect(focus).toHaveBeenCalledTimes(2);
+  blurTracker();
+  refocusTracker();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(focus).toHaveBeenCalledTimes(2);
 });
 
 test.each(hostileDomainCases)('$kind fails closed when $domain receives another domain without private leakage', async ({
@@ -1158,6 +1833,7 @@ test.each(["back", "domain"] as const)("dirty edit %s freezes exact editor and d
 });
 
 test("initiating controls use pairwise distinct refs while each control keeps its ref across retries", async () => {
+  const focus = jest.spyOn(trackerAccessibility, "focusRefIfAvailable");
   const input = Object.freeze({
     measurementDate: records.growth.measurementDate,
     weightG: 7300,
@@ -1206,7 +1882,9 @@ test("initiating controls use pairwise distinct refs while each control keeps it
     await screen.findByRole("header", { name: "确认保存修改" });
     const first = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
     if (first.tag !== "confirm.update") throw new Error("expected first save confirmation");
+    focus.mockClear();
     fireEvent.press(screen.getByRole("button", { name: "返回修改" }));
+    expect(focus).toHaveBeenCalledWith(first.decision.initiatingControlRef);
     fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
     await screen.findByRole("header", { name: "确认保存修改" });
     const second = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
@@ -1221,7 +1899,9 @@ test("initiating controls use pairwise distinct refs while each control keeps it
     await screen.findByRole("header", { name: "确认删除这条生长记录" });
     const first = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
     if (first.tag !== "confirm.delete") throw new Error("expected first delete confirmation");
+    focus.mockClear();
     fireEvent.press(screen.getByRole("button", { name: "取消" }));
+    expect(focus).toHaveBeenCalledWith(first.decision.initiatingControlRef);
     fireEvent.press(screen.getByRole("button", { name: "删除这条记录" }));
     await screen.findByRole("header", { name: "确认删除这条生长记录" });
     const second = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
@@ -1235,7 +1915,9 @@ test("initiating controls use pairwise distinct refs while each control keeps it
     control();
     const first = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
     if (first.tag !== "confirm.discard") throw new Error("expected first discard confirmation");
+    focus.mockClear();
     fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+    expect(focus).toHaveBeenCalledWith(first.decision.initiatingControlRef);
     control();
     const second = mockTrackerReducerObserver.mock.calls.at(-1)?.[1] as TrackerScreenState;
     if (second.tag !== "confirm.discard") throw new Error("expected second discard confirmation");

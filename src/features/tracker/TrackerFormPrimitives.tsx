@@ -1,4 +1,4 @@
-import { useState, type Ref } from "react";
+import { createContext, useContext, useState, type ReactNode, type Ref } from "react";
 import {
   Pressable,
   type KeyboardTypeOptions,
@@ -41,6 +41,23 @@ export type TrackerInputSubmitConfig = Readonly<{
 }>;
 export type TrackerInputSubmitMap = Readonly<Partial<Record<TrackerInputField, TrackerInputSubmitConfig>>>;
 
+export type TrackerErrorAnnouncement = Readonly<{ id: number; message: string }>;
+const TrackerErrorAnnouncementContext = createContext<TrackerErrorAnnouncement | null | undefined>(undefined);
+
+export function TrackerErrorAnnouncementScope({
+  announcement,
+  children,
+}: Readonly<{
+  announcement: TrackerErrorAnnouncement | null;
+  children: ReactNode;
+}>) {
+  return (
+    <TrackerErrorAnnouncementContext.Provider value={announcement}>
+      {children}
+    </TrackerErrorAnnouncementContext.Provider>
+  );
+}
+
 type InputProps = Readonly<{
   busy?: boolean;
   disabled?: boolean;
@@ -57,12 +74,15 @@ type InputProps = Readonly<{
 }>;
 
 export function FieldError({ message }: { message?: string }) {
+  const announcement = useContext(TrackerErrorAnnouncementContext);
   if (!message) return null;
+  const announce = announcement === undefined || announcement?.message === message;
   return (
     <Text
-      accessibilityLiveRegion="assertive"
-      accessibilityRole="alert"
+      accessibilityLiveRegion={announce ? "assertive" : undefined}
+      accessibilityRole={announce ? "alert" : undefined}
       allowFontScaling
+      key={announcement && announce ? announcement.id : undefined}
       style={styles.error}
     >
       {message}
@@ -284,6 +304,7 @@ const styles = StyleSheet.create({
     borderRadius: radius.control,
     justifyContent: "center",
     minHeight: 44,
+    minWidth: 44,
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.sm,
   },
