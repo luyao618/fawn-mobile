@@ -248,8 +248,12 @@ test("rejected missing-record reload transition suppresses its fallback list", a
   renderTracker(service);
   mockTrackerReducerRejector.mockImplementation((action) => action.type === "GET_MISSING_RELOAD_STARTED");
   fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
-  await waitFor(() => expect(getById).toHaveBeenCalledTimes(1));
-  await act(async () => { jest.runOnlyPendingTimers(); await Promise.resolve(); });
+  expect(getById).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    await Promise.resolve();
+    await jest.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+  });
   expect(list).toHaveBeenCalledTimes(1);
   expect(screen.getByRole("header", { name: "编辑生长记录" })).toBeTruthy();
 });
