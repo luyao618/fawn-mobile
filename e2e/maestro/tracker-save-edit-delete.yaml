@@ -1,0 +1,984 @@
+appId: com.luyao618.formobile
+---
+- extendedWaitUntil:
+    visible:
+      id: "tab-RecordsTab"
+    timeout: 120000
+- tapOn:
+    id: "tab-RecordsTab"
+- extendedWaitUntil:
+    visible: '^生长记录$'
+    timeout: 120000
+- tapOn: '^生长$'
+- tapOn: '^新增生长记录$'
+- assertVisible: '^新增生长记录$'
+- scrollUntilVisible:
+    element:
+      text: '^测量日期$'
+      below:
+        text: '^测量日期$'
+    direction: DOWN
+- tapOn:
+    text: '^测量日期$'
+    below:
+      text: '^测量日期$'
+- eraseText
+- inputText: "2026-07-19"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^2026-07-19$'
+          below:
+            text: '^测量日期$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^2026-07-19$'
+            below:
+              text: '^测量日期$'
+          direction: DOWN
+      - assertVisible:
+          text: '^2026-07-19$'
+          below:
+            text: '^测量日期$'
+- scrollUntilVisible:
+    element:
+      text: '^体重（克）$'
+      below:
+        text: '^体重（克）$'
+    direction: DOWN
+- tapOn:
+    text: '^体重（克）$'
+    below:
+      text: '^体重（克）$'
+- inputText: "7200"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^7200$'
+          below:
+            text: '^体重（克）$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^7200$'
+            below:
+              text: '^体重（克）$'
+          direction: DOWN
+      - assertVisible:
+          text: '^7200$'
+          below:
+            text: '^体重（克）$'
+- scrollUntilVisible:
+    element:
+      text: '^身长（厘米）$'
+      below:
+        text: '^身长（厘米）$'
+    direction: DOWN
+- tapOn:
+    text: '^身长（厘米）$'
+    below:
+      text: '^身长（厘米）$'
+- inputText: "68.5"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^68\.5$'
+          below:
+            text: '^身长（厘米）$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^68\.5$'
+            below:
+              text: '^身长（厘米）$'
+          direction: DOWN
+      - assertVisible:
+          text: '^68\.5$'
+          below:
+            text: '^身长（厘米）$'
+- scrollUntilVisible:
+    element:
+      text: '^头围（厘米）$'
+      below:
+        text: '^头围（厘米）$'
+    direction: DOWN
+- tapOn:
+    text: '^头围（厘米）$'
+    below:
+      text: '^头围（厘米）$'
+- inputText: "43.2"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^43\.2$'
+          below:
+            text: '^头围（厘米）$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^43\.2$'
+            below:
+              text: '^头围（厘米）$'
+          direction: DOWN
+      - assertVisible:
+          text: '^43\.2$'
+          below:
+            text: '^头围（厘米）$'
+- scrollUntilVisible:
+    element:
+      text: '^备注$'
+      below:
+        text: '^备注$'
+    direction: DOWN
+- tapOn:
+    text: '^备注$'
+    below:
+      text: '^备注$'
+- inputText: "synthetic growth"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^synthetic growth$'
+          below:
+            text: '^备注$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^synthetic growth$'
+            below:
+              text: '^备注$'
+          direction: DOWN
+      - assertVisible:
+          text: '^synthetic growth$'
+          below:
+            text: '^备注$'
+- scrollUntilVisible:
+    element:
+      text: '^保存生长记录$'
+    direction: DOWN
+- tapOn: '^保存生长记录$'
+- scrollUntilVisible:
+    element:
+      text: '^生长记录，2026年7月19日，体重 7200 克 · 身长 68\.5 厘米 · 头围 43\.2 厘米 · 有备注$'
+    direction: DOWN
+- assertVisible: '^生长记录，2026年7月19日，体重 7200 克 · 身长 68\.5 厘米 · 头围 43\.2 厘米 · 有备注$'
+- tapOn: '^喂养$'
+- tapOn: '^新增喂养记录$'
+- assertVisible: '^新增喂养记录$'
+- scrollUntilVisible:
+    element:
+      text: '^喂养日期$'
+      below:
+        text: '^喂养日期$'
+    direction: DOWN
+- tapOn:
+    text: '^喂养日期$'
+    below:
+      text: '^喂养日期$'
+- eraseText
+- inputText: "2026-07-20"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^2026-07-20$'
+          below:
+            text: '^喂养日期$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^2026-07-20$'
+            below:
+              text: '^喂养日期$'
+          direction: DOWN
+      - assertVisible:
+          text: '^2026-07-20$'
+          below:
+            text: '^喂养日期$'
+- scrollUntilVisible:
+    element:
+      text: '^喂养时间$'
+      below:
+        text: '^喂养时间$'
+    direction: DOWN
+- tapOn:
+    text: '^喂养时间$'
+    below:
+      text: '^喂养时间$'
+- eraseText
+- inputText: "08:10"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^08:10$'
+          below:
+            text: '^喂养时间$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^08:10$'
+            below:
+              text: '^喂养时间$'
+          direction: DOWN
+      - assertVisible:
+          text: '^08:10$'
+          below:
+            text: '^喂养时间$'
+- scrollUntilVisible:
+    element:
+      text: '^喂养类型配方奶$'
+    direction: DOWN
+- tapOn: '^喂养类型配方奶$'
+- scrollUntilVisible:
+    element:
+      text: '^量（毫升）$'
+      below:
+        text: '^量（毫升）$'
+    direction: DOWN
+- tapOn:
+    text: '^量（毫升）$'
+    below:
+      text: '^量（毫升）$'
+- inputText: "90"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^90$'
+          below:
+            text: '^量（毫升）$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^90$'
+            below:
+              text: '^量（毫升）$'
+          direction: DOWN
+      - assertVisible:
+          text: '^90$'
+          below:
+            text: '^量（毫升）$'
+- scrollUntilVisible:
+    element:
+      text: '^备注$'
+      below:
+        text: '^备注$'
+    direction: DOWN
+- tapOn:
+    text: '^备注$'
+    below:
+      text: '^备注$'
+- inputText: "synthetic feeding"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^synthetic feeding$'
+          below:
+            text: '^备注$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^synthetic feeding$'
+            below:
+              text: '^备注$'
+          direction: DOWN
+      - assertVisible:
+          text: '^synthetic feeding$'
+          below:
+            text: '^备注$'
+- scrollUntilVisible:
+    element:
+      text: '^保存喂养记录$'
+    direction: DOWN
+- tapOn: '^保存喂养记录$'
+- scrollUntilVisible:
+    element:
+      text: '^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 90 毫升 · 有备注$'
+    direction: DOWN
+- assertVisible: '^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 90 毫升 · 有备注$'
+- tapOn: '^睡眠$'
+- tapOn: '^新增睡眠记录$'
+- assertVisible: '^新增睡眠记录$'
+- scrollUntilVisible:
+    element:
+      text: '^开始日期$'
+      below:
+        text: '^开始日期$'
+    direction: DOWN
+- tapOn:
+    text: '^开始日期$'
+    below:
+      text: '^开始日期$'
+- eraseText
+- inputText: "2026-07-20"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^2026-07-20$'
+          below:
+            text: '^开始日期$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^2026-07-20$'
+            below:
+              text: '^开始日期$'
+          direction: DOWN
+      - assertVisible:
+          text: '^2026-07-20$'
+          below:
+            text: '^开始日期$'
+- scrollUntilVisible:
+    element:
+      text: '^开始时间$'
+      below:
+        text: '^开始时间$'
+    direction: DOWN
+- tapOn:
+    text: '^开始时间$'
+    below:
+      text: '^开始时间$'
+- eraseText
+- inputText: "04:00"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^04:00$'
+          below:
+            text: '^开始时间$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^04:00$'
+            below:
+              text: '^开始时间$'
+          direction: DOWN
+      - assertVisible:
+          text: '^04:00$'
+          below:
+            text: '^开始时间$'
+- scrollUntilVisible:
+    element:
+      text: '^结束日期$'
+      below:
+        text: '^结束日期$'
+    direction: DOWN
+- tapOn:
+    text: '^结束日期$'
+    below:
+      text: '^结束日期$'
+- inputText: "2026-07-20"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^2026-07-20$'
+          below:
+            text: '^结束日期$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^2026-07-20$'
+            below:
+              text: '^结束日期$'
+          direction: DOWN
+      - assertVisible:
+          text: '^2026-07-20$'
+          below:
+            text: '^结束日期$'
+- scrollUntilVisible:
+    element:
+      text: '^结束时间$'
+      below:
+        text: '^结束时间$'
+    direction: DOWN
+- tapOn:
+    text: '^结束时间$'
+    below:
+      text: '^结束时间$'
+- inputText: "09:00"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^09:00$'
+          below:
+            text: '^结束时间$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^09:00$'
+            below:
+              text: '^结束时间$'
+          direction: DOWN
+      - assertVisible:
+          text: '^09:00$'
+          below:
+            text: '^结束时间$'
+- scrollUntilVisible:
+    element:
+      text: '^睡眠类型夜间睡眠$'
+    direction: DOWN
+- tapOn: '^睡眠类型夜间睡眠$'
+- scrollUntilVisible:
+    element:
+      text: '^夜醒次数$'
+      below:
+        text: '^夜醒次数$'
+    direction: DOWN
+- tapOn:
+    text: '^夜醒次数$'
+    below:
+      text: '^夜醒次数$'
+- eraseText
+- inputText: "2"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^2$'
+          below:
+            text: '^夜醒次数$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^2$'
+            below:
+              text: '^夜醒次数$'
+          direction: DOWN
+      - assertVisible:
+          text: '^2$'
+          below:
+            text: '^夜醒次数$'
+- scrollUntilVisible:
+    element:
+      text: '^备注$'
+      below:
+        text: '^备注$'
+    direction: DOWN
+- tapOn:
+    text: '^备注$'
+    below:
+      text: '^备注$'
+- inputText: "synthetic sleep"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^synthetic sleep$'
+          below:
+            text: '^备注$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^synthetic sleep$'
+            below:
+              text: '^备注$'
+          direction: DOWN
+      - assertVisible:
+          text: '^synthetic sleep$'
+          below:
+            text: '^备注$'
+- scrollUntilVisible:
+    element:
+      text: '^保存睡眠记录$'
+    direction: DOWN
+- tapOn: '^保存睡眠记录$'
+- scrollUntilVisible:
+    element:
+      text: '^睡眠记录，2026年7月20日 04:00（本机时间），夜间睡眠 · 至 2026年7月20日 09:00（本机时间） · 夜醒 2 次 · 有备注$'
+    direction: DOWN
+- assertVisible: '^睡眠记录，2026年7月20日 04:00（本机时间），夜间睡眠 · 至 2026年7月20日 09:00（本机时间） · 夜醒 2 次 · 有备注$'
+- tapOn: '^大小便$'
+- tapOn: '^新增大小便记录$'
+- assertVisible: '^新增大小便记录$'
+- scrollUntilVisible:
+    element:
+      text: '^记录日期$'
+      below:
+        text: '^记录日期$'
+    direction: DOWN
+- tapOn:
+    text: '^记录日期$'
+    below:
+      text: '^记录日期$'
+- eraseText
+- inputText: "2026-07-20"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^2026-07-20$'
+          below:
+            text: '^记录日期$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^2026-07-20$'
+            below:
+              text: '^记录日期$'
+          direction: DOWN
+      - assertVisible:
+          text: '^2026-07-20$'
+          below:
+            text: '^记录日期$'
+- scrollUntilVisible:
+    element:
+      text: '^记录时间$'
+      below:
+        text: '^记录时间$'
+    direction: DOWN
+- tapOn:
+    text: '^记录时间$'
+    below:
+      text: '^记录时间$'
+- eraseText
+- inputText: "08:20"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^08:20$'
+          below:
+            text: '^记录时间$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^08:20$'
+            below:
+              text: '^记录时间$'
+          direction: DOWN
+      - assertVisible:
+          text: '^08:20$'
+          below:
+            text: '^记录时间$'
+- scrollUntilVisible:
+    element:
+      text: '^类型混合$'
+    direction: DOWN
+- tapOn: '^类型混合$'
+- scrollUntilVisible:
+    element:
+      text: '^备注$'
+      below:
+        text: '^备注$'
+    direction: DOWN
+- tapOn:
+    text: '^备注$'
+    below:
+      text: '^备注$'
+- inputText: "synthetic diaper"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^synthetic diaper$'
+          below:
+            text: '^备注$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^synthetic diaper$'
+            below:
+              text: '^备注$'
+          direction: DOWN
+      - assertVisible:
+          text: '^synthetic diaper$'
+          below:
+            text: '^备注$'
+- scrollUntilVisible:
+    element:
+      text: '^保存大小便记录$'
+    direction: DOWN
+- tapOn: '^保存大小便记录$'
+- scrollUntilVisible:
+    element:
+      text: '^大小便记录，2026年7月20日 08:20（本机时间），混合 · 有备注$'
+    direction: DOWN
+- assertVisible: '^大小便记录，2026年7月20日 08:20（本机时间），混合 · 有备注$'
+- tapOn: '^健康$'
+- tapOn: '^新增健康记录$'
+- assertVisible: '^新增健康记录$'
+- scrollUntilVisible:
+    element:
+      text: '^记录日期$'
+      below:
+        text: '^记录日期$'
+    direction: DOWN
+- tapOn:
+    text: '^记录日期$'
+    below:
+      text: '^记录日期$'
+- eraseText
+- inputText: "2026-07-18"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^2026-07-18$'
+          below:
+            text: '^记录日期$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^2026-07-18$'
+            below:
+              text: '^记录日期$'
+          direction: DOWN
+      - assertVisible:
+          text: '^2026-07-18$'
+          below:
+            text: '^记录日期$'
+- scrollUntilVisible:
+    element:
+      text: '^健康记录类型常规检查$'
+    direction: DOWN
+- tapOn: '^健康记录类型常规检查$'
+- scrollUntilVisible:
+    element:
+      text: '^标题$'
+      below:
+        text: '^标题$'
+    direction: DOWN
+- tapOn:
+    text: '^标题$'
+    below:
+      text: '^标题$'
+- inputText: "Synthetic checkup"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^Synthetic checkup$'
+          below:
+            text: '^标题$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^Synthetic checkup$'
+            below:
+              text: '^标题$'
+          direction: DOWN
+      - assertVisible:
+          text: '^Synthetic checkup$'
+          below:
+            text: '^标题$'
+- scrollUntilVisible:
+    element:
+      text: '^说明$'
+      below:
+        text: '^说明$'
+    direction: DOWN
+- tapOn:
+    text: '^说明$'
+    below:
+      text: '^说明$'
+- inputText: "synthetic health"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^synthetic health$'
+          below:
+            text: '^说明$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^synthetic health$'
+            below:
+              text: '^说明$'
+          direction: DOWN
+      - assertVisible:
+          text: '^synthetic health$'
+          below:
+            text: '^说明$'
+- scrollUntilVisible:
+    element:
+      text: '^保存健康记录$'
+    direction: DOWN
+- tapOn: '^保存健康记录$'
+- assertVisible: '^确认新增健康记录$'
+- tapOn: '^返回修改$'
+- assertVisible: '^新增健康记录$'
+- scrollUntilVisible:
+    element:
+      text: '^2026-07-18$'
+      below:
+        text: '^记录日期$'
+    direction: DOWN
+- assertVisible:
+    text: '^2026-07-18$'
+    below:
+      text: '^记录日期$'
+- scrollUntilVisible:
+    element:
+      text: '^Synthetic checkup$'
+      below:
+        text: '^标题$'
+    direction: DOWN
+- assertVisible:
+    text: '^Synthetic checkup$'
+    below:
+      text: '^标题$'
+- scrollUntilVisible:
+    element:
+      text: '^synthetic health$'
+      below:
+        text: '^说明$'
+    direction: DOWN
+- assertVisible:
+    text: '^synthetic health$'
+    below:
+      text: '^说明$'
+- scrollUntilVisible:
+    element:
+      text: '^保存健康记录$'
+    direction: DOWN
+- tapOn: '^保存健康记录$'
+- assertVisible: '^确认新增健康记录$'
+- assertVisible: '^健康记录类型$'
+- assertVisible: '^常规检查$'
+- tapOn: '^确认保存$'
+- scrollUntilVisible:
+    element:
+      text: '^健康记录，2026年7月18日，常规检查 · Synthetic checkup · 有说明$'
+    direction: DOWN
+- assertVisible: '^健康记录，2026年7月18日，常规检查 · Synthetic checkup · 有说明$'
+- tapOn: '^喂养$'
+- scrollUntilVisible:
+    element:
+      text: '^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 90 毫升 · 有备注$'
+    direction: DOWN
+- assertVisible: '^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 90 毫升 · 有备注$'
+- tapOn: '^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 90 毫升 · 有备注$'
+- assertVisible: '^编辑喂养记录$'
+- scrollUntilVisible:
+    element:
+      text: '^量（毫升）$'
+      below:
+        text: '^量（毫升）$'
+    direction: DOWN
+- tapOn:
+    text: '^量（毫升）$'
+    below:
+      text: '^量（毫升）$'
+- eraseText
+- inputText: "100"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+          text: '^100$'
+          below:
+            text: '^量（毫升）$'
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^100$'
+            below:
+              text: '^量（毫升）$'
+          direction: DOWN
+      - assertVisible:
+          text: '^100$'
+          below:
+            text: '^量（毫升）$'
+- scrollUntilVisible:
+    element:
+      text: '^保存修改$'
+    direction: DOWN
+- tapOn: '^保存修改$'
+- assertVisible: '^确认保存修改$'
+- assertVisible: '^原内容$'
+- assertVisible: '^90 毫升$'
+- assertVisible: '^新内容$'
+- assertVisible: '^100 毫升$'
+- tapOn: '^确认保存$'
+- scrollUntilVisible:
+    element:
+      text: '^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 100 毫升 · 有备注$'
+    direction: DOWN
+- assertVisible: '^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 100 毫升 · 有备注$'
+- tapOn: '^大小便$'
+- scrollUntilVisible:
+    element:
+      text: '^大小便记录，2026年7月20日 08:20（本机时间），混合 · 有备注$'
+    direction: DOWN
+- assertVisible: '^大小便记录，2026年7月20日 08:20（本机时间），混合 · 有备注$'
+- tapOn: '^大小便记录，2026年7月20日 08:20（本机时间），混合 · 有备注$'
+- assertVisible: '^编辑大小便记录$'
+- scrollUntilVisible:
+    element:
+      text: '^删除这条记录$'
+    direction: DOWN
+- tapOn: '^删除这条记录$'
+- assertVisible: '^确认删除这条大小便记录$'
+- assertVisible: '^2026年7月20日 08:20（本机时间）$'
+- assertVisible: '^混合 · 有备注$'
+- assertVisible: '^删除后不会出现在记录列表中；当前版本没有恢复入口。$'
+- tapOn: '^确认删除$'
+- assertVisible: '^还没有大小便记录$'
+- assertNotVisible: '^大小便记录，2026年7月20日 08:20（本机时间），混合 · 有备注$'

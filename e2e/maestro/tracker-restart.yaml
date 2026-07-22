@@ -1,0 +1,38 @@
+appId: com.luyao618.formobile
+---
+- extendedWaitUntil:
+    visible:
+      id: "tab-RecordsTab"
+    timeout: 120000
+- tapOn:
+    id: "tab-RecordsTab"
+- extendedWaitUntil:
+    visible: '^生长记录$'
+    timeout: 120000
+- tapOn: '^生长$'
+- scrollUntilVisible:
+    element:
+      text: '^生长记录，2026年7月19日，体重 7200 克 · 身长 68\.5 厘米 · 头围 43\.2 厘米 · 有备注$'
+    direction: DOWN
+- assertVisible: '^生长记录，2026年7月19日，体重 7200 克 · 身长 68\.5 厘米 · 头围 43\.2 厘米 · 有备注$'
+- tapOn: '^喂养$'
+- scrollUntilVisible:
+    element:
+      text: '^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 100 毫升 · 有备注$'
+    direction: DOWN
+- assertVisible: '^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 100 毫升 · 有备注$'
+- tapOn: '^睡眠$'
+- scrollUntilVisible:
+    element:
+      text: '^睡眠记录，2026年7月20日 04:00（本机时间），夜间睡眠 · 至 2026年7月20日 09:00（本机时间） · 夜醒 2 次 · 有备注$'
+    direction: DOWN
+- assertVisible: '^睡眠记录，2026年7月20日 04:00（本机时间），夜间睡眠 · 至 2026年7月20日 09:00（本机时间） · 夜醒 2 次 · 有备注$'
+- tapOn: '^大小便$'
+- assertVisible: '^还没有大小便记录$'
+- assertNotVisible: '^大小便记录，2026年7月20日 08:20（本机时间），混合 · 有备注$'
+- tapOn: '^健康$'
+- scrollUntilVisible:
+    element:
+      text: '^健康记录，2026年7月18日，常规检查 · Synthetic checkup · 有说明$'
+    direction: DOWN
+- assertVisible: '^健康记录，2026年7月18日，常规检查 · Synthetic checkup · 有说明$'
