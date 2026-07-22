@@ -4106,13 +4106,15 @@ function trackerInputSequence(label: string, value: string, erase: boolean): str
   const androidEntered = trackerCompoundSelector(label, value, 10);
   const iosScrollEntered = trackerCompoundSelector(label, value, 12);
   const iosAssertEntered = trackerCompoundSelector(label, value, 10);
+  const tap = `- tapOn:\n${tapField}`;
+  // Pinned Android eraseText backspaces from the caret, so retapping and erasing clears a surviving right-side suffix.
+  const entryStart = erase ? `${tap}\n- eraseText\n${tap}\n- eraseText` : tap;
   return `- scrollUntilVisible:
     element:
 ${scrollField}
     direction: DOWN
-- tapOn:
-${tapField}
-${erase ? "- eraseText\n" : ""}- inputText: ${JSON.stringify(value)}
+${entryStart}
+- inputText: ${JSON.stringify(value)}
 - runFlow:
     when:
       platform: Android
@@ -4136,8 +4138,8 @@ ${iosAssertEntered}`;
 
 const trackerCommandInventories = Object.freeze({
   save: Object.freeze({
-    extendedWaitUntil: 2, tapOn: 53, assertVisible: 77, scrollUntilVisible: 67,
-    eraseText: 10, inputText: 22, runFlow: 44, hideKeyboard: 22, swipe: 22, assertNotVisible: 1,
+    extendedWaitUntil: 2, tapOn: 63, assertVisible: 77, scrollUntilVisible: 67,
+    eraseText: 20, inputText: 22, runFlow: 44, hideKeyboard: 22, swipe: 22, assertNotVisible: 1,
   }),
   restart: Object.freeze({
     extendedWaitUntil: 2, tapOn: 6, scrollUntilVisible: 4, assertVisible: 5, assertNotVisible: 1,
@@ -4710,9 +4712,27 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
     readFile(trackerSaveFlowPath, "utf8"), readFile(trackerRestartFlowPath, "utf8"),
     readFile(trackerAndroidRunnerPath, "utf8"), readFile(trackerIosRunnerPath, "utf8"),
   ]);
+  const replaceExactlyOnce = (source: string, target: string, replacement: string, label: string): string => {
+    assert.equal(source.split(target).length - 1, 1, `${label} mutation target must occur exactly once`);
+    return source.replace(target, () => replacement);
+  };
+  const measurementDateSecondClear = `- tapOn:\n${trackerCompoundSelector("测量日期", "测量日期", 4)}\n- eraseText\n`;
+  const measurementDateDoubleClear = `${measurementDateSecondClear}${measurementDateSecondClear}`;
+  const measurementDateFinalClear = `${measurementDateSecondClear}- inputText: "2026-07-19"`;
   const flowMutations: readonly [string, string, "save" | "restart", RegExp?][] = [
     ["label-only input", saveFlow.replace(trackerCompoundSelector("测量日期", "测量日期", 4), "    text: '^测量日期$'"), "save"],
-    ["missing erase", saveFlow.replace("- eraseText\n- inputText: \"2026-07-19\"", "- inputText: \"2026-07-19\""), "save"],
+    ["one clear cycle", replaceExactlyOnce(
+      saveFlow,
+      measurementDateDoubleClear,
+      measurementDateSecondClear,
+      "one clear cycle",
+    ), "save", /one clear cycle command inventory drifted/],
+    ["wrong second-cycle field", replaceExactlyOnce(
+      saveFlow,
+      measurementDateFinalClear,
+      `- tapOn:\n${trackerCompoundSelector("喂养日期", "喂养日期", 4)}\n- eraseText\n- inputText: "2026-07-19"`,
+      "wrong second-cycle field",
+    ), "save", /测量日期=2026-07-19 must use the exact compound entry sequence/],
     ["wrong decimal escaping", restartFlow.replace("68\\.5", "68.5"), "restart"],
     ["coordinate", `${saveFlow}\n- tapOn:\n    point: \"50%,50%\"\n`, "save"],
     ["optional", `${saveFlow}\n- tapOn:\n    text: '^生长$'\n    optional: true\n`, "save"],
@@ -4725,7 +4745,8 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
     const enforceMutation = () => {
       assertTrackerFlowSafety(mutation, label, kind);
       for (const [field, value, erase] of [["测量日期", "2026-07-19", true]] as const) {
-        assert.equal(mutation.split(trackerInputSequence(field, value, erase)).length - 1, 1);
+        assert.equal(mutation.split(trackerInputSequence(field, value, erase)).length - 1, 1,
+          `${field}=${value} must use the exact compound entry sequence`);
       }
       assert.match(mutation, /68\\\.5/);
     };

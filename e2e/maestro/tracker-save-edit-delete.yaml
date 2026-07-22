@@ -23,6 +23,11 @@ appId: com.luyao618.formobile
     below:
       text: '^测量日期$'
 - eraseText
+- tapOn:
+    text: '^测量日期$'
+    below:
+      text: '^测量日期$'
+- eraseText
 - inputText: "2026-07-19"
 - runFlow:
     when:
@@ -217,6 +222,11 @@ appId: com.luyao618.formobile
     below:
       text: '^喂养日期$'
 - eraseText
+- tapOn:
+    text: '^喂养日期$'
+    below:
+      text: '^喂养日期$'
+- eraseText
 - inputText: "2026-07-20"
 - runFlow:
     when:
@@ -249,6 +259,11 @@ appId: com.luyao618.formobile
       below:
         text: '^喂养时间$'
     direction: DOWN
+- tapOn:
+    text: '^喂养时间$'
+    below:
+      text: '^喂养时间$'
+- eraseText
 - tapOn:
     text: '^喂养时间$'
     below:
@@ -381,6 +396,11 @@ appId: com.luyao618.formobile
     below:
       text: '^开始日期$'
 - eraseText
+- tapOn:
+    text: '^开始日期$'
+    below:
+      text: '^开始日期$'
+- eraseText
 - inputText: "2026-07-20"
 - runFlow:
     when:
@@ -413,6 +433,11 @@ appId: com.luyao618.formobile
       below:
         text: '^开始时间$'
     direction: DOWN
+- tapOn:
+    text: '^开始时间$'
+    below:
+      text: '^开始时间$'
+- eraseText
 - tapOn:
     text: '^开始时间$'
     below:
@@ -532,6 +557,11 @@ appId: com.luyao618.formobile
     below:
       text: '^夜醒次数$'
 - eraseText
+- tapOn:
+    text: '^夜醒次数$'
+    below:
+      text: '^夜醒次数$'
+- eraseText
 - inputText: "2"
 - runFlow:
     when:
@@ -618,6 +648,11 @@ appId: com.luyao618.formobile
     below:
       text: '^记录日期$'
 - eraseText
+- tapOn:
+    text: '^记录日期$'
+    below:
+      text: '^记录日期$'
+- eraseText
 - inputText: "2026-07-20"
 - runFlow:
     when:
@@ -650,6 +685,11 @@ appId: com.luyao618.formobile
       below:
         text: '^记录时间$'
     direction: DOWN
+- tapOn:
+    text: '^记录时间$'
+    below:
+      text: '^记录时间$'
+- eraseText
 - tapOn:
     text: '^记录时间$'
     below:
@@ -741,6 +781,11 @@ appId: com.luyao618.formobile
       below:
         text: '^记录日期$'
     direction: DOWN
+- tapOn:
+    text: '^记录日期$'
+    below:
+      text: '^记录日期$'
+- eraseText
 - tapOn:
     text: '^记录日期$'
     below:
@@ -915,6 +960,11 @@ appId: com.luyao618.formobile
       below:
         text: '^量（毫升）$'
     direction: DOWN
+- tapOn:
+    text: '^量（毫升）$'
+    below:
+      text: '^量（毫升）$'
+- eraseText
 - tapOn:
     text: '^量（毫升）$'
     below:
