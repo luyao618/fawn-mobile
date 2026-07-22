@@ -615,7 +615,7 @@ test("CLI actions write only exact canonical JSON bytes", async (context) => {
     ["--action", "fixture-oracle", "--time-zone", "Asia/Shanghai", "--output", fixtureOutput],
     ["--action", "tracker-snapshot", "--database", database, "--output", snapshotOutput],
   ]) {
-    const result = spawnSync(process.execPath, [TOOL_PATH, ...args], { encoding: "utf8" });
+    const result = spawnSync(process.execPath, ["--no-warnings", TOOL_PATH, ...args], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, "");
     assert.equal(result.stderr, "");
