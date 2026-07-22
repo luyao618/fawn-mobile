@@ -89,6 +89,7 @@ jobs:
             --scheme-report-e2e .artifacts/schemes/android-e2e.json \
             --persistence-report .artifacts/android-persistence.json \
             --profile-restart-report .artifacts/android-profile-restart.json \
+            --tracker-restart-report .artifacts/android-tracker-restart.json \
             --output .artifacts/android-e2e.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -102,6 +103,7 @@ jobs:
             .artifacts/test-results/android-maestro.log
             .artifacts/android-persistence.json
             .artifacts/android-profile-restart.json
+            .artifacts/android-tracker-restart.json
             .artifacts/persistence/android/*.json
           if-no-files-found: error
       - name: Retain Android launch and Maestro diagnostics

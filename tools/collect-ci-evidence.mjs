@@ -10,9 +10,10 @@ import { fileURLToPath } from "node:url";
 import { validateResolvedConfigs } from "./check-app-config.mjs";
 import { validateFaultBundleProof } from "./check-fault-bundles.mjs";
 import { inspectNativeScheme, NATIVE_EVIDENCE_PATHS } from "./check-native-schemes.mjs";
+import { validateCanonicalTrackerReportBytes } from "./tracker-evidence.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
-export const CI_EVIDENCE_SCHEMA_VERSION = 5;
+export const CI_EVIDENCE_SCHEMA_VERSION = 6;
 const PROFILE_VALUE_SHA256 = "6bfb59d6996bf798923420d4ffb334430f3b1c6cd0c87988d29e353c06a7f6db";
 const PROFILE_VALUES = Object.freeze({
   birthDate: "2024-02-29",
@@ -155,6 +156,17 @@ export function collectProfileRestartEvidence(path, reportSha256) {
   assert(path, "Profile restart report path is absent");
   assert.match(reportSha256, /^[0-9a-f]{64}$/, "Profile restart report SHA is invalid");
   return { path, sha256: reportSha256 };
+}
+
+export function collectTrackerRestartEvidence(path, reportSha256, platform) {
+  assert(["android", "ios"].includes(platform), "Tracker restart evidence platform is invalid");
+  assert.equal(path, `.artifacts/${platform}-tracker-restart.json`, "Tracker restart report path is noncanonical");
+  assert.match(reportSha256, /^[0-9a-f]{64}$/, "Tracker restart report SHA is invalid");
+  return { path, sha256: reportSha256 };
+}
+
+export function validateTrackerRestartReport(bytes, platform, expectedSha, root = repoRoot) {
+  return validateCanonicalTrackerReportBytes(bytes, platform, expectedSha, root);
 }
 
 export async function validateNativeReports({ platform, expectedSha, configReports, schemeReports, root = repoRoot }) {
@@ -414,9 +426,47 @@ async function loadReport(path) {
   return { path, sha256: await sha256(path), report };
 }
 
+function trackerRestartReportOption(platform, argv = process.argv.slice(2)) {
+  const name = "--tracker-restart-report";
+  const exactIndexes = [];
+  const aliases = [];
+  argv.forEach((argument, index) => {
+    if (argument === name) exactIndexes.push(index);
+    else if (argument.startsWith(`${name}=`)) aliases.push(argument);
+  });
+  if (platform === "host") {
+    assert.equal(exactIndexes.length + aliases.length, 0, `${name} is forbidden for host evidence`);
+    return null;
+  }
+  if (["android", "ios"].includes(platform)) {
+    assert.equal(aliases.length, 0, `${name} aliases are invalid; use the canonical raw path argument`);
+    assert.equal(exactIndexes.length, 1, `${name} is required exactly once for native evidence`);
+    const path = argv[exactIndexes[0] + 1];
+    assert(path && !path.startsWith("--"), `${name} requires one raw canonical path argument`);
+    assert.equal(path, `.artifacts/${platform}-tracker-restart.json`, `${name} path is noncanonical for ${platform}`);
+    return path;
+  }
+  assert.equal(exactIndexes.length + aliases.length, 0, `${name} is invalid for platform ${platform}`);
+  return null;
+}
+
+async function loadTrackerRestartReport(path, platform, expectedSha) {
+  let bytes;
+  try {
+    bytes = await readFile(path);
+  } catch (error) {
+    throw new Error(`Required tracker restart report is absent: ${path}`, { cause: error });
+  }
+  validateTrackerRestartReport(bytes, platform, expectedSha);
+  return collectTrackerRestartEvidence(path, createHash("sha256").update(bytes).digest("hex"), platform);
+}
+
 async function main() {
   const output = resolve(option("--output", ".artifacts/ci-evidence.json"));
   const expectedSha = option("--expected-sha", process.env.EXPECTED_SHA);
+  const platform = option("--platform", process.platform);
+  const flavor = option("--flavor", "static");
+  const trackerRestartReportPath = trackerRestartReportOption(platform);
   const checkedOutSha = command("git", ["rev-parse", "HEAD"]);
   assert(checkedOutSha, "Unable to read checked-out SHA");
   assert(expectedSha, "Expected SHA is required");
@@ -435,13 +485,12 @@ async function main() {
   }
   const testResult = validateTestResultInput(option("--test-result", null), testResultPath, testResultBytes);
 
-  const platform = option("--platform", process.platform);
-  const flavor = option("--flavor", "static");
   let reports = null;
   let nativeFiles = null;
   let faultBundles = null;
   let persistence = null;
   let profileRestart = null;
+  let trackerRestart = null;
   if (platform === "host") {
     assert.equal(flavor, "static", "Host evidence must represent static gates");
     const faultBundleProof = await loadReport(option("--fault-bundle-proof", null));
@@ -476,6 +525,7 @@ async function main() {
     assert.equal(profileRestartReport.path, `.artifacts/${platform}-profile-restart.json`, "Profile restart report path is noncanonical");
     await validateProfileRestartReport(profileRestartReport.report, platform, expectedSha);
     profileRestart = collectProfileRestartEvidence(profileRestartReport.path, profileRestartReport.sha256);
+    trackerRestart = await loadTrackerRestartReport(trackerRestartReportPath, platform, expectedSha);
   }
   const evidence = {
     schemaVersion: CI_EVIDENCE_SCHEMA_VERSION,
@@ -495,6 +545,7 @@ async function main() {
     faultBundles,
     persistence,
     profileRestart,
+    trackerRestart,
     runner: {
       os: process.env.RUNNER_OS ?? process.platform,
       arch: process.env.RUNNER_ARCH ?? process.arch,

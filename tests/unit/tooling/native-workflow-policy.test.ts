@@ -86,11 +86,11 @@ const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
 const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/android/production/**/*.js\n.artifacts/fault-bundles/android/production/metadata.json\n.artifacts/fault-bundles/android/e2e/**/*.js\n.artifacts/fault-bundles/android/e2e/metadata.json\n.artifacts/fault-bundles/ios/production/**/*.js\n.artifacts/fault-bundles/ios/production/metadata.json\n.artifacts/fault-bundles/ios/e2e/**/*.js\n.artifacts/fault-bundles/ios/e2e/metadata.json\n";
 const exactChildPrimaryUploadPaths = {
-  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n.artifacts/android-persistence.json\n.artifacts/android-profile-restart.json\n.artifacts/persistence/android/*.json\n",
-  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/ios-profile-restart.json\n.artifacts/persistence/ios/*.json\n",
+  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n.artifacts/android-persistence.json\n.artifacts/android-profile-restart.json\n.artifacts/android-tracker-restart.json\n.artifacts/persistence/android/*.json\n",
+  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/ios-profile-restart.json\n.artifacts/ios-tracker-restart.json\n.artifacts/persistence/ios/*.json\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "52236399b43c99f85a9820351612e0228b835ad8f67c15eee23e9025b803fcb9";
+const exactAndroidRunnerSha256 = "f2c078edca1a49e0958ae93265a3585800ff98e02ad106c80d20b766b54fdb67";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -163,6 +163,7 @@ const exactChildCollectorRuns = {
   --scheme-report-e2e .artifacts/schemes/android-e2e.json \
   --persistence-report .artifacts/android-persistence.json \
   --profile-restart-report .artifacts/android-profile-restart.json \
+  --tracker-restart-report .artifacts/android-tracker-restart.json \
   --output .artifacts/android-e2e.json` + "\n",
   ios: String.raw`node tools/collect-ci-evidence.mjs \
   --expected-sha "${expectedShaInput}" --platform ios --flavor e2e \
@@ -173,6 +174,7 @@ const exactChildCollectorRuns = {
   --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
   --persistence-report .artifacts/ios-persistence.json \
   --profile-restart-report .artifacts/ios-profile-restart.json \
+  --tracker-restart-report .artifacts/ios-tracker-restart.json \
   --output .artifacts/ios-e2e.json` + "\n",
 } as const;
 
@@ -711,7 +713,7 @@ function assertMetroProcessGroupPolicy(script: string, platform: NativePlatform)
   );
   assert.deepEqual(
     lines.filter((line) => line.trim().startsWith("kill ")).map((line) => line.trim()),
-    ['kill -- "-$metro_pid" 2>/dev/null', 'kill -- "-$metro_pid"'],
+    ['kill -- "-$metro_pid" 2>/dev/null', 'kill -- "-$owned_metro_pid"'],
     `${platform} Metro teardown must signal the complete process group in cleanup and the offline transition`,
   );
 }
@@ -1761,6 +1763,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     const processGroupMutations = [
       script.replace("set -m\n", ""),
       script.replaceAll('kill -- "-$metro_pid"', 'kill "$metro_pid"'),
+      script.replace('kill -- "-$owned_metro_pid"', 'kill "$owned_metro_pid"'),
       script.replace(
         `set -m\n${exactHeadlessMetroCommands[platform]}\nmetro_pid=$!\nset +m`,
         `set +m\n${exactHeadlessMetroCommands[platform]}\nmetro_pid=$!`,
@@ -3589,14 +3592,16 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assert.equal((iosWorkflow.match(/-configuration Release/g) ?? []).length, 1, "iOS Release must build exactly once");
   ordered(androidRunner,
     "bash scripts/e2e/run-persistence-android.sh",
-    'kill -- "-$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    "owned_metro_pid=$metro_pid", 'validate_positive_safe_integer "$owned_metro_pid"',
+    'kill -- "-$owned_metro_pid"', 'wait "$owned_metro_pid"', "metro_pid=",
     'adb -s "$emulator_serial" reverse --remove tcp:8081',
     "curl --silent --fail http://127.0.0.1:8081/status",
     "bash scripts/e2e/run-profile-restart-android.sh",
   );
   ordered(iosWorkflow,
     "bash scripts/e2e/run-persistence-ios.sh",
-    'kill -- "-$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    "owned_metro_pid=$metro_pid", 'validate_positive_safe_integer "$owned_metro_pid"',
+    'kill -- "-$owned_metro_pid"', 'wait "$owned_metro_pid"', "metro_pid=",
     "curl --silent --fail http://127.0.0.1:8081/status",
     "bash scripts/e2e/run-profile-restart-ios.sh",
   );
@@ -4754,4 +4759,238 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
     if (expectedError) assert.throws(enforceMutation, expectedError, `${platform} runner mutation`);
     else assert.throws(enforceMutation, `${platform} runner mutation`);
   }
+});
+
+function extractBashFunction(source: string, name: string): string {
+  const lines = source.split(/\r\n|\n|\r/);
+  const starts = lines.flatMap((line, index) => line.trim() === `${name}() {` ? [index] : []);
+  assert.equal(starts.length, 1, `${name} must have exactly one Bash function definition`);
+  const end = lines.findIndex((line, index) => index > starts[0]! && line.trim() === "}");
+  assert(end > starts[0]!, `${name} Bash function is unterminated`);
+  return lines.slice(starts[0], end + 1).join("\n");
+}
+
+function assertC3PositiveSafeIntegerValidator(source: string, platform: "android" | "ios"): string {
+  const validator = extractBashFunction(source, "validate_positive_safe_integer");
+  assert.match(validator, /Number\.isSafeInteger\(value\)/,
+    `${platform} validator must retain the safe-integer predicate`);
+  assert.match(validator, /value\s*<=\s*0/,
+    `${platform} validator must retain the positivity predicate`);
+  assert.match(validator, /String\(value\)\s*!==\s*process\.argv\[1\]/,
+    `${platform} validator must retain the canonical-string predicate`);
+  return validator;
+}
+
+function runC3PositiveSafeIntegerValidator(validator: string, value: string) {
+  return spawnSync("bash", ["-c", `set -euo pipefail\n${validator}\nvalidate_positive_safe_integer "$1"`, "_", value], {
+    encoding: "utf8",
+  });
+}
+
+function assertC3OwnedMetroHandoff(source: string, platform: "android" | "ios"): void {
+  const device = platform === "android" ? '"$emulator_serial"' : '"$simulator_udid"';
+  const artifact = platform === "android"
+    ? "android/app/build/outputs/apk/release/app-release.apk"
+    : '"$release_app_path"';
+  const profileCall = `bash scripts/e2e/run-profile-restart-${platform}.sh ${device} `
+    + (platform === "android" ? '"$EXPECTED_SHA" ' : '"${{ inputs.expected_sha }}" ')
+    + artifact;
+  const trackerCall = `bash scripts/e2e/run-tracker-restart-${platform}.sh ${device} `
+    + (platform === "android" ? '"$EXPECTED_SHA" ' : '"${{ inputs.expected_sha }}" ')
+    + `${artifact} "$owned_metro_pid"`;
+  const lines = source.split(/\r\n|\n|\r/);
+  const lineIndexes = (exact: string) => lines.flatMap((line, index) => line.trim() === exact ? [index] : []);
+  const assignmentIndexes = lineIndexes("owned_metro_pid=$metro_pid");
+  const validationIndexes = lineIndexes('validate_positive_safe_integer "$owned_metro_pid"');
+  const killIndexes = lineIndexes('kill -- "-$owned_metro_pid"');
+  const waitIndexes = lineIndexes('wait "$owned_metro_pid"');
+  assert.equal(assignmentIndexes.length, 1, `${platform} must retain exactly one owned Metro PID`);
+  assert.equal(validationIndexes.length, 1, `${platform} must validate the owned Metro PID exactly once`);
+  assert.equal(killIndexes.length, 1, `${platform} must contain exactly one owned Metro kill`);
+  assert.equal(waitIndexes.length, 1, `${platform} must contain exactly one owned Metro wait`);
+  const cleanupClearIndexes = lineIndexes("metro_pid=").filter((index) => index > waitIndexes[0]!);
+  assert.equal(cleanupClearIndexes.length, 1, `${platform} must clear cleanup ownership exactly once after the owned Metro wait`);
+  assert(assignmentIndexes[0]! < validationIndexes[0]!
+    && validationIndexes[0]! < killIndexes[0]!
+    && killIndexes[0]! < waitIndexes[0]!
+    && waitIndexes[0]! < cleanupClearIndexes[0]!,
+  `${platform} must preserve retained assignment, kill, wait, and cleanup-owner clear order`);
+  assertC3PositiveSafeIntegerValidator(source, platform);
+  ordered(source,
+    "owned_metro_pid=$metro_pid",
+    'kill -- "-$owned_metro_pid"',
+    'wait "$owned_metro_pid"',
+    "metro_pid=",
+    ...(platform === "android" ? ['reverse --remove tcp:8081'] : []),
+    "curl --silent --fail http://127.0.0.1:8081/status",
+    profileCall,
+    trackerCall,
+  );
+  assert.equal((source.match(new RegExp(`bash scripts/e2e/run-profile-restart-${platform}\\.sh`, "g")) ?? []).length, 1);
+  assert.equal((source.match(new RegExp(`bash scripts/e2e/run-tracker-restart-${platform}\\.sh`, "g")) ?? []).length, 1);
+  assert.equal(source.split(trackerCall).length - 1, 1, `${platform} tracker runner handoff must be exact and mandatory`);
+  assert.doesNotMatch(source, new RegExp(`(?:if|\\|\\||&&).*run-tracker-restart-${platform}|run-tracker-restart-${platform}.*(?:\\|\\||&&)`),
+    `${platform} tracker runner must not be optional or conditional`);
+  assert.equal(source.slice(source.indexOf("owned_metro_pid=$metro_pid")).includes("owned_metro_pid="), true);
+  assert.equal((source.slice(source.indexOf("owned_metro_pid=$metro_pid") + 1).match(/owned_metro_pid=\s*$/gm) ?? []).length, 0,
+    `${platform} must not destroy the retained Metro PID`);
+}
+
+function c3CollectorRun(platform: "android" | "ios"): string {
+  return exactChildCollectorRuns[platform];
+}
+
+function c3PrimaryUploadPath(platform: "android" | "ios"): string {
+  return exactChildPrimaryUploadPaths[platform];
+}
+
+function assertC3WorkflowBinding(source: string, platform: "android" | "ios"): void {
+  const workflow = parseWorkflow(source, `.github/workflows/e2e-${platform}.yml`);
+  const steps = requiredSteps(requiredJob(workflow, platform), platform);
+  const collector = steps.filter((step) => step.name === "Collect same-SHA evidence");
+  assert.equal(collector.length, 1, `${platform} must retain one collector`);
+  assert.equal(collector[0]!.run, c3CollectorRun(platform), `${platform} tracker collector flag must be exact`);
+  assertUnconditionalFailClosed(collector[0]!, `${platform} tracker collector`);
+  const uploads = steps.filter((step) => usesActionRepository(step, uploadArtifactRepository));
+  assert.equal(uploads.length, 2, `${platform} must retain only primary evidence and generic diagnostics uploads`);
+  const primary = uploads.find((step) => step.with?.name === `${platform}-e2e-evidence-${expectedShaInput}`);
+  assert(primary?.with, `${platform} primary evidence upload is absent`);
+  assert.equal(primary.with.path, c3PrimaryUploadPath(platform), `${platform} primary tracker evidence paths must be explicit`);
+  const diagnostics = uploads.find((step) => step.with?.name === `${platform}-e2e-diagnostics-${expectedShaInput}`);
+  assert.deepEqual(diagnostics?.with, {
+    name: `${platform}-e2e-diagnostics-${expectedShaInput}`,
+    path: ".artifacts/launch/**\n.artifacts/test-results/**\n",
+    "include-hidden-files": true,
+    "if-no-files-found": "ignore",
+  }, `${platform} generic diagnostics upload must remain non-evidence and unchanged`);
+  assert.equal(diagnostics?.if, "always()");
+}
+
+test("G035 C3 outer runners retain one exact owned Metro PID through profile then tracker handoff", async () => {
+  const [android, iosWorkflowSource] = await Promise.all([
+    readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
+    readFile(".github/workflows/e2e-ios.yml", "utf8"),
+  ]);
+  const iosWorkflow = parseWorkflow(iosWorkflowSource, ".github/workflows/e2e-ios.yml");
+  const ios = requiredSteps(requiredJob(iosWorkflow, "ios"), "ios")
+    .find((step) => step.name === "Serial production and E2E builds, install, and smoke")?.run;
+  assert(ios, "Parsed iOS outer runner script is absent");
+  assertC3OwnedMetroHandoff(android, "android");
+  assertC3OwnedMetroHandoff(ios, "ios");
+  for (const [platform, source] of [["android", android], ["ios", ios]] as const) {
+    const validator = assertC3PositiveSafeIntegerValidator(source, platform);
+    for (const valid of ["1", "42", "9007199254740991"]) {
+      const result = runC3PositiveSafeIntegerValidator(validator, valid);
+      assert.equal(result.status, 0, `${platform} rejected canonical safe PID ${valid}: ${result.stderr}`);
+    }
+    for (const invalid of ["0", "-1", "1.5", "9007199254740992", "01", "1e3", "+1", ""]) {
+      const result = runC3PositiveSafeIntegerValidator(validator, invalid);
+      assert.notEqual(result.status, 0, `${platform} accepted invalid PID ${JSON.stringify(invalid)}`);
+    }
+    const validatorMutations = [
+      [source.replace("Number.isSafeInteger(value)", "true"), /safe-integer predicate/],
+      [source.replace("value <= 0 || ", ""), /positivity predicate/],
+      [source.replace(" || String(value) !== process.argv[1]", ""), /canonical-string predicate/],
+    ] as const;
+    for (const [hostile, expected] of validatorMutations) {
+      assert.notEqual(hostile, source);
+      assert.throws(() => assertC3PositiveSafeIntegerValidator(hostile, platform), expected);
+    }
+    const lateValidationLines = source.split("\n");
+    const validationIndex = lateValidationLines.findIndex((line) => line.trim() === 'validate_positive_safe_integer "$owned_metro_pid"');
+    const killIndex = lateValidationLines.findIndex((line) => line.trim() === 'kill -- "-$owned_metro_pid"');
+    assert(validationIndex >= 0 && killIndex > validationIndex);
+    [lateValidationLines[validationIndex], lateValidationLines[killIndex]] = [lateValidationLines[killIndex]!, lateValidationLines[validationIndex]!];
+    const lateValidation = lateValidationLines.join("\n");
+    assert.notEqual(lateValidation, source);
+    assert.throws(() => assertC3OwnedMetroHandoff(lateValidation, platform), /assignment, kill, wait|order/);
+  }
+  const swapRunnerCalls = (value: string, platform: "android" | "ios") => {
+    const lines = value.split("\n");
+    const profileIndex = lines.findIndex((line) => line.includes(`run-profile-restart-${platform}.sh`));
+    const trackerIndex = lines.findIndex((line) => line.includes(`run-tracker-restart-${platform}.sh`));
+    assert(profileIndex >= 0 && trackerIndex > profileIndex);
+    [lines[profileIndex], lines[trackerIndex]] = [lines[trackerIndex]!, lines[profileIndex]!];
+    return lines.join("\n");
+  };
+  const mutations = (["android", "ios"] as const).flatMap((platform) => {
+    const source = platform === "android" ? android : ios;
+    return [
+      [platform, source, (value: string) => value.replace("owned_metro_pid=$metro_pid\n", "")],
+      [platform, source, (value: string) => value.replace('wait "$owned_metro_pid"', 'wait "$metro_pid"')],
+      [platform, source, (value: string) => swapRunnerCalls(value, platform)],
+      [platform, source, (value: string) => value.replace(`bash scripts/e2e/run-tracker-restart-${platform}.sh`, "true")],
+      [platform, source, (value: string) => value.replace(`bash scripts/e2e/run-tracker-restart-${platform}.sh`, `true && bash scripts/e2e/run-tracker-restart-${platform}.sh`)],
+    ] as const;
+  });
+  for (const [platform, source, mutate] of mutations) {
+    const hostile = mutate(source);
+    assert.notEqual(hostile, source, `${platform} PID mutation must change its source`);
+    assert.throws(() => assertC3OwnedMetroHandoff(hostile, platform));
+  }
+  for (const [platform, source] of [["android", android], ["ios", ios]] as const) {
+    const extraPreKillWait = source.replace(
+      'kill -- "-$owned_metro_pid"\n',
+      'wait "$owned_metro_pid"\nkill -- "-$owned_metro_pid"\n',
+    );
+    assert.notEqual(extraPreKillWait, source);
+    assert.throws(
+      () => assertC3OwnedMetroHandoff(extraPreKillWait, platform),
+      /exactly one owned Metro wait/,
+    );
+  }
+});
+
+test("G035 C3 reusable workflows pass canonical tracker flags and upload only explicit tracker JSON", async () => {
+  for (const platform of ["android", "ios"] as const) {
+    const source = await readFile(`.github/workflows/e2e-${platform}.yml`, "utf8");
+    assertC3WorkflowBinding(source, platform);
+    for (const hostilePath of [
+      ".artifacts/tracker/**", ".artifacts/trac[k]er/**", ".artifacts/**/tracker*.json",
+      ".artifacts/tracker/**/*.{json,db}", ".artifacts/tracker.sqlite",
+      `.artifacts/${platform}-tracker-restart.db`, `.artifacts/${platform}-tracker-restart.db-wal`,
+      `.artifacts/${platform}-tracker-restart.db-shm`, `.artifacts/${platform}-tracker-restart.apk`,
+      `.artifacts/${platform}-tracker-restart.app`, `.artifacts/${platform}-tracker-restart.bundle`,
+      `.artifacts/${platform}-tracker-restart.log`, `.artifacts/${platform}-tracker-restart.png`,
+      `.artifacts/${platform}-tracker-restart.xml`, `.artifacts/${platform}-tracker-restart.zip`,
+      `.artifacts/../${platform}-tracker-restart.json`, `.artifacts/${platform}-tracker-restart`,
+    ]) {
+      const hostile = source.replace(
+        `.artifacts/${platform}-profile-restart.json\n`,
+        `.artifacts/${platform}-profile-restart.json\n            ${hostilePath}\n`,
+      );
+      assert.notEqual(hostile, source);
+      assert.throws(() => assertC3WorkflowBinding(hostile, platform), hostilePath);
+    }
+  }
+});
+
+test("G035 C3 tracker temp and debug output cannot hide beneath generic diagnostic uploads", async () => {
+  const forbiddenTrackerPlacement = /\.artifacts\/(?:tracker\/|(?:launch|test-results)\/[^\n]*tracker)/i;
+  for (const platform of ["android", "ios"] as const) {
+    const runner = await readFile(`scripts/e2e/run-tracker-restart-${platform}.sh`, "utf8");
+    assert.doesNotMatch(runner, forbiddenTrackerPlacement);
+    for (const hostile of [
+      `.artifacts/launch/tracker-${platform}.log`,
+      `.artifacts/test-results/tracker-${platform}.json`,
+      `.artifacts/tracker/${platform}/debug`,
+    ]) {
+      assert.match(`${runner}\nprivate_tmp=${hostile}\n`, forbiddenTrackerPlacement);
+    }
+  }
+});
+
+test("G035 C3 preserves one serial exact-head reusable workflow per native platform", async () => {
+  assert.deepEqual((await readdir(".github/workflows")).sort(), ["ci.yml", "e2e-android.yml", "e2e-ios.yml"]);
+  const workflows = await loadNativeWorkflows();
+  assertExactJobKeys(workflows.ci, ["static", "android-e2e", "ios-e2e"], "CI");
+  for (const [jobName, path] of [["android-e2e", "./.github/workflows/e2e-android.yml"], ["ios-e2e", "./.github/workflows/e2e-ios.yml"]] as const) {
+    const job = requiredJob(workflows.ci, jobName);
+    assert.equal(job.needs, "static");
+    assert.equal(job.uses, path);
+    assert.deepEqual(job.with, { expected_sha: exactHeadSha });
+    assert.equal(Object.hasOwn(job, "strategy"), false, `${jobName} must not introduce a matrix`);
+  }
+  assertExactJobKeys(workflows.android, ["android"], "android");
+  assertExactJobKeys(workflows.ios, ["ios"], "ios");
 });
