@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const exactVersion = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const registryIntegrity = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
+const npmRegistry = "https://registry.npmjs.org";
 
 export const APPROVED_EXPO_INSTALL_EXCLUSIONS = Object.freeze([
   "expo",
@@ -25,7 +26,7 @@ export const APPROVED_APP_DEPENDENCIES = Object.freeze({
     react: "19.2.3",
     "react-native": "0.86.0",
     "react-native-safe-area-context": "5.7.0",
-    "react-native-screens": "4.25.2",
+    "react-native-screens": "4.26.0",
   }),
   development: Object.freeze({
     "@testing-library/react-native": "13.3.3",
@@ -99,6 +100,11 @@ function approvedDeclarations() {
   );
 }
 
+function canonicalNpmTarballUrl(name, version) {
+  const tarballName = name.slice(name.lastIndexOf("/") + 1);
+  return `${npmRegistry}/${name}/-/${tarballName}-${version}.tgz`;
+}
+
 export function validateAppDependencyPolicy(packageJson, packageLock, artifactLock, licenseInventory) {
   assert.deepEqual(
     packageJson.expo?.install?.exclude,
@@ -125,6 +131,7 @@ export function validateAppDependencyPolicy(packageJson, packageLock, artifactLo
   assert.deepEqual([...artifactByName.keys()].sort(), expectedNames, "App dependency lock must cover every approved root declaration exactly once");
   assert.deepEqual([...licenseByName.keys()].sort(), expectedNames, "App license inventory must cover every approved root declaration exactly once");
   assert.equal(artifactLock.schema_version, 1, "App dependency schema must be version 1");
+  assert.equal(artifactLock.registry, npmRegistry, `App dependency lock registry must exactly match ${npmRegistry}`);
   assert.equal(licenseInventory.schema_version, 1, "App license schema must be version 1");
   assert.equal(packageLock.lockfileVersion, 3, "Root npm lockfile version must be 3");
   for (const [name, approved] of Object.entries(APPROVED_NATIVE_TRANSITIVE_GRAPH)) {
@@ -152,6 +159,7 @@ export function validateAppDependencyPolicy(packageJson, packageLock, artifactLo
     assert(installed && !installed.link, `${name} is missing or linked in the root package lock`);
     assert.equal(installed.version, declaration.version, `${name} root lock version drifted`);
     assert.equal(installed.integrity, artifact.integrity, `${name} root lock integrity drifted`);
+    assert.equal(installed.resolved, canonicalNpmTarballUrl(name, declaration.version), `${name} root lock registry resolution drifted`);
     const license = licenseByName.get(name);
     assert.equal(license.version, declaration.version, `${name} license version drifted`);
     assert.equal(license.kind, declaration.kind, `${name} license ownership drifted`);
