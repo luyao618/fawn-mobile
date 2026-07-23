@@ -122,6 +122,9 @@ jobs:
             exit "$status"
           }
           trap cleanup EXIT
+          validate_positive_safe_integer() {
+            node -e 'const value = Number(process.argv[1]); if (!Number.isSafeInteger(value) || value <= 0 || String(value) !== process.argv[1]) process.exit(1);' "$1"
+          }
           for attempt in $(seq 1 60); do curl --silent --fail http://127.0.0.1:8081/status >/dev/null && break; sleep 2; done
           curl --silent --fail http://127.0.0.1:8081/status
           dev_client_url='formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081'
@@ -134,9 +137,11 @@ jobs:
           maestro --device "$simulator_udid" test --debug-output .artifacts/launch/maestro/ios-smoke e2e/maestro/shell-smoke.yaml 2>&1 | tee .artifacts/test-results/ios-maestro.attempt.log
           mv .artifacts/test-results/ios-maestro.attempt.log .artifacts/test-results/ios-maestro.log
           bash scripts/e2e/run-persistence-ios.sh "$simulator_udid" "${{ inputs.expected_sha }}"
-          kill -- "-$metro_pid"
+          owned_metro_pid=$metro_pid
+          validate_positive_safe_integer "$owned_metro_pid"
+          kill -- "-$owned_metro_pid"
           set +e
-          wait "$metro_pid"
+          wait "$owned_metro_pid"
           metro_status=$?
           set -e
           test "$metro_status" -eq 0 -o "$metro_status" -eq 143
@@ -146,6 +151,7 @@ jobs:
             exit 1
           fi
           bash scripts/e2e/run-profile-restart-ios.sh "$simulator_udid" "${{ inputs.expected_sha }}" "$release_app_path"
+          bash scripts/e2e/run-tracker-restart-ios.sh "$simulator_udid" "${{ inputs.expected_sha }}" "$release_app_path" "$owned_metro_pid"
       - name: Collect same-SHA evidence
         run: |
           node tools/collect-ci-evidence.mjs \
@@ -157,6 +163,7 @@ jobs:
             --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
             --persistence-report .artifacts/ios-persistence.json \
             --profile-restart-report .artifacts/ios-profile-restart.json \
+            --tracker-restart-report .artifacts/ios-tracker-restart.json \
             --output .artifacts/ios-e2e.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -170,6 +177,7 @@ jobs:
             .artifacts/test-results/ios-maestro.log
             .artifacts/ios-persistence.json
             .artifacts/ios-profile-restart.json
+            .artifacts/ios-tracker-restart.json
             .artifacts/persistence/ios/*.json
           if-no-files-found: error
       - name: Retain Ios launch and Maestro diagnostics

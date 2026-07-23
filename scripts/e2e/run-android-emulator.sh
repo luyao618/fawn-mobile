@@ -48,6 +48,9 @@ install_apk() {
   printf '%s\n' "$install_output"
   return "$install_status"
 }
+validate_positive_safe_integer() {
+  node -e 'const value = Number(process.argv[1]); if (!Number.isSafeInteger(value) || value <= 0 || String(value) !== process.argv[1]) process.exit(1);' "$1"
+}
 wait_for_package_service
 if ! install_apk; then
   if grep -Eq -e "^(cmd: )?Can't find service: package$" -e '^(cmd: )?Failure calling service package: Broken pipe( \([0-9]+\))?$' <<< "${install_output//$'\r'/}"; then
@@ -72,9 +75,11 @@ maestro --device "$emulator_serial" test --debug-output .artifacts/launch/maestr
 mv .artifacts/test-results/android-maestro.attempt.log .artifacts/test-results/android-maestro.log
 if [ -n "${EXPECTED_SHA:-}" ]; then
   bash scripts/e2e/run-persistence-android.sh "$emulator_serial" "$EXPECTED_SHA"
-  kill -- "-$metro_pid"
+  owned_metro_pid=$metro_pid
+  validate_positive_safe_integer "$owned_metro_pid"
+  kill -- "-$owned_metro_pid"
   set +e
-  wait "$metro_pid"
+  wait "$owned_metro_pid"
   metro_status=$?
   set -e
   test "$metro_status" -eq 0 -o "$metro_status" -eq 143
@@ -85,4 +90,5 @@ if [ -n "${EXPECTED_SHA:-}" ]; then
     exit 1
   fi
   bash scripts/e2e/run-profile-restart-android.sh "$emulator_serial" "$EXPECTED_SHA" android/app/build/outputs/apk/release/app-release.apk
+  bash scripts/e2e/run-tracker-restart-android.sh "$emulator_serial" "$EXPECTED_SHA" android/app/build/outputs/apk/release/app-release.apk "$owned_metro_pid"
 fi

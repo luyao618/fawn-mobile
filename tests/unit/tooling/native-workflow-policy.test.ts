@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { parse } from "yaml";
+import { parse, parseAllDocuments } from "yaml";
 
 function ordered(text: string, ...needles: string[]) {
   let offset = -1;
@@ -85,11 +86,11 @@ const whoOfflineVerificationCommand = `${whoDownloadCommand} --offline`;
 const exactWhoProvisionScript = `${whoDownloadCommand}\n${whoOfflineVerificationCommand}\n`;
 const exactStaticUploadPath = ".artifacts/static.json\n.artifacts/test-results/static-gates.log\n.artifacts/fault-bundles/proof.json\n.artifacts/fault-bundles/android/production/**/*.js\n.artifacts/fault-bundles/android/production/metadata.json\n.artifacts/fault-bundles/android/e2e/**/*.js\n.artifacts/fault-bundles/android/e2e/metadata.json\n.artifacts/fault-bundles/ios/production/**/*.js\n.artifacts/fault-bundles/ios/production/metadata.json\n.artifacts/fault-bundles/ios/e2e/**/*.js\n.artifacts/fault-bundles/ios/e2e/metadata.json\n";
 const exactChildPrimaryUploadPaths = {
-  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n.artifacts/android-persistence.json\n.artifacts/android-profile-restart.json\n.artifacts/persistence/android/*.json\n",
-  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/ios-profile-restart.json\n.artifacts/persistence/ios/*.json\n",
+  android: ".artifacts/android-e2e.json\n.artifacts/config/android-*.json\n.artifacts/schemes/android-*.json\n.artifacts/native/android/**\n.artifacts/launch/android-dev-client.log\n.artifacts/test-results/android-maestro.log\n.artifacts/android-persistence.json\n.artifacts/android-profile-restart.json\n.artifacts/android-tracker-restart.json\n.artifacts/persistence/android/*.json\n",
+  ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/ios-profile-restart.json\n.artifacts/ios-tracker-restart.json\n.artifacts/persistence/ios/*.json\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "52236399b43c99f85a9820351612e0228b835ad8f67c15eee23e9025b803fcb9";
+const exactAndroidRunnerSha256 = "f2c078edca1a49e0958ae93265a3585800ff98e02ad106c80d20b766b54fdb67";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -162,6 +163,7 @@ const exactChildCollectorRuns = {
   --scheme-report-e2e .artifacts/schemes/android-e2e.json \
   --persistence-report .artifacts/android-persistence.json \
   --profile-restart-report .artifacts/android-profile-restart.json \
+  --tracker-restart-report .artifacts/android-tracker-restart.json \
   --output .artifacts/android-e2e.json` + "\n",
   ios: String.raw`node tools/collect-ci-evidence.mjs \
   --expected-sha "${expectedShaInput}" --platform ios --flavor e2e \
@@ -172,6 +174,7 @@ const exactChildCollectorRuns = {
   --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
   --persistence-report .artifacts/ios-persistence.json \
   --profile-restart-report .artifacts/ios-profile-restart.json \
+  --tracker-restart-report .artifacts/ios-tracker-restart.json \
   --output .artifacts/ios-e2e.json` + "\n",
 } as const;
 
@@ -710,7 +713,7 @@ function assertMetroProcessGroupPolicy(script: string, platform: NativePlatform)
   );
   assert.deepEqual(
     lines.filter((line) => line.trim().startsWith("kill ")).map((line) => line.trim()),
-    ['kill -- "-$metro_pid" 2>/dev/null', 'kill -- "-$metro_pid"'],
+    ['kill -- "-$metro_pid" 2>/dev/null', 'kill -- "-$owned_metro_pid"'],
     `${platform} Metro teardown must signal the complete process group in cleanup and the offline transition`,
   );
 }
@@ -1760,6 +1763,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     const processGroupMutations = [
       script.replace("set -m\n", ""),
       script.replaceAll('kill -- "-$metro_pid"', 'kill "$metro_pid"'),
+      script.replace('kill -- "-$owned_metro_pid"', 'kill "$owned_metro_pid"'),
       script.replace(
         `set -m\n${exactHeadlessMetroCommands[platform]}\nmetro_pid=$!\nset +m`,
         `set +m\n${exactHeadlessMetroCommands[platform]}\nmetro_pid=$!`,
@@ -3588,14 +3592,16 @@ test("G031 native policy preserves Debug evidence before one-way offline Release
   assert.equal((iosWorkflow.match(/-configuration Release/g) ?? []).length, 1, "iOS Release must build exactly once");
   ordered(androidRunner,
     "bash scripts/e2e/run-persistence-android.sh",
-    'kill -- "-$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    "owned_metro_pid=$metro_pid", 'validate_positive_safe_integer "$owned_metro_pid"',
+    'kill -- "-$owned_metro_pid"', 'wait "$owned_metro_pid"', "metro_pid=",
     'adb -s "$emulator_serial" reverse --remove tcp:8081',
     "curl --silent --fail http://127.0.0.1:8081/status",
     "bash scripts/e2e/run-profile-restart-android.sh",
   );
   ordered(iosWorkflow,
     "bash scripts/e2e/run-persistence-ios.sh",
-    'kill -- "-$metro_pid"', 'wait "$metro_pid"', "metro_pid=",
+    "owned_metro_pid=$metro_pid", 'validate_positive_safe_integer "$owned_metro_pid"',
+    'kill -- "-$owned_metro_pid"', 'wait "$owned_metro_pid"', "metro_pid=",
     "curl --silent --fail http://127.0.0.1:8081/status",
     "bash scripts/e2e/run-profile-restart-ios.sh",
   );
@@ -4079,4 +4085,933 @@ pid=$(pidof_app)
   const restartOrderMutation = restartFlow.replace(exactRestartNavigation, `- assertVisible: "G031LeapBaby"\n${exactRestartNavigation}`);
   assert.notEqual(restartOrderMutation, restartFlow);
   assert.throws(() => assertProfileRestartFlowOrder(restartOrderMutation));
+});
+
+const trackerSaveFlowPath = "e2e/maestro/tracker-save-edit-delete.yaml";
+const trackerRestartFlowPath = "e2e/maestro/tracker-restart.yaml";
+const trackerAndroidRunnerPath = "scripts/e2e/run-tracker-restart-android.sh";
+const trackerIosRunnerPath = "scripts/e2e/run-tracker-restart-ios.sh";
+// Compound-selector expectations are frozen against this exact upstream Maestro implementation.
+const trackerMaestroPin = Object.freeze({ version: "2.6.1", upstreamCommit: "00f516729f57d48f36ded55244cfbe358ada6b00" });
+
+function trackerCompoundSelector(label: string, value = label, indentation = 0): string {
+  const outer = " ".repeat(indentation);
+  const inner = " ".repeat(indentation + 2);
+  return `${outer}text: '${`^${escapeRegex(value)}$`}'\n${outer}below:\n${inner}text: '${`^${escapeRegex(label)}$`}'`;
+}
+
+function trackerInputSequence(label: string, value: string, erase: boolean): string {
+  const scrollField = trackerCompoundSelector(label, label, 6);
+  const tapField = trackerCompoundSelector(label, label, 4);
+  const androidEntered = trackerCompoundSelector(label, value, 10);
+  const iosScrollEntered = trackerCompoundSelector(label, value, 12);
+  const iosAssertEntered = trackerCompoundSelector(label, value, 10);
+  const tap = `- tapOn:\n${tapField}`;
+  // Pinned Android eraseText backspaces from the caret, so retapping and erasing clears a surviving right-side suffix.
+  const entryStart = erase ? `${tap}\n- eraseText\n${tap}\n- eraseText` : tap;
+  return `- scrollUntilVisible:
+    element:
+${scrollField}
+    direction: DOWN
+${entryStart}
+- inputText: ${JSON.stringify(value)}
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+      - assertVisible:
+${androidEntered}
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+${iosScrollEntered}
+          direction: DOWN
+      - assertVisible:
+${iosAssertEntered}`;
+}
+
+const trackerCommandInventories = Object.freeze({
+  save: Object.freeze({
+    extendedWaitUntil: 2, tapOn: 63, assertVisible: 77, scrollUntilVisible: 67,
+    eraseText: 20, inputText: 22, runFlow: 44, hideKeyboard: 22, swipe: 22, assertNotVisible: 1,
+  }),
+  restart: Object.freeze({
+    extendedWaitUntil: 2, tapOn: 6, scrollUntilVisible: 4, assertVisible: 5, assertNotVisible: 1,
+  }),
+});
+
+function trackerCommandInventory(flow: string): Record<string, number> {
+  const documents = parseAllDocuments(flow);
+  assert.equal(documents.length, 2, "Tracker flow must have one config and one command document");
+  for (const document of documents) assert.deepEqual(document.errors, [], "Tracker flow YAML is invalid");
+  assert.deepEqual(documents[0]!.toJS(), { appId: "com.luyao618.formobile" });
+  const commands = documents[1]!.toJS();
+  assert(Array.isArray(commands), "Tracker flow command document must be an array");
+  const inventory: Record<string, number> = {};
+  const visit = (entries: unknown[]): void => {
+    for (const entry of entries) {
+      let command: string;
+      if (typeof entry === "string") {
+        command = entry;
+      } else {
+        assert(entry !== null && typeof entry === "object" && !Array.isArray(entry), "Tracker command must be a scalar or mapping");
+        const keys = Object.keys(entry);
+        assert.equal(keys.length, 1, "Tracker command mappings must have exactly one command key");
+        command = keys[0]!;
+        if (command === "runFlow") {
+          const nested = (entry as { runFlow?: { commands?: unknown } }).runFlow?.commands;
+          assert(Array.isArray(nested), "Inline tracker runFlow must have commands");
+          visit(nested);
+        }
+      }
+      inventory[command] = (inventory[command] ?? 0) + 1;
+    }
+  };
+  visit(commands);
+  return inventory;
+}
+
+function assertTrackerFlowSafety(flow: string, path: string, kind: "save" | "restart"): void {
+  assert.match(flow, /^appId: com\.luyao618\.formobile\n---\n/);
+  assert.doesNotMatch(flow, /\b(?:optional|retry|retryTapIfNoChange|evalScript|point|index)\s*:/);
+  assert.doesNotMatch(flow, /\b(?:checked|selected)\s*:/);
+  assert.doesNotMatch(flow, /tapOn:\s*["']?(?:记录|我的)["']?\s*$/m);
+  assert.doesNotMatch(flow, /^\s*-\s*sleep\s*:/mi);
+  assert.doesNotMatch(flow, /\$\{(?:TODAY|DATE|NOW)/);
+  assert.equal((flow.match(/id: "tab-RecordsTab"/g) ?? []).length, 2, `${path} must wait for and enter Records by ID`);
+  assert.equal((flow.match(/- tapOn:\n    id: "tab-RecordsTab"/g) ?? []).length, 1, `${path} must enter Records exactly once`);
+  assert.deepEqual(trackerCommandInventory(flow), trackerCommandInventories[kind], `${path} command inventory drifted`);
+}
+
+function assertTrackerRunnerPolicy(script: string, platform: "android" | "ios"): void {
+  const runner = `run-tracker-restart-${platform}.sh`;
+  const installCommand = platform === "android"
+    ? /^[ \t]*adb[ \t]+-s[ \t]+"\$serial"[ \t]+install(?:[ \t]|$).*$/gm
+    : /^[ \t]*xcrun[ \t]+simctl[ \t]+install(?:[ \t]|$).*$/gm;
+  const uninstallCommand = platform === "android"
+    ? /^[ \t]*adb[ \t]+-s[ \t]+"\$serial"[ \t]+uninstall(?:[ \t]|$).*$/gm
+    : /^[ \t]*xcrun[ \t]+simctl[ \t]+uninstall(?:[ \t]|$).*$/gm;
+  assert.match(script, /^#!\/usr\/bin\/env bash\nset -euo pipefail\n/);
+  assert.match(script, /metro_pid=\$\{4:\?owned Metro PID required\}/);
+  assert.match(script, new RegExp(`maestro --version[^\n]+${trackerMaestroPin.version.replaceAll(".", "\\.")}`), trackerMaestroPin.upstreamCommit);
+  assert.match(script, /validate_positive_safe_integer "\$metro_pid" "owned Metro PID"/);
+  assert.match(script, /assert_pid_absent "\$metro_pid" "owned Metro PID"/);
+  assert.match(script, /curl --silent --fail http:\/\/127\.0\.0\.1:8081\/status/);
+  assert.match(script, /mktemp -d "\$\{TMPDIR:-\/tmp\}\/g035-tracker-[a-z]+\.XXXXXX"/);
+  assert.equal((script.match(/cleanup\(\) \{\n  status=\$\?\n  trap - EXIT\n  rm -rf "\$private_tmp"\n  exit "\$status"\n\}\ntrap cleanup EXIT/g) ?? []).length, 1,
+    `${runner} must preserve exact unconditional EXIT cleanup`);
+  assert.match(script, /rm -f "\$report"/);
+  assert.equal((script.match(/"\$destination-wal"/g) ?? []).length, 2);
+  assert.equal((script.match(/"\$destination-shm"/g) ?? []).length, 2);
+  assert.match(script, /test "\$source_identity" = "\$installed_before_identity"/);
+  assert.match(script, /test "\$source_identity" = "\$installed_after_identity"/);
+  assert.doesNotMatch(script, /test "\$pre_save_pid" !=/);
+  assert.doesNotMatch(script, /\.artifacts\/tracker\/[a-z]+\/(?:.*\.(?:db|db-wal|db-shm|sqlite|apk|app|bundle|log|png|xml|zip)|[^.\s"']+)/i);
+  assert.doesNotMatch(script, /^\s*(?:for|while|until)\s+|\bsleep\s+[0-9]|\bseq\s+/m);
+  assert.doesNotMatch(script, /expo start|openurl|push_db|seed-recovery|run-persistence|^\s*retry(?:TapIfNoChange)?\b/im);
+  assert.equal((script.match(/tools\/tracker-evidence\.mjs --action tracker-snapshot/g) ?? []).length, 1);
+  assert.equal((script.match(/^snapshot (?:pre-save|post-save|post-relaunch)$/gm) ?? []).length, 3);
+  assert.equal((script.match(/tools\/tracker-evidence\.mjs --action fixture-oracle/g) ?? []).length, 1);
+  assert.equal((script.match(/tools\/tracker-evidence\.mjs --action privacy-proof/g) ?? []).length, 1);
+  assert.equal((script.match(/tools\/tracker-evidence\.mjs --action validate-report/g) ?? []).length, 1);
+  assert.equal((script.match(/e2e\/maestro\/tracker-save-edit-delete\.yaml/g) ?? []).length, 2,
+    `${runner} must hash and execute the save flow exactly once`);
+  assert.equal((script.match(/e2e\/maestro\/tracker-restart\.yaml/g) ?? []).length, 2,
+    `${runner} must hash and execute the restart flow exactly once`);
+  const installLine = script.match(installCommand)?.[0];
+  assert(installLine, `${runner} install line is missing`);
+  const postInstall = script.slice(script.indexOf(installLine) + installLine.length, script.indexOf("EXPECTED_SHA="));
+  assert.doesNotMatch(postInstall, /\b(?:install|clear|seed|databasePush|rebuild|metroRestart)\b/,
+    `${runner} mutates the installation after the fresh install`);
+  assert.doesNotMatch(postInstall, /^\s*(?:alias|function)\b|^\s*["']?\$[A-Za-z_]/m,
+    `${runner} cannot introduce post-install command indirection`);
+  assert.doesNotMatch(postInstall, /^\s*(?:adb\s+-s\s+"\$serial"|xcrun\s+simctl)\s+["']?\$[A-Za-z_]/m,
+    `${runner} native mutation verbs must remain literal`);
+  assert.equal((script.match(installCommand) ?? []).length, 1, `${runner} must contain one install command at any indentation`);
+  assert.equal((script.match(uninstallCommand) ?? []).length, 1, `${runner} must contain one uninstall command at any indentation`);
+  for (const [mutation, count] of Object.entries({
+    install: 2, clear: 1, seed: 1, databasePush: 1, rebuild: 1, metroRestart: 1,
+  })) {
+    assert.equal((script.match(new RegExp(`\\b${mutation}\\b`, "g")) ?? []).length, count,
+      `${runner} ${mutation} mutation vocabulary drifted`);
+  }
+  ordered(script,
+    "assert_pid_absent \"$metro_pid\" \"owned Metro PID\"",
+    "assert_metro_unreachable \"before tracker operations\"",
+    "pre_save_pid=$(launch)",
+    "pre_save_zone=$(device_time_zone)",
+    "terminate \"$pre_save_pid\"",
+    "assert_app_pid_absent \"$pre_save_pid\" \"pre-save\"",
+    "snapshot pre-save",
+    "save_pid=$(launch)",
+    "installed_before_identity=$(installed_identity",
+    "e2e/maestro/tracker-save-edit-delete.yaml",
+    "post_save_zone=$(device_time_zone)",
+    "terminate \"$save_pid\"",
+    "assert_app_pid_absent \"$save_pid\" \"save\"",
+    "snapshot post-save",
+    "relaunch_pid=$(launch)",
+    "test \"$relaunch_pid\" != \"$save_pid\"",
+    "post_relaunch_zone=$(device_time_zone)",
+    "installed_after_identity=$(installed_identity",
+    "e2e/maestro/tracker-restart.yaml",
+    "terminate \"$relaunch_pid\"",
+    "assert_app_pid_absent \"$relaunch_pid\" \"relaunch\"",
+    "snapshot post-relaunch",
+    "assert_metro_unreachable \"before report emission\"",
+    "tools/tracker-evidence.mjs --action validate-report");
+  assert.match(script, new RegExp(`report=\\.artifacts/${platform}-tracker-restart\\.json`));
+}
+
+test("G035 C2 tracker flows lock the exact pinned native scenario", async () => {
+  const [saveFlow, restartFlow, primitives] = await Promise.all([
+    readFile(trackerSaveFlowPath, "utf8"),
+    readFile(trackerRestartFlowPath, "utf8"),
+    readFile("src/features/tracker/TrackerFormPrimitives.tsx", "utf8"),
+  ]);
+  assertTrackerFlowSafety(saveFlow, trackerSaveFlowPath, "save");
+  assertTrackerFlowSafety(restartFlow, trackerRestartFlowPath, "restart");
+  assert.match(primitives, /<View style=\{styles\.field\}>\s*<Text[^>]*>\{label\}<\/Text>\s*<TextInput\s*accessibilityLabel=\{label\}/s);
+
+  const entries = [
+    ["测量日期", "2026-07-19", true], ["体重（克）", "7200", false],
+    ["身长（厘米）", "68.5", false], ["头围（厘米）", "43.2", false], ["备注", "synthetic growth", false],
+    ["喂养日期", "2026-07-20", true], ["喂养时间", "08:10", true], ["量（毫升）", "90", false],
+    ["备注", "synthetic feeding", false], ["开始日期", "2026-07-20", true], ["开始时间", "04:00", true],
+    ["结束日期", "2026-07-20", false], ["结束时间", "09:00", false], ["夜醒次数", "2", true],
+    ["备注", "synthetic sleep", false], ["记录日期", "2026-07-20", true], ["记录时间", "08:20", true],
+    ["备注", "synthetic diaper", false], ["记录日期", "2026-07-18", true], ["标题", "Synthetic checkup", false],
+    ["说明", "synthetic health", false], ["量（毫升）", "100", true],
+  ] as const;
+  for (const [label, value, erase] of entries) {
+    const exact = trackerInputSequence(label, value, erase);
+    assert.equal((saveFlow.split(exact).length - 1), 1, `${label}=${value} must use the exact compound entry sequence`);
+  }
+  assert.doesNotMatch(saveFlow, /时长（分钟）[\s\S]{0,220}inputText/);
+  for (const radio of ["喂养类型配方奶", "睡眠类型夜间睡眠", "类型混合", "健康记录类型常规检查"]) {
+    assert.match(saveFlow, new RegExp(`tapOn: ['\"]\\^${radio}\\$['\"]`));
+  }
+  assert.equal((saveFlow.match(/- tapOn: '\^健康记录类型常规检查\$'/g) ?? []).length, 1, "health radio must not be retapped after cancel");
+
+  ordered(saveFlow,
+    "^新增健康记录$", "^保存健康记录$", "^确认新增健康记录$", "^返回修改$", "^新增健康记录$",
+    "^2026-07-18$", "^Synthetic checkup$", "^synthetic health$", "^保存健康记录$", "^确认新增健康记录$",
+    "^健康记录类型$", "^常规检查$", "^确认保存$");
+  ordered(saveFlow,
+    "^喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 90 毫升 · 有备注$", "^编辑喂养记录$",
+    trackerInputSequence("量（毫升）", "100", true), "^保存修改$", "^确认保存修改$", "^原内容$", "^90 毫升$",
+    "^新内容$", "^100 毫升$", "^确认保存$");
+  ordered(saveFlow,
+    "^大小便记录，2026年7月20日 08:20（本机时间），混合 · 有备注$", "^编辑大小便记录$", "^删除这条记录$",
+    "^确认删除这条大小便记录$", "^2026年7月20日 08:20（本机时间）$", "^混合 · 有备注$",
+    "^删除后不会出现在记录列表中；当前版本没有恢复入口。$", "^确认删除$");
+  for (const row of [
+    "生长记录，2026年7月19日，体重 7200 克 · 身长 68\\.5 厘米 · 头围 43\\.2 厘米 · 有备注",
+    "喂养记录，2026年7月20日 08:10（本机时间），配方奶 · 量 100 毫升 · 有备注",
+    "睡眠记录，2026年7月20日 04:00（本机时间），夜间睡眠 · 至 2026年7月20日 09:00（本机时间） · 夜醒 2 次 · 有备注",
+    "健康记录，2026年7月18日，常规检查 · Synthetic checkup · 有说明",
+  ]) assert.ok(restartFlow.includes(`text: '^${row}$'`), `restart must prove ${row}`);
+  assert.match(restartFlow, /assertNotVisible: '\^大小便记录，2026年7月20日 08:20（本机时间），混合 · 有备注\$'/);
+  assert.match(restartFlow, /assertVisible: '\^还没有大小便记录\$'/);
+});
+
+test("G035 C2 tracker runners lock lifecycle, identity, and private-temp policy", async () => {
+  const [android, ios] = await Promise.all([
+    readFile(trackerAndroidRunnerPath, "utf8"),
+    readFile(trackerIosRunnerPath, "utf8"),
+  ]);
+  assertTrackerRunnerPolicy(android, "android");
+  assertTrackerRunnerPolicy(ios, "ios");
+  assert.equal((android.match(/^adb -s "\$serial" uninstall /gm) ?? []).length, 1);
+  assert.equal((android.match(/^adb -s "\$serial" install --no-streaming /gm) ?? []).length, 1);
+  assert.equal((ios.match(/^xcrun simctl uninstall /gm) ?? []).length, 1);
+  assert.equal((ios.match(/^xcrun simctl install /gm) ?? []).length, 1);
+  assert.match(android, /adb -s "\$serial" root/);
+  assert.match(android, /adb -s "\$serial" wait-for-device/);
+  assert.doesNotMatch(android, /reverse --remove/);
+  assert.match(android, /assert_reverse_absent "before tracker operations"/);
+  assert.match(android, /assert_reverse_absent "before report emission"/);
+  assert.match(android, /setprop persist\.sys\.timezone Asia\/Shanghai/);
+  assert.match(android, /test "\$source_identity" = "\$installed_before_identity"/);
+  assert.match(android, /test "\$source_identity" = "\$installed_after_identity"/);
+  assert.match(ios, /SIMCTL_CHILD_TZ=Asia\/Shanghai xcrun simctl launch/);
+  assert.match(ios, /SIMCTL_CHILD_TZ=Asia\/Shanghai bash scripts\/e2e\/query-ios-device-calendar\.sh/);
+  assert.match(ios, /ios-three-component-identity/);
+  assert.match(ios, /test "\$source_identity" = "\$installed_before_identity"/);
+  assert.match(ios, /test "\$source_identity" = "\$installed_after_identity"/);
+});
+
+async function writeExecutable(path: string, source: string): Promise<void> {
+  await writeFile(path, source);
+  await chmod(path, 0o755);
+}
+
+function insertTrackerHarnessRows(db: DatabaseSync): void {
+  db.exec(`BEGIN IMMEDIATE;
+    INSERT INTO growth_records(
+      id,measurement_date,weight_g,height_cm,head_cm,weight_percentile,height_percentile,head_percentile,
+      notes,source_message_id,created_at,updated_at,deleted_at
+    ) VALUES ('tracker-growth-harness','2026-07-19',7200,68.5,43.2,NULL,NULL,NULL,
+      'synthetic growth',NULL,'2026-07-20T01:10:00.000Z','2026-07-20T01:10:00.000Z',NULL);
+    INSERT INTO feeding_records(
+      id,feed_time,feed_type,amount_ml,duration_min,notes,source_message_id,created_at,updated_at,deleted_at
+    ) VALUES ('tracker-feeding-harness','2026-07-20T00:10:00.000Z','formula',100,NULL,
+      'synthetic feeding',NULL,'2026-07-20T01:11:00.000Z','2026-07-20T01:16:00.000Z',NULL);
+    INSERT INTO sleep_records(
+      id,sleep_start,sleep_end,sleep_type,night_wakings,notes,source_message_id,created_at,updated_at,deleted_at
+    ) VALUES ('tracker-sleep-harness','2026-07-19T20:00:00.000Z','2026-07-20T01:00:00.000Z','night',2,
+      'synthetic sleep',NULL,'2026-07-20T01:12:00.000Z','2026-07-20T01:12:00.000Z',NULL);
+    INSERT INTO diaper_records(
+      id,diaper_time,diaper_type,notes,source_message_id,created_at,updated_at,deleted_at
+    ) VALUES ('tracker-diaper-harness','2026-07-20T00:20:00.000Z','mixed','synthetic diaper',NULL,
+      '2026-07-20T01:13:00.000Z','2026-07-20T01:17:00.000Z','2026-07-20T01:17:00.000Z');
+    INSERT INTO health_records(
+      id,record_date,record_type,title,description,source_message_id,created_at,updated_at,deleted_at
+    ) VALUES ('tracker-health-harness','2026-07-18','checkup','Synthetic checkup','synthetic health',NULL,
+      '2026-07-20T01:14:00.000Z','2026-07-20T01:14:00.000Z',NULL);
+    COMMIT;`);
+}
+
+function createTrackerHarnessDatabase(path: string, migrationSql: string, populated: boolean): DatabaseSync {
+  const db = new DatabaseSync(path);
+  db.exec(migrationSql);
+  db.prepare("INSERT INTO schema_migrations(version,name,sha256,applied_at) VALUES (1,?,?,?)").run(
+    "initial-schema",
+    "f7dfa123b82ca6bb8f6ef6220c31f1d80fc987ea6435609d0e649367fc669cec",
+    "2026-07-20T00:00:00.000Z",
+  );
+  db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA wal_checkpoint(TRUNCATE);");
+  if (populated) insertTrackerHarnessRows(db);
+  return db;
+}
+
+async function copyTrackerHarnessFile(root: string, relative: string): Promise<void> {
+  const destination = join(root, relative);
+  await mkdir(dirname(destination), { recursive: true });
+  await copyFile(resolve(relative), destination);
+}
+
+async function createTrackerRunnerHarness(platform: "android" | "ios") {
+  const root = await mkdtemp(join(tmpdir(), `g035-${platform}-runner-`));
+  const bin = join(root, "bin");
+  const calls = join(root, "calls.log");
+  const phase = join(root, "database-phase");
+  const expectedSha = "a".repeat(40);
+  const harnessFiles = [
+    "App.tsx", "index.ts", "app.config.ts", "tools/tracker-evidence.mjs",
+    "tests/fixtures/tracker/manual-tracker-v1.json", "src/infrastructure/db/migrations/migration1.ts",
+    trackerSaveFlowPath, trackerRestartFlowPath, trackerAndroidRunnerPath, trackerIosRunnerPath,
+  ];
+  await Promise.all(harnessFiles.map((path) => copyTrackerHarnessFile(root, path)));
+  for (const args of [["init", "--quiet"], ["add", ...harnessFiles]]) {
+    const result = spawnSync("/usr/bin/git", args, { cwd: root, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  }
+
+  const migrationSource = await readFile("src/infrastructure/db/migrations/migration1.ts", "utf8");
+  const prefix = "export const MIGRATION_1_SQL = String.raw`";
+  const start = migrationSource.indexOf(prefix);
+  const end = migrationSource.indexOf("`;\n\nexport const MIGRATION_1_SHA256", start + prefix.length);
+  assert(start >= 0 && end > start, "Harness migration SQL source is malformed");
+  const migrationSql = migrationSource.slice(start + prefix.length, end);
+  const preDatabase = join(root, "pre.db");
+  createTrackerHarnessDatabase(preDatabase, migrationSql, false).close();
+  const postDatabase = join(root, "post.db");
+  const databaseWriter = createTrackerHarnessDatabase(postDatabase, migrationSql, true);
+  assert((await readFile(`${postDatabase}-wal`)).length > 0, "Harness post-save facts must live in a real WAL sidecar");
+  assert((await readFile(`${postDatabase}-shm`)).length > 0, "Harness post-save WAL must have a real SHM sidecar");
+  await writeFile(phase, "pre");
+
+  await mkdir(bin);
+  const commonLog = `printf '%s %s\\n' "$(basename "$0")" "$*" >> ${JSON.stringify(calls)}`;
+  await writeExecutable(join(bin, "git"), `#!/usr/bin/env bash
+${commonLog}
+if [ "\${1:-}" = rev-parse ]; then
+  printf '%s\n' ${JSON.stringify(expectedSha)}
+else
+  exec /usr/bin/git "$@"
+fi
+`);
+  await writeExecutable(join(bin, "maestro"), `#!/usr/bin/env bash
+${commonLog}
+if [ "\${1:-}" = --version ]; then
+  printf '%s\n' 2.6.1
+elif [[ "$*" == *tracker-save-edit-delete.yaml ]]; then
+  printf '%s' post > ${JSON.stringify(phase)}
+  if [ -n "\${HARNESS_IOS_DATA:-}" ]; then
+    /bin/cp ${JSON.stringify(postDatabase)} "$HARNESS_IOS_DATA/Documents/SQLite/user.db"
+    /bin/cp ${JSON.stringify(`${postDatabase}-wal`)} "$HARNESS_IOS_DATA/Documents/SQLite/user.db-wal"
+    /bin/cp ${JSON.stringify(`${postDatabase}-shm`)} "$HARNESS_IOS_DATA/Documents/SQLite/user.db-shm"
+  fi
+fi
+`);
+  await writeExecutable(join(bin, "curl"), `#!/usr/bin/env bash
+${commonLog}
+exit 22
+`);
+  await writeExecutable(join(bin, "node"), `#!/usr/bin/env bash
+${commonLog}
+if [ "\${HARNESS_FAIL_VALIDATOR:-}" = 1 ] && [[ "$*" == *"--action validate-report"* ]]; then exit 42; fi
+exec ${JSON.stringify(process.execPath)} "$@"
+`);
+  if (platform === "android") {
+    const release = join(root, "release.apk");
+    const state = join(root, "android-pid");
+    const counter = join(root, "android-counter");
+    await writeFile(release, "APKDATA");
+    await writeFile(state, "");
+    await writeFile(counter, "100");
+    await writeExecutable(join(bin, "unzip"), `#!/usr/bin/env bash
+${commonLog}
+if [ "$1" = -Z1 ]; then printf '%s\n' assets/index.android.bundle; else printf '%s' BUNDLE; fi
+`);
+    await writeExecutable(join(bin, "adb"), `#!/usr/bin/env bash
+${commonLog}
+shift 2
+case "$1" in
+  root|wait-for-device|uninstall|install) exit 0 ;;
+  reverse) exit 0 ;;
+  exec-out)
+    database=$(cat ${JSON.stringify(phase)})
+    case "$*" in
+      *base.apk*) /bin/cat ${JSON.stringify(release)} ;;
+      *user.db-wal*) /bin/cat ${JSON.stringify(root)}/"$database.db-wal" ;;
+      *user.db-shm*) /bin/cat ${JSON.stringify(root)}/"$database.db-shm" ;;
+      *) /bin/cat ${JSON.stringify(root)}/"$database.db" ;;
+    esac
+    exit 0 ;;
+  shell)
+    shift
+    command="$*"
+    case "$command" in
+      'id -u') printf '%s\n' 0 ;;
+      *'service check package'*) printf '%s\n' 'Service package: found' ;;
+      *'setprop persist.sys.timezone'*) ;;
+      *'getprop persist.sys.timezone'*) printf '%s\n' Asia/Shanghai ;;
+      *'am start -W'*)
+        next=$(( $(cat ${JSON.stringify(counter)}) + 1 )); printf '%s' "$next" > ${JSON.stringify(counter)}; printf '%s' "$next" > ${JSON.stringify(state)} ;;
+      *'am force-stop'*) : > ${JSON.stringify(state)} ;;
+      *'pidof -s'*)
+        pid=$(cat ${JSON.stringify(state)})
+        if [ -n "$pid" ]; then printf '%s\n__PIDOF_STATUS__=0\n' "$pid"; else printf '%s\n' '__PIDOF_STATUS__=1'; fi ;;
+      *'pm path'*) printf '%s\n' 'package:/data/app/base.apk' ;;
+      *'test -f'*'-wal'*) database=$(cat ${JSON.stringify(phase)}); test -f ${JSON.stringify(root)}/"$database.db-wal" ;;
+      *'test -f'*'-shm'*) database=$(cat ${JSON.stringify(phase)}); test -f ${JSON.stringify(root)}/"$database.db-shm" ;;
+      *) exit 0 ;;
+    esac ;;
+esac
+`);
+    return {
+      root, bin, calls, expectedSha, databaseWriter, processState: state, iosData: "",
+      artifact: release, runner: join(root, trackerAndroidRunnerPath), args: ["emulator-5554", expectedSha, release, "999999"],
+    };
+  }
+
+  const releaseApp = join(root, "Release.app");
+  const data = join(root, "data");
+  await mkdir(releaseApp);
+  await mkdir(join(data, "Documents", "SQLite"), { recursive: true });
+  await writeFile(join(releaseApp, "ForMobile"), "EXECUTABLE");
+  await chmod(join(releaseApp, "ForMobile"), 0o755);
+  await writeFile(join(releaseApp, "main.jsbundle"), "BUNDLE");
+  await writeFile(join(releaseApp, "Info.plist"), "PLIST");
+  await copyFile(preDatabase, join(data, "Documents", "SQLite", "user.db"));
+  const state = join(root, "ios-pid");
+  await writeFile(state, "");
+  await mkdir(join(root, "scripts", "e2e"), { recursive: true });
+  await writeFile(join(root, "scripts", "e2e", "query-ios-device-calendar.sh"), `#!/usr/bin/env bash
+printf 'bash scripts/e2e/query-ios-device-calendar.sh %s\\n' "$*" >> ${JSON.stringify(calls)}
+printf '2026-07-22\\tAsia/Shanghai\\n'
+`);
+  await writeExecutable(join(bin, "xcrun"), `#!/usr/bin/env bash
+${commonLog}
+test "$1" = simctl || exit 1
+case "$2" in
+  uninstall|install) exit 0 ;;
+  launch)
+    /bin/sleep 300 >/dev/null 2>&1 &
+    pid=$!
+    printf '%s' "$pid" > ${JSON.stringify(state)}
+    printf 'com.luyao618.formobile: %s\n' "$pid" ;;
+  terminate)
+    pid=$(cat ${JSON.stringify(state)})
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill "$pid"; fi
+    /bin/sleep 0.05
+    : > ${JSON.stringify(state)} ;;
+  get_app_container)
+    if [ "$5" = data ]; then printf '%s\n' ${JSON.stringify(data)}; else printf '%s\n' ${JSON.stringify(releaseApp)}; fi ;;
+  *) exit 1 ;;
+esac
+`);
+  await writeExecutable(join(bin, "plutil"), `#!/usr/bin/env bash
+${commonLog}
+output=
+previous=
+for argument in "$@"; do [ "$previous" != -o ] || output=$argument; previous=$argument; done
+printf '{}' > "$output"
+`);
+  await writeExecutable(join(bin, "cp"), `#!/usr/bin/env bash
+${commonLog}
+exec /bin/cp "$@"
+`);
+  return {
+    root, bin, calls, expectedSha, databaseWriter, processState: state, iosData: data,
+    artifact: releaseApp, runner: join(root, trackerIosRunnerPath), args: ["simulator-udid", expectedSha, releaseApp, "999999"],
+  };
+}
+
+async function assertTrackerPrivateTempAbsent(root: string, platform: "android" | "ios", phase: string): Promise<void> {
+  const privateDirectories = (await readdir(root)).filter((entry) => /^g035-tracker-(?:android|ios)\./.test(entry));
+  assert.deepEqual(privateDirectories, [], `${platform} private temp must be removed ${phase}`);
+}
+
+test("G035 C2 tracker runners execute the frozen lifecycle under hermetic command harnesses", async () => {
+  for (const platform of ["android", "ios"] as const) {
+    const harness = await createTrackerRunnerHarness(platform);
+    try {
+      const result = spawnSync("/bin/bash", [harness.runner, ...harness.args], {
+        cwd: harness.root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${harness.bin}:${process.env.PATH ?? ""}`,
+          TMPDIR: harness.root,
+          HARNESS_IOS_DATA: harness.iosData,
+        },
+      });
+      assert.equal(result.status, 0, `${platform}: ${result.stderr}`);
+      const calls = await readFile(harness.calls, "utf8");
+      assert.equal((calls.match(/^maestro .*tracker-save-edit-delete\.yaml$/gm) ?? []).length, 1, `${platform} save calls:\n${calls}`);
+      assert.equal((calls.match(/^maestro .*tracker-restart\.yaml$/gm) ?? []).length, 1, `${platform} restart calls:\n${calls}`);
+      assert.equal((calls.match(/^curl /gm) ?? []).length, 2);
+      assert.equal((calls.match(/^node .*--action tracker-snapshot/gm) ?? []).length, 3);
+      assert.equal((calls.match(/^node .*--action validate-report/gm) ?? []).length, 1, `${platform} must run the real C1 validator`);
+      if (platform === "android") {
+        ordered(calls, "adb -s emulator-5554 root", "adb -s emulator-5554 wait-for-device", "adb -s emulator-5554 uninstall", "adb -s emulator-5554 install --no-streaming");
+        assert.equal((calls.match(/^adb -s emulator-5554 install(?:\s|$)/gm) ?? []).length, 1);
+        assert.equal((calls.match(/^adb -s emulator-5554 shell am start -W/gm) ?? []).length, 3);
+        assert.equal((calls.match(/^adb -s emulator-5554 shell am force-stop/gm) ?? []).length, 3);
+        assert.equal((calls.match(/^adb -s emulator-5554 reverse --list$/gm) ?? []).length, 2);
+        assert.match(calls, /^adb -s emulator-5554 exec-out cat .*user\.db-wal$/m);
+        assert.match(calls, /^adb -s emulator-5554 exec-out cat .*user\.db-shm$/m);
+      } else {
+        ordered(calls, "xcrun simctl uninstall", "xcrun simctl install", "xcrun simctl launch");
+        assert.equal((calls.match(/^xcrun simctl install(?:\s|$)/gm) ?? []).length, 1);
+        assert.equal((calls.match(/^xcrun simctl launch/gm) ?? []).length, 3);
+        assert.equal((calls.match(/^xcrun simctl terminate/gm) ?? []).length, 3);
+        assert.equal((calls.match(/^bash scripts\/e2e\/query-ios-device-calendar\.sh/gm) ?? []).length, 3);
+        assert.match(calls, /^cp .*user\.db-wal .*post-save\.db-wal$/m);
+        assert.match(calls, /^cp .*user\.db-shm .*post-save\.db-shm$/m);
+      }
+      const reportText = await readFile(join(harness.root, `.artifacts/${platform}-tracker-restart.json`), "utf8");
+      const report = JSON.parse(reportText) as any;
+      assert.equal(reportText.at(-1), "}", `${platform} report must be canonical JSON without a newline`);
+      assert.equal(report.reportType, "manual-tracker-offline-restart");
+      assert.deepEqual(report.database.preSave.counts, {
+        total: 0, active: 0, tombstoned: 0,
+        byDomain: Object.fromEntries(["growth", "feeding", "sleep", "diaper", "health"].map((domain) => (
+          [domain, { total: 0, active: 0, tombstoned: 0 }]
+        ))),
+      });
+      assert.deepEqual(report.database.postRelaunch, report.database.postSave);
+      assert.deepEqual(report.database.postSave.counts, {
+        total: 5, active: 4, tombstoned: 1,
+        byDomain: {
+          growth: { total: 1, active: 1, tombstoned: 0 },
+          feeding: { total: 1, active: 1, tombstoned: 0 },
+          sleep: { total: 1, active: 1, tombstoned: 0 },
+          diaper: { total: 1, active: 0, tombstoned: 1 },
+          health: { total: 1, active: 1, tombstoned: 0 },
+        },
+      });
+      const launches = Object.values(report.lifecycle.directLaunches) as { pid: number; terminated: boolean; absentBeforeSnapshot: boolean }[];
+      assert.equal(new Set(launches.map(({ pid }) => pid)).size, 3, `${platform} launches must have distinct modeled identities`);
+      for (const launch of launches) assert.deepEqual(
+        { terminated: launch.terminated, absentBeforeSnapshot: launch.absentBeforeSnapshot },
+        { terminated: true, absentBeforeSnapshot: true },
+      );
+      const binaryHashes = Object.values(report.binary.source) as string[];
+      assert(binaryHashes.every((value) => /^[0-9a-f]{64}$/.test(value) && value !== "0".repeat(64)));
+      assert.equal(new Set(binaryHashes).size, binaryHashes.length, `${platform} binary components must have distinct real hashes`);
+      assert.deepEqual(report.binary.installedBefore, report.binary.source);
+      assert.deepEqual(report.binary.installedAfter, report.binary.source);
+      assert.equal(await readFile(harness.processState, "utf8"), "", `${platform} process must be absent after final terminate`);
+      if (platform === "ios") {
+        for (const { pid } of launches) {
+          assert.throws(() => process.kill(pid, 0), (error: unknown) => (
+            error instanceof Error && "code" in error && error.code === "ESRCH"
+          ), `iOS process ${pid} must be absent after terminate`);
+        }
+      }
+      await assertTrackerPrivateTempAbsent(harness.root, platform, "after successful execution");
+    } finally {
+      harness.databaseWriter.close();
+      await rm(harness.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("G035 C2 tracker runner PID arguments fail before native commands", async () => {
+  for (const platform of ["android", "ios"] as const) {
+    for (const hostilePid of ["0", "-1", "01", "9007199254740992", "abc"]) {
+      const harness = await createTrackerRunnerHarness(platform);
+      try {
+        const args = [...harness.args.slice(0, 3), hostilePid];
+        const result = spawnSync("/bin/bash", [harness.runner, ...args], {
+          cwd: harness.root,
+          encoding: "utf8",
+          env: { ...process.env, PATH: `${harness.bin}:${process.env.PATH ?? ""}`, TMPDIR: harness.root },
+        });
+        assert.notEqual(result.status, 0, `${platform} accepted ${hostilePid}`);
+        const calls = await readFile(harness.calls, "utf8").catch(() => "");
+        assert.equal(calls, "", `${platform} touched native commands for ${hostilePid}`);
+        await assertTrackerPrivateTempAbsent(harness.root, platform, `after invalid PID ${hostilePid}`);
+      } finally {
+        harness.databaseWriter.close();
+        await rm(harness.root, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("G035 C2 tracker runners clean private temp after a nonzero validator exit", async () => {
+  for (const platform of ["android", "ios"] as const) {
+    const harness = await createTrackerRunnerHarness(platform);
+    try {
+      const result = spawnSync("/bin/bash", [harness.runner, ...harness.args], {
+        cwd: harness.root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${harness.bin}:${process.env.PATH ?? ""}`,
+          TMPDIR: harness.root,
+          HARNESS_IOS_DATA: harness.iosData,
+          HARNESS_FAIL_VALIDATOR: "1",
+        },
+      });
+      assert.equal(result.status, 42, `${platform}: ${result.stderr}`);
+      const calls = await readFile(harness.calls, "utf8");
+      assert.equal((calls.match(/^node .*--action validate-report/gm) ?? []).length, 1,
+        `${platform} must reach the injected validator failure`);
+      await assertTrackerPrivateTempAbsent(harness.root, platform, "after nonzero validator exit");
+    } finally {
+      harness.databaseWriter.close();
+      await rm(harness.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("G035 C2 hostile mutations fail the frozen flow and runner contracts", async () => {
+  const [saveFlow, restartFlow, android, ios] = await Promise.all([
+    readFile(trackerSaveFlowPath, "utf8"), readFile(trackerRestartFlowPath, "utf8"),
+    readFile(trackerAndroidRunnerPath, "utf8"), readFile(trackerIosRunnerPath, "utf8"),
+  ]);
+  const replaceExactlyOnce = (source: string, target: string, replacement: string, label: string): string => {
+    assert.equal(source.split(target).length - 1, 1, `${label} mutation target must occur exactly once`);
+    return source.replace(target, () => replacement);
+  };
+  const measurementDateSecondClear = `- tapOn:\n${trackerCompoundSelector("测量日期", "测量日期", 4)}\n- eraseText\n`;
+  const measurementDateDoubleClear = `${measurementDateSecondClear}${measurementDateSecondClear}`;
+  const measurementDateFinalClear = `${measurementDateSecondClear}- inputText: "2026-07-19"`;
+  const flowMutations: readonly [string, string, "save" | "restart", RegExp?][] = [
+    ["label-only input", saveFlow.replace(trackerCompoundSelector("测量日期", "测量日期", 4), "    text: '^测量日期$'"), "save"],
+    ["one clear cycle", replaceExactlyOnce(
+      saveFlow,
+      measurementDateDoubleClear,
+      measurementDateSecondClear,
+      "one clear cycle",
+    ), "save", /one clear cycle command inventory drifted/],
+    ["wrong second-cycle field", replaceExactlyOnce(
+      saveFlow,
+      measurementDateFinalClear,
+      `- tapOn:\n${trackerCompoundSelector("喂养日期", "喂养日期", 4)}\n- eraseText\n- inputText: "2026-07-19"`,
+      "wrong second-cycle field",
+    ), "save", /测量日期=2026-07-19 must use the exact compound entry sequence/],
+    ["wrong decimal escaping", restartFlow.replace("68\\.5", "68.5"), "restart"],
+    ["coordinate", `${saveFlow}\n- tapOn:\n    point: \"50%,50%\"\n`, "save"],
+    ["optional", `${saveFlow}\n- tapOn:\n    text: '^生长$'\n    optional: true\n`, "save"],
+    ["checked", `${saveFlow}\n- assertVisible:\n    text: '^常规检查$'\n    checked: true\n`, "save"],
+    ["reviewer extra Maestro tap", `${saveFlow}\n- tapOn: '^生长$'\n`, "save", /reviewer extra Maestro tap command inventory drifted/],
+    ["aliased extra Maestro tap", `${restartFlow}\n- &extraTap\n  tapOn: '^生长$'\n- *extraTap\n`, "restart", /aliased extra Maestro tap command inventory drifted/],
+  ];
+  for (const [label, mutation, kind, expectedError] of flowMutations) {
+    assert.ok(mutation !== saveFlow && mutation !== restartFlow, `${label} mutation must change a flow`);
+    const enforceMutation = () => {
+      assertTrackerFlowSafety(mutation, label, kind);
+      for (const [field, value, erase] of [["测量日期", "2026-07-19", true]] as const) {
+        assert.equal(mutation.split(trackerInputSequence(field, value, erase)).length - 1, 1,
+          `${field}=${value} must use the exact compound entry sequence`);
+      }
+      assert.match(mutation, /68\\\.5/);
+    };
+    if (expectedError) assert.throws(enforceMutation, expectedError, label);
+    else assert.throws(enforceMutation, label);
+  }
+  const runnerMutations: readonly ["android" | "ios", string, string, RegExp?][] = [
+    ["android", android, android.replace("snapshot post-save", "snapshot post-save-live")],
+    ["android", android, android.replace("assert_metro_unreachable \"before tracker operations\"", "true")],
+    ["android", android, android.replace("rm -rf \"$private_tmp\"", ":")],
+    ["android", android, android.replace('rm -rf "$private_tmp"', '[ "$status" -eq 0 ] && rm -rf "$private_tmp"'),
+      /run-tracker-restart-android\.sh must preserve exact unconditional EXIT cleanup/],
+    ["android", android, android.replace('"$destination-wal"', '"$destination"')],
+    ["android", android, android.replace('test "$source_identity" = "$installed_before_identity"', "true")],
+    ["android", android, android.replace('adb -s "$serial" install --no-streaming "$release_apk" >/dev/null', 'adb -s "$serial" install --no-streaming "$release_apk" >/dev/null\nadb -s "$serial" install --no-streaming "$release_apk" >/dev/null'),
+      /run-tracker-restart-android\.sh mutates the installation after the fresh install/],
+    ["android", android, android.replace("post_save_zone=$(device_time_zone)", 'adb -s "$serial" shell pm clear "$app_id"\npost_save_zone=$(device_time_zone)'),
+      /run-tracker-restart-android\.sh mutates the installation after the fresh install/],
+    ["ios", ios, ios.replace("test \"$relaunch_pid\" != \"$save_pid\"", "true")],
+    ["ios", ios, ios.replace("post_save_zone=$(device_time_zone)", "post_save_zone=Asia/Shanghai")],
+    ["ios", ios, ios.replace('"$destination-shm"', '"$destination"')],
+    ["ios", ios, ios.replace('test "$source_identity" = "$installed_after_identity"', "true")],
+    ["ios", ios, ios.replace("post_save_zone=$(device_time_zone)", '  xcrun simctl install "$udid" "$release_app"\npost_save_zone=$(device_time_zone)'),
+      /run-tracker-restart-ios\.sh mutates the installation after the fresh install/],
+    ["ios", ios, ios.replace("post_save_zone=$(device_time_zone)", 'post_save_operation=install\nxcrun simctl "$post_save_operation" "$udid" "$release_app"\npost_save_zone=$(device_time_zone)'),
+      /run-tracker-restart-ios\.sh mutates the installation after the fresh install/],
+  ];
+  for (const [platform, script, mutation, expectedError] of runnerMutations) {
+    assert.notEqual(mutation, script);
+    const enforceMutation = () => assertTrackerRunnerPolicy(mutation, platform);
+    if (expectedError) assert.throws(enforceMutation, expectedError, `${platform} runner mutation`);
+    else assert.throws(enforceMutation, `${platform} runner mutation`);
+  }
+});
+
+function extractBashFunction(source: string, name: string): string {
+  const lines = source.split(/\r\n|\n|\r/);
+  const starts = lines.flatMap((line, index) => line.trim() === `${name}() {` ? [index] : []);
+  assert.equal(starts.length, 1, `${name} must have exactly one Bash function definition`);
+  const end = lines.findIndex((line, index) => index > starts[0]! && line.trim() === "}");
+  assert(end > starts[0]!, `${name} Bash function is unterminated`);
+  return lines.slice(starts[0], end + 1).join("\n");
+}
+
+function assertC3PositiveSafeIntegerValidator(source: string, platform: "android" | "ios"): string {
+  const validator = extractBashFunction(source, "validate_positive_safe_integer");
+  assert.match(validator, /Number\.isSafeInteger\(value\)/,
+    `${platform} validator must retain the safe-integer predicate`);
+  assert.match(validator, /value\s*<=\s*0/,
+    `${platform} validator must retain the positivity predicate`);
+  assert.match(validator, /String\(value\)\s*!==\s*process\.argv\[1\]/,
+    `${platform} validator must retain the canonical-string predicate`);
+  return validator;
+}
+
+function runC3PositiveSafeIntegerValidator(validator: string, value: string) {
+  return spawnSync("bash", ["-c", `set -euo pipefail\n${validator}\nvalidate_positive_safe_integer "$1"`, "_", value], {
+    encoding: "utf8",
+  });
+}
+
+function assertC3OwnedMetroHandoff(source: string, platform: "android" | "ios"): void {
+  const device = platform === "android" ? '"$emulator_serial"' : '"$simulator_udid"';
+  const artifact = platform === "android"
+    ? "android/app/build/outputs/apk/release/app-release.apk"
+    : '"$release_app_path"';
+  const profileCall = `bash scripts/e2e/run-profile-restart-${platform}.sh ${device} `
+    + (platform === "android" ? '"$EXPECTED_SHA" ' : '"${{ inputs.expected_sha }}" ')
+    + artifact;
+  const trackerCall = `bash scripts/e2e/run-tracker-restart-${platform}.sh ${device} `
+    + (platform === "android" ? '"$EXPECTED_SHA" ' : '"${{ inputs.expected_sha }}" ')
+    + `${artifact} "$owned_metro_pid"`;
+  const lines = source.split(/\r\n|\n|\r/);
+  const lineIndexes = (exact: string) => lines.flatMap((line, index) => line.trim() === exact ? [index] : []);
+  const assignmentIndexes = lineIndexes("owned_metro_pid=$metro_pid");
+  const validationIndexes = lineIndexes('validate_positive_safe_integer "$owned_metro_pid"');
+  const killIndexes = lineIndexes('kill -- "-$owned_metro_pid"');
+  const waitIndexes = lineIndexes('wait "$owned_metro_pid"');
+  assert.equal(assignmentIndexes.length, 1, `${platform} must retain exactly one owned Metro PID`);
+  assert.equal(validationIndexes.length, 1, `${platform} must validate the owned Metro PID exactly once`);
+  assert.equal(killIndexes.length, 1, `${platform} must contain exactly one owned Metro kill`);
+  assert.equal(waitIndexes.length, 1, `${platform} must contain exactly one owned Metro wait`);
+  const cleanupClearIndexes = lineIndexes("metro_pid=").filter((index) => index > waitIndexes[0]!);
+  assert.equal(cleanupClearIndexes.length, 1, `${platform} must clear cleanup ownership exactly once after the owned Metro wait`);
+  assert(assignmentIndexes[0]! < validationIndexes[0]!
+    && validationIndexes[0]! < killIndexes[0]!
+    && killIndexes[0]! < waitIndexes[0]!
+    && waitIndexes[0]! < cleanupClearIndexes[0]!,
+  `${platform} must preserve retained assignment, kill, wait, and cleanup-owner clear order`);
+  assertC3PositiveSafeIntegerValidator(source, platform);
+  ordered(source,
+    "owned_metro_pid=$metro_pid",
+    'kill -- "-$owned_metro_pid"',
+    'wait "$owned_metro_pid"',
+    "metro_pid=",
+    ...(platform === "android" ? ['reverse --remove tcp:8081'] : []),
+    "curl --silent --fail http://127.0.0.1:8081/status",
+    profileCall,
+    trackerCall,
+  );
+  assert.equal((source.match(new RegExp(`bash scripts/e2e/run-profile-restart-${platform}\\.sh`, "g")) ?? []).length, 1);
+  assert.equal((source.match(new RegExp(`bash scripts/e2e/run-tracker-restart-${platform}\\.sh`, "g")) ?? []).length, 1);
+  assert.equal(source.split(trackerCall).length - 1, 1, `${platform} tracker runner handoff must be exact and mandatory`);
+  assert.doesNotMatch(source, new RegExp(`(?:if|\\|\\||&&).*run-tracker-restart-${platform}|run-tracker-restart-${platform}.*(?:\\|\\||&&)`),
+    `${platform} tracker runner must not be optional or conditional`);
+  assert.equal(source.slice(source.indexOf("owned_metro_pid=$metro_pid")).includes("owned_metro_pid="), true);
+  assert.equal((source.slice(source.indexOf("owned_metro_pid=$metro_pid") + 1).match(/owned_metro_pid=\s*$/gm) ?? []).length, 0,
+    `${platform} must not destroy the retained Metro PID`);
+}
+
+function c3CollectorRun(platform: "android" | "ios"): string {
+  return exactChildCollectorRuns[platform];
+}
+
+function c3PrimaryUploadPath(platform: "android" | "ios"): string {
+  return exactChildPrimaryUploadPaths[platform];
+}
+
+function assertC3WorkflowBinding(source: string, platform: "android" | "ios"): void {
+  const workflow = parseWorkflow(source, `.github/workflows/e2e-${platform}.yml`);
+  const steps = requiredSteps(requiredJob(workflow, platform), platform);
+  const collector = steps.filter((step) => step.name === "Collect same-SHA evidence");
+  assert.equal(collector.length, 1, `${platform} must retain one collector`);
+  assert.equal(collector[0]!.run, c3CollectorRun(platform), `${platform} tracker collector flag must be exact`);
+  assertUnconditionalFailClosed(collector[0]!, `${platform} tracker collector`);
+  const uploads = steps.filter((step) => usesActionRepository(step, uploadArtifactRepository));
+  assert.equal(uploads.length, 2, `${platform} must retain only primary evidence and generic diagnostics uploads`);
+  const primary = uploads.find((step) => step.with?.name === `${platform}-e2e-evidence-${expectedShaInput}`);
+  assert(primary?.with, `${platform} primary evidence upload is absent`);
+  assert.equal(primary.with.path, c3PrimaryUploadPath(platform), `${platform} primary tracker evidence paths must be explicit`);
+  const diagnostics = uploads.find((step) => step.with?.name === `${platform}-e2e-diagnostics-${expectedShaInput}`);
+  assert.deepEqual(diagnostics?.with, {
+    name: `${platform}-e2e-diagnostics-${expectedShaInput}`,
+    path: ".artifacts/launch/**\n.artifacts/test-results/**\n",
+    "include-hidden-files": true,
+    "if-no-files-found": "ignore",
+  }, `${platform} generic diagnostics upload must remain non-evidence and unchanged`);
+  assert.equal(diagnostics?.if, "always()");
+}
+
+test("G035 C3 outer runners retain one exact owned Metro PID through profile then tracker handoff", async () => {
+  const [android, iosWorkflowSource] = await Promise.all([
+    readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
+    readFile(".github/workflows/e2e-ios.yml", "utf8"),
+  ]);
+  const iosWorkflow = parseWorkflow(iosWorkflowSource, ".github/workflows/e2e-ios.yml");
+  const ios = requiredSteps(requiredJob(iosWorkflow, "ios"), "ios")
+    .find((step) => step.name === "Serial production and E2E builds, install, and smoke")?.run;
+  assert(ios, "Parsed iOS outer runner script is absent");
+  assertC3OwnedMetroHandoff(android, "android");
+  assertC3OwnedMetroHandoff(ios, "ios");
+  for (const [platform, source] of [["android", android], ["ios", ios]] as const) {
+    const validator = assertC3PositiveSafeIntegerValidator(source, platform);
+    for (const valid of ["1", "42", "9007199254740991"]) {
+      const result = runC3PositiveSafeIntegerValidator(validator, valid);
+      assert.equal(result.status, 0, `${platform} rejected canonical safe PID ${valid}: ${result.stderr}`);
+    }
+    for (const invalid of ["0", "-1", "1.5", "9007199254740992", "01", "1e3", "+1", ""]) {
+      const result = runC3PositiveSafeIntegerValidator(validator, invalid);
+      assert.notEqual(result.status, 0, `${platform} accepted invalid PID ${JSON.stringify(invalid)}`);
+    }
+    const validatorMutations = [
+      [source.replace("Number.isSafeInteger(value)", "true"), /safe-integer predicate/],
+      [source.replace("value <= 0 || ", ""), /positivity predicate/],
+      [source.replace(" || String(value) !== process.argv[1]", ""), /canonical-string predicate/],
+    ] as const;
+    for (const [hostile, expected] of validatorMutations) {
+      assert.notEqual(hostile, source);
+      assert.throws(() => assertC3PositiveSafeIntegerValidator(hostile, platform), expected);
+    }
+    const lateValidationLines = source.split("\n");
+    const validationIndex = lateValidationLines.findIndex((line) => line.trim() === 'validate_positive_safe_integer "$owned_metro_pid"');
+    const killIndex = lateValidationLines.findIndex((line) => line.trim() === 'kill -- "-$owned_metro_pid"');
+    assert(validationIndex >= 0 && killIndex > validationIndex);
+    [lateValidationLines[validationIndex], lateValidationLines[killIndex]] = [lateValidationLines[killIndex]!, lateValidationLines[validationIndex]!];
+    const lateValidation = lateValidationLines.join("\n");
+    assert.notEqual(lateValidation, source);
+    assert.throws(() => assertC3OwnedMetroHandoff(lateValidation, platform), /assignment, kill, wait|order/);
+  }
+  const swapRunnerCalls = (value: string, platform: "android" | "ios") => {
+    const lines = value.split("\n");
+    const profileIndex = lines.findIndex((line) => line.includes(`run-profile-restart-${platform}.sh`));
+    const trackerIndex = lines.findIndex((line) => line.includes(`run-tracker-restart-${platform}.sh`));
+    assert(profileIndex >= 0 && trackerIndex > profileIndex);
+    [lines[profileIndex], lines[trackerIndex]] = [lines[trackerIndex]!, lines[profileIndex]!];
+    return lines.join("\n");
+  };
+  const mutations = (["android", "ios"] as const).flatMap((platform) => {
+    const source = platform === "android" ? android : ios;
+    return [
+      [platform, source, (value: string) => value.replace("owned_metro_pid=$metro_pid\n", "")],
+      [platform, source, (value: string) => value.replace('wait "$owned_metro_pid"', 'wait "$metro_pid"')],
+      [platform, source, (value: string) => swapRunnerCalls(value, platform)],
+      [platform, source, (value: string) => value.replace(`bash scripts/e2e/run-tracker-restart-${platform}.sh`, "true")],
+      [platform, source, (value: string) => value.replace(`bash scripts/e2e/run-tracker-restart-${platform}.sh`, `true && bash scripts/e2e/run-tracker-restart-${platform}.sh`)],
+    ] as const;
+  });
+  for (const [platform, source, mutate] of mutations) {
+    const hostile = mutate(source);
+    assert.notEqual(hostile, source, `${platform} PID mutation must change its source`);
+    assert.throws(() => assertC3OwnedMetroHandoff(hostile, platform));
+  }
+  for (const [platform, source] of [["android", android], ["ios", ios]] as const) {
+    const extraPreKillWait = source.replace(
+      'kill -- "-$owned_metro_pid"\n',
+      'wait "$owned_metro_pid"\nkill -- "-$owned_metro_pid"\n',
+    );
+    assert.notEqual(extraPreKillWait, source);
+    assert.throws(
+      () => assertC3OwnedMetroHandoff(extraPreKillWait, platform),
+      /exactly one owned Metro wait/,
+    );
+  }
+});
+
+test("G035 C3 reusable workflows pass canonical tracker flags and upload only explicit tracker JSON", async () => {
+  for (const platform of ["android", "ios"] as const) {
+    const source = await readFile(`.github/workflows/e2e-${platform}.yml`, "utf8");
+    assertC3WorkflowBinding(source, platform);
+    for (const hostilePath of [
+      ".artifacts/tracker/**", ".artifacts/trac[k]er/**", ".artifacts/**/tracker*.json",
+      ".artifacts/tracker/**/*.{json,db}", ".artifacts/tracker.sqlite",
+      `.artifacts/${platform}-tracker-restart.db`, `.artifacts/${platform}-tracker-restart.db-wal`,
+      `.artifacts/${platform}-tracker-restart.db-shm`, `.artifacts/${platform}-tracker-restart.apk`,
+      `.artifacts/${platform}-tracker-restart.app`, `.artifacts/${platform}-tracker-restart.bundle`,
+      `.artifacts/${platform}-tracker-restart.log`, `.artifacts/${platform}-tracker-restart.png`,
+      `.artifacts/${platform}-tracker-restart.xml`, `.artifacts/${platform}-tracker-restart.zip`,
+      `.artifacts/../${platform}-tracker-restart.json`, `.artifacts/${platform}-tracker-restart`,
+    ]) {
+      const hostile = source.replace(
+        `.artifacts/${platform}-profile-restart.json\n`,
+        `.artifacts/${platform}-profile-restart.json\n            ${hostilePath}\n`,
+      );
+      assert.notEqual(hostile, source);
+      assert.throws(() => assertC3WorkflowBinding(hostile, platform), hostilePath);
+    }
+  }
+});
+
+test("G035 C3 tracker temp and debug output cannot hide beneath generic diagnostic uploads", async () => {
+  const forbiddenTrackerPlacement = /\.artifacts\/(?:tracker\/|(?:launch|test-results)\/[^\n]*tracker)/i;
+  for (const platform of ["android", "ios"] as const) {
+    const runner = await readFile(`scripts/e2e/run-tracker-restart-${platform}.sh`, "utf8");
+    assert.doesNotMatch(runner, forbiddenTrackerPlacement);
+    for (const hostile of [
+      `.artifacts/launch/tracker-${platform}.log`,
+      `.artifacts/test-results/tracker-${platform}.json`,
+      `.artifacts/tracker/${platform}/debug`,
+    ]) {
+      assert.match(`${runner}\nprivate_tmp=${hostile}\n`, forbiddenTrackerPlacement);
+    }
+  }
+});
+
+test("G035 C3 preserves one serial exact-head reusable workflow per native platform", async () => {
+  assert.deepEqual((await readdir(".github/workflows")).sort(), ["ci.yml", "e2e-android.yml", "e2e-ios.yml"]);
+  const workflows = await loadNativeWorkflows();
+  assertExactJobKeys(workflows.ci, ["static", "android-e2e", "ios-e2e"], "CI");
+  for (const [jobName, path] of [["android-e2e", "./.github/workflows/e2e-android.yml"], ["ios-e2e", "./.github/workflows/e2e-ios.yml"]] as const) {
+    const job = requiredJob(workflows.ci, jobName);
+    assert.equal(job.needs, "static");
+    assert.equal(job.uses, path);
+    assert.deepEqual(job.with, { expected_sha: exactHeadSha });
+    assert.equal(Object.hasOwn(job, "strategy"), false, `${jobName} must not introduce a matrix`);
+  }
+  assertExactJobKeys(workflows.android, ["android"], "android");
+  assertExactJobKeys(workflows.ios, ["ios"], "ios");
 });
