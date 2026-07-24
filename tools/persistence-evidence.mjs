@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,33 @@ const PROFILE_VALUES = Object.freeze({
   name: "G031LeapBaby",
   sex: "female",
 });
+const DESTINATION_READBACK_CANONICALIZATION_VERSION = 1;
+const DESTINATION_READBACK_SCHEMA_SHA256 = "6b0f47330ed82306a6f601f4ad87a865c692fb0356ede4cda38a610a4d14b8e4";
+const DESTINATION_READBACK_SCENARIOS = new Set(["migrationHashRetry", "failedMigrationRollback"]);
+const EXPECTED_PERSISTENCE_SCENARIO_FACTS = Object.freeze({
+  meta: { value_json: '"preserved"' },
+  jobs: [{ id: "e2e-j", status: "queued", lease_owner: null, lease_expires_at: null }],
+  turns: [{ id: "e2e-t", status: "failed", error_code: "startup_interrupted" }],
+  tasks: [{ id: "e2e-p", status: "expired" }],
+});
+const DESTINATION_READBACK_COMPARISON_KEYS = [
+  "checkedOutShaMatchesExpected",
+  "destinationCheckpointComplete",
+  "destinationJournalModeIsWal",
+  "destinationMigrationIdentityMatchesFrozen",
+  "destinationQuickCheckOk",
+  "destinationScenarioFactsMatchExpected",
+  "destinationSchemaFingerprintMatchesFrozen",
+  "journalModeEqual",
+  "migrationIdentityEqual",
+  "scenarioFactsEqual",
+  "schemaFingerprintEqual",
+  "sourceJournalModeIsWal",
+  "sourceMigrationIdentityMatchesFrozen",
+  "sourceQuickCheckOk",
+  "sourceScenarioFactsMatchExpected",
+  "sourceSchemaFingerprintMatchesFrozen",
+];
 
 function option(name, required = true) {
   const index = process.argv.indexOf(name);
@@ -44,6 +71,335 @@ function checkpoint(db) {
 
 function sha256Bytes(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalSha256(value) {
+  return sha256Bytes(canonicalJson(value));
+}
+
+function normalizedQuickCheck(db) {
+  try {
+    const rows = db.prepare("PRAGMA quick_check").all();
+    return rows.length === 1 && rows[0]?.quick_check === "ok" ? "ok" : "failed";
+  } catch {
+    return "unavailable";
+  }
+}
+
+function normalizedMigration(db) {
+  try {
+    const rows = db.prepare("SELECT version,name,sha256 FROM schema_migrations ORDER BY version").all();
+    if (!rows.every((row) => Number.isSafeInteger(row.version)
+      && typeof row.name === "string" && /^[a-z0-9-]{1,64}$/.test(row.name)
+      && typeof row.sha256 === "string" && /^[0-9a-f]{64}$/.test(row.sha256))) return [];
+    return rows.map(({ version, name, sha256 }) => ({ version, name, sha256 }));
+  } catch {
+    return [];
+  }
+}
+
+function normalizedJournalMode(db) {
+  try {
+    const value = db.prepare("PRAGMA journal_mode").get()?.journal_mode;
+    return ["delete", "truncate", "persist", "memory", "wal", "off"].includes(value) ? value : "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+
+function schemaFingerprintSha256(db) {
+  try {
+    const rows = db.prepare(`SELECT type,name,tbl_name AS tableName,sql
+      FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
+      ORDER BY type,name,tbl_name,sql`).all();
+    if (!rows.every((row) => typeof row.type === "string"
+      && typeof row.name === "string"
+      && typeof row.tableName === "string"
+      && (row.sql === null || typeof row.sql === "string"))) return null;
+    const normalized = rows.map(({ type, name, tableName, sql }) => ({
+      type,
+      name,
+      tableName,
+      sql: sql === null ? null : sql.replace(/\r\n?/g, "\n").trim(),
+    }));
+    return canonicalSha256(normalized);
+  } catch {
+    return null;
+  }
+}
+
+function scenarioFactsSha256(db, scenario) {
+  try {
+    const facts = {
+      meta: db.prepare("SELECT value_json FROM app_meta WHERE key='e2e.persistence.sentinel'").get() ?? null,
+      jobs: db.prepare("SELECT id,status,lease_owner,lease_expires_at FROM local_jobs WHERE id='e2e-j' ORDER BY id").all(),
+      turns: db.prepare("SELECT id,status,error_code FROM chat_turns WHERE id='e2e-t' ORDER BY id").all(),
+      tasks: db.prepare("SELECT id,status FROM pending_agent_tasks WHERE id='e2e-p' ORDER BY id").all(),
+    };
+    return canonicalSha256({ scenario, facts });
+  } catch {
+    return null;
+  }
+}
+
+function readOnlyDatabaseProof(db, scenario, origin) {
+  return {
+    origin,
+    quickCheck: normalizedQuickCheck(db),
+    migration: normalizedMigration(db),
+    journalMode: normalizedJournalMode(db),
+    schemaFingerprintSha256: schemaFingerprintSha256(db),
+    scenarioFactsSha256: scenarioFactsSha256(db, scenario),
+  };
+}
+
+function emptyDatabaseProof(origin) {
+  return {
+    origin,
+    quickCheck: "unavailable",
+    migration: [],
+    journalMode: "unavailable",
+    schemaFingerprintSha256: null,
+    scenarioFactsSha256: null,
+  };
+}
+
+function emptyDestinationReadbackReport() {
+  return {
+    schemaVersion: 1,
+    reportType: "destination-database-readback",
+    platform: "ios",
+    scenario: null,
+    canonicalizationVersion: DESTINATION_READBACK_CANONICALIZATION_VERSION,
+    checkedOutSha: null,
+    expectedSha: null,
+    source: emptyDatabaseProof("prepared-host-source"),
+    destination: {
+      origin: "device-readback",
+      checkpoint: { busy: null, logFrames: null, checkpointedFrames: null },
+      quickCheck: "unavailable",
+      migration: [],
+      journalMode: "unavailable",
+      schemaFingerprintSha256: null,
+      scenarioFactsSha256: null,
+    },
+    comparison: Object.fromEntries(DESTINATION_READBACK_COMPARISON_KEYS.map((key) => [key, false])),
+    status: "fail",
+  };
+}
+
+function rawUniqueOption(name) {
+  const indexes = process.argv.flatMap((value, index) => value === name ? [index] : []);
+  if (indexes.length !== 1) return undefined;
+  const value = process.argv[indexes[0] + 1];
+  return typeof value === "string" && !value.startsWith("--") ? value : undefined;
+}
+
+function exactDestinationReadbackOptions() {
+  const allowed = new Set([
+    "--action",
+    "--platform",
+    "--scenario",
+    "--expected-sha",
+    "--source",
+    "--destination",
+    "--destination-checkpoint-status",
+    "--destination-checkpoint",
+    "--output",
+  ]);
+  const args = process.argv.slice(2);
+  assert.equal(args.length % 2, 0);
+  const parsed = new Map();
+  for (let index = 0; index < args.length; index += 2) {
+    const name = args[index];
+    const value = args[index + 1];
+    assert(allowed.has(name));
+    assert(!parsed.has(name));
+    assert(typeof value === "string" && !value.startsWith("--"));
+    parsed.set(name, value);
+  }
+  assert.deepEqual([...parsed.keys()].sort(), [...allowed].sort());
+  return Object.fromEntries(parsed);
+}
+
+function parseDestinationCheckpointStatus(value) {
+  assert.match(value, /^(0|[1-9]\d{0,2})$/);
+  const status = Number(value);
+  assert(Number.isSafeInteger(status) && status <= 255);
+  return status;
+}
+
+function parseDestinationCheckpoint(value) {
+  const match = /^(0|[1-9]\d*)\|(0|[1-9]\d*)\|(0|[1-9]\d*)$/.exec(value);
+  assert(match);
+  const checkpoint = {
+    busy: Number(match[1]),
+    logFrames: Number(match[2]),
+    checkpointedFrames: Number(match[3]),
+  };
+  assert(Object.values(checkpoint).every(Number.isSafeInteger));
+  return checkpoint;
+}
+
+function assertDistinctRegularDatabases(source, destination) {
+  assert.notEqual(resolve(source), resolve(destination));
+  assert(lstatSync(source).isFile() && lstatSync(destination).isFile());
+  const sourceStat = statSync(source);
+  const destinationStat = statSync(destination);
+  assert(sourceStat.isFile() && destinationStat.isFile());
+  assert(sourceStat.dev !== destinationStat.dev || sourceStat.ino !== destinationStat.ino);
+}
+
+function currentCheckedOutSha() {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" });
+  const sha = result.status === 0 ? result.stdout.trim() : "";
+  assert.match(sha, /^[0-9a-f]{40}$/);
+  return sha;
+}
+
+function inspectDestinationReadbackDatabases(sourcePath, destinationPath, scenario) {
+  let sourceDb;
+  let destinationDb;
+  let source = emptyDatabaseProof("prepared-host-source");
+  let destination = emptyDatabaseProof("device-readback");
+  let closed = true;
+  try {
+    sourceDb = new DatabaseSync(sourcePath, { readOnly: true });
+    destinationDb = new DatabaseSync(destinationPath, { readOnly: true });
+    source = readOnlyDatabaseProof(sourceDb, scenario, "prepared-host-source");
+    destination = readOnlyDatabaseProof(destinationDb, scenario, "device-readback");
+  } finally {
+    for (const db of [destinationDb, sourceDb]) {
+      if (db === undefined) continue;
+      try { db.close(); } catch { closed = false; }
+    }
+  }
+  return { source, destination, closed };
+}
+
+function exactKeys(value, keys) {
+  assert(value !== null && typeof value === "object" && !Array.isArray(value));
+  assert.deepEqual(Object.keys(value).sort(), [...keys].sort());
+}
+
+function validateDestinationReadbackReport(report) {
+  exactKeys(report, [
+    "schemaVersion", "reportType", "platform", "scenario", "canonicalizationVersion",
+    "checkedOutSha", "expectedSha", "source", "destination", "comparison", "status",
+  ]);
+  assert.equal(report.schemaVersion, 1);
+  assert.equal(report.reportType, "destination-database-readback");
+  assert.equal(report.platform, "ios");
+  assert(report.scenario === null || DESTINATION_READBACK_SCENARIOS.has(report.scenario));
+  assert.equal(report.canonicalizationVersion, DESTINATION_READBACK_CANONICALIZATION_VERSION);
+  for (const sha of [report.checkedOutSha, report.expectedSha]) assert(sha === null || /^[0-9a-f]{40}$/.test(sha));
+  for (const [proof, origin] of [[report.source, "prepared-host-source"], [report.destination, "device-readback"]]) {
+    const keys = ["origin", "quickCheck", "migration", "journalMode", "schemaFingerprintSha256", "scenarioFactsSha256"];
+    if (origin === "device-readback") keys.push("checkpoint");
+    exactKeys(proof, keys);
+    assert.equal(proof.origin, origin);
+    assert(["ok", "failed", "unavailable"].includes(proof.quickCheck));
+    assert(Array.isArray(proof.migration));
+    for (const migration of proof.migration) {
+      exactKeys(migration, ["version", "name", "sha256"]);
+      assert(Number.isSafeInteger(migration.version));
+      assert.match(migration.name, /^[a-z0-9-]{1,64}$/);
+      assert.match(migration.sha256, /^[0-9a-f]{64}$/);
+    }
+    assert(["delete", "truncate", "persist", "memory", "wal", "off", "unavailable"].includes(proof.journalMode));
+    for (const hash of [proof.schemaFingerprintSha256, proof.scenarioFactsSha256]) assert(hash === null || /^[0-9a-f]{64}$/.test(hash));
+  }
+  exactKeys(report.destination.checkpoint, ["busy", "logFrames", "checkpointedFrames"]);
+  for (const value of Object.values(report.destination.checkpoint)) assert(value === null || (Number.isSafeInteger(value) && value >= 0));
+  exactKeys(report.comparison, DESTINATION_READBACK_COMPARISON_KEYS);
+  assert(Object.values(report.comparison).every((value) => typeof value === "boolean"));
+  assert(["pass", "fail"].includes(report.status));
+  if (report.status === "pass") {
+    assert(Object.values(report.comparison).every(Boolean));
+    assert.match(report.checkedOutSha, /^[0-9a-f]{40}$/);
+    assert.equal(report.checkedOutSha, report.expectedSha);
+  }
+}
+
+function destinationReadback() {
+  const output = rawUniqueOption("--output");
+  let report = emptyDestinationReadbackReport();
+  let checkpointFailureStatus = null;
+  const rawScenario = rawUniqueOption("--scenario");
+  const rawExpectedSha = rawUniqueOption("--expected-sha");
+  const rawCheckpointStatus = rawUniqueOption("--destination-checkpoint-status");
+  const rawCheckpoint = rawUniqueOption("--destination-checkpoint");
+  if (DESTINATION_READBACK_SCENARIOS.has(rawScenario)) report.scenario = rawScenario;
+  if (/^[0-9a-f]{40}$/.test(rawExpectedSha ?? "")) report.expectedSha = rawExpectedSha;
+  try { report.checkedOutSha = currentCheckedOutSha(); } catch { /* retained as null */ }
+  try {
+    const status = parseDestinationCheckpointStatus(rawCheckpointStatus);
+    if (status === 0) report.destination.checkpoint = parseDestinationCheckpoint(rawCheckpoint);
+    else checkpointFailureStatus = status;
+  } catch { /* retained as unavailable */ }
+  try {
+    const options = exactDestinationReadbackOptions();
+    assert.equal(options["--action"], "destination-readback");
+    assert.equal(options["--platform"], "ios");
+    assert(DESTINATION_READBACK_SCENARIOS.has(options["--scenario"]));
+    assert.match(options["--expected-sha"], /^[0-9a-f]{40}$/);
+    report.scenario = options["--scenario"];
+    report.expectedSha = options["--expected-sha"];
+    const checkpointStatus = parseDestinationCheckpointStatus(options["--destination-checkpoint-status"]);
+    if (checkpointStatus !== 0) {
+      checkpointFailureStatus = checkpointStatus;
+      assert.equal(options["--destination-checkpoint"], "");
+      throw new Error("Destination checkpoint failed");
+    }
+    report.destination.checkpoint = parseDestinationCheckpoint(options["--destination-checkpoint"]);
+    assertDistinctRegularDatabases(options["--source"], options["--destination"]);
+    const inspected = inspectDestinationReadbackDatabases(options["--source"], options["--destination"], report.scenario);
+    report.source = inspected.source;
+    report.destination = { ...inspected.destination, checkpoint: report.destination.checkpoint };
+    const frozenMigration = [{ version: 1, name: "initial-schema", sha256: frozenMigrationSha() }];
+    const expectedFactsSha256 = canonicalSha256({ scenario: report.scenario, facts: EXPECTED_PERSISTENCE_SCENARIO_FACTS });
+    report.comparison = {
+      checkedOutShaMatchesExpected: report.checkedOutSha === report.expectedSha,
+      destinationCheckpointComplete: report.destination.checkpoint.busy === 0
+        && report.destination.checkpoint.logFrames === report.destination.checkpoint.checkpointedFrames,
+      destinationJournalModeIsWal: report.destination.journalMode === "wal",
+      destinationMigrationIdentityMatchesFrozen: canonicalJson(report.destination.migration) === canonicalJson(frozenMigration),
+      destinationQuickCheckOk: report.destination.quickCheck === "ok",
+      destinationScenarioFactsMatchExpected: report.destination.scenarioFactsSha256 === expectedFactsSha256,
+      destinationSchemaFingerprintMatchesFrozen: report.destination.schemaFingerprintSha256 === DESTINATION_READBACK_SCHEMA_SHA256,
+      journalModeEqual: report.source.journalMode === report.destination.journalMode,
+      migrationIdentityEqual: canonicalJson(report.source.migration) === canonicalJson(report.destination.migration),
+      scenarioFactsEqual: report.source.scenarioFactsSha256 !== null
+        && report.source.scenarioFactsSha256 === report.destination.scenarioFactsSha256,
+      schemaFingerprintEqual: report.source.schemaFingerprintSha256 !== null
+        && report.source.schemaFingerprintSha256 === report.destination.schemaFingerprintSha256,
+      sourceJournalModeIsWal: report.source.journalMode === "wal",
+      sourceMigrationIdentityMatchesFrozen: canonicalJson(report.source.migration) === canonicalJson(frozenMigration),
+      sourceQuickCheckOk: report.source.quickCheck === "ok",
+      sourceScenarioFactsMatchExpected: report.source.scenarioFactsSha256 === expectedFactsSha256,
+      sourceSchemaFingerprintMatchesFrozen: report.source.schemaFingerprintSha256 === DESTINATION_READBACK_SCHEMA_SHA256,
+    };
+    if (inspected.closed && Object.values(report.comparison).every(Boolean)) report.status = "pass";
+  } catch {
+    report.status = "fail";
+  }
+  try {
+    validateDestinationReadbackReport(report);
+  } catch {
+    report = emptyDestinationReadbackReport();
+  }
+  if (output !== undefined) {
+    try { writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`); } catch { process.exitCode = 1; return; }
+  }
+  process.exitCode = report.status === "pass" ? 0 : checkpointFailureStatus ?? 1;
 }
 
 function exactMigrationIdentity() {
@@ -351,18 +707,22 @@ function report() {
 }
 
 const action = option("--action");
-const path = option("--database", false);
-switch (action) {
-  case "seed-recovery": seedRecovery(path); break;
-  case "corrupt-hash": setMigrationSha(path, "0".repeat(64)); break;
-  case "repair-hash": setMigrationSha(path, frozenMigrationSha()); break;
-  case "create-poison": createPoison(path); break;
-  case "snapshot": writeFileSync(option("--output"), `${JSON.stringify(snapshot(path), null, 2)}\n`); break;
-  case "poison-snapshot": writeFileSync(option("--output"), `${JSON.stringify(poisonSnapshot(path), null, 2)}\n`); break;
-  case "profile-snapshot": writeFileSync(option("--output"), `${JSON.stringify(profileSnapshot(path), null, 2)}\n`); break;
-  case "age-oracle": writeFileSync(option("--output"), `${JSON.stringify(ageOracle(option("--local-date")), null, 2)}\n`); break;
-  case "privacy-scan": writeFileSync(option("--output"), `${JSON.stringify(profilePrivacyProof(), null, 2)}\n`); break;
-  case "profile-report": writeFileSync(option("--output"), `${JSON.stringify(validateProfileReport(JSON.parse(readFileSync(option("--input"), "utf8"))), null, 2)}\n`); break;
-  case "report": writeFileSync(option("--output"), `${JSON.stringify(report(), null, 2)}\n`); break;
-  default: throw new Error(`Unknown action: ${action}`);
+if (action === "destination-readback") {
+  destinationReadback();
+} else {
+  const path = option("--database", false);
+  switch (action) {
+    case "seed-recovery": seedRecovery(path); break;
+    case "corrupt-hash": setMigrationSha(path, "0".repeat(64)); break;
+    case "repair-hash": setMigrationSha(path, frozenMigrationSha()); break;
+    case "create-poison": createPoison(path); break;
+    case "snapshot": writeFileSync(option("--output"), `${JSON.stringify(snapshot(path), null, 2)}\n`); break;
+    case "poison-snapshot": writeFileSync(option("--output"), `${JSON.stringify(poisonSnapshot(path), null, 2)}\n`); break;
+    case "profile-snapshot": writeFileSync(option("--output"), `${JSON.stringify(profileSnapshot(path), null, 2)}\n`); break;
+    case "age-oracle": writeFileSync(option("--output"), `${JSON.stringify(ageOracle(option("--local-date")), null, 2)}\n`); break;
+    case "privacy-scan": writeFileSync(option("--output"), `${JSON.stringify(profilePrivacyProof(), null, 2)}\n`); break;
+    case "profile-report": writeFileSync(option("--output"), `${JSON.stringify(validateProfileReport(JSON.parse(readFileSync(option("--input"), "utf8"))), null, 2)}\n`); break;
+    case "report": writeFileSync(option("--output"), `${JSON.stringify(report(), null, 2)}\n`); break;
+    default: throw new Error(`Unknown action: ${action}`);
+  }
 }

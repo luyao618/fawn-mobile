@@ -2717,8 +2717,23 @@ const exactIosPersistenceStopHelper = 'stop() { xcrun simctl terminate "$udid" "
 const exactIosPersistencePushHelper = `push_db() {
   test ! -s "$local_db-wal"
   sqlite3 "$device_db" ".restore '$local_db'"
-  sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);"
+  destination_checkpoint=
+  destination_checkpoint_status=0
+  destination_checkpoint=$(sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);") || destination_checkpoint_status=$?
+  if [ "$destination_checkpoint_status" -ne 0 ]; then
+    [ "\${1-}" = destination-readback ] || return "$destination_checkpoint_status"
+  fi
 }`;
+const exactIosDestinationReadbackCommands = {
+  migrationHashRetry: 'NODE_NO_WARNINGS=1 node tools/persistence-evidence.mjs --action destination-readback --platform ios --scenario migrationHashRetry --expected-sha "$expected_sha" --source "$local_db" --destination "$device_db" --destination-checkpoint-status "$destination_checkpoint_status" --destination-checkpoint "$destination_checkpoint" --output "$diagnostics/migrationHashRetry.json"',
+  failedMigrationRollback: 'NODE_NO_WARNINGS=1 node tools/persistence-evidence.mjs --action destination-readback --platform ios --scenario failedMigrationRollback --expected-sha "$expected_sha" --source "$local_db" --destination "$device_db" --destination-checkpoint-status "$destination_checkpoint_status" --destination-checkpoint "$destination_checkpoint" --output "$diagnostics/failedMigrationRollback.json"',
+} as const;
+const exactIosCopyCommandLines = [
+  'cp "$device_db" "$local_db"; test -s "$local_db"',
+  'for suffix in -wal -shm; do [ ! -f "$device_db$suffix" ] || cp "$device_db$suffix" "$local_db$suffix"; done',
+  'cp "$local_db" "$artifacts/canonical.db"',
+  'cp "$artifacts/canonical.db" "$local_db"',
+];
 
 function assertIosPersistenceTerminatePolicy(wrapper: string): string {
   const terminateLines = wrapper
@@ -2743,6 +2758,50 @@ function assertIosPersistencePushPolicy(wrapper: string): void {
   );
 }
 
+function assertIosDestinationReadbackPolicy(wrapper: string): void {
+  assert.equal(
+    wrapper.split("\n").filter((line) => line.includes("--action destination-readback")).length,
+    2,
+    "iOS persistence must contain exactly two destination readback actions",
+  );
+  assert.equal(
+    wrapper.split("\n").filter((line) => line.includes("wal_checkpoint")).length,
+    1,
+    "iOS persistence must reuse exactly the existing live destination checkpoint",
+  );
+  assert.equal(
+    wrapper.split("\n").filter((line) => /(?:^|;\s*)retry(?:;|$)/.test(line)).length,
+    2,
+    "iOS persistence must preserve exactly two retry call sites",
+  );
+  assert.match(wrapper, /^diagnostics=\.artifacts\/launch\/persistence\/ios$/m);
+  assert.match(wrapper, /^mkdir -p "\$artifacts" "\$diagnostics"$/m);
+  assert.ok(wrapper.includes(`node tools/persistence-evidence.mjs --action repair-hash --database "$local_db"
+push_db destination-readback
+${exactIosDestinationReadbackCommands.migrationHashRetry}
+retry; stop; pull_db`), "migration hash proof must run immediately after repaired push and before retry");
+  assert.ok(wrapper.includes(`cp "$artifacts/canonical.db" "$local_db"
+push_db destination-readback
+${exactIosDestinationReadbackCommands.failedMigrationRollback}
+retry; stop`), "rollback proof must run immediately after canonical push and before retry");
+  for (const command of Object.values(exactIosDestinationReadbackCommands)) {
+    assert.match(command, /^NODE_NO_WARNINGS=1 node /);
+    assert.match(command, /--source "\$local_db" --destination "\$device_db"/);
+    assert.match(command, /--destination-checkpoint-status "\$destination_checkpoint_status"/);
+    assert.match(command, /--destination-checkpoint "\$destination_checkpoint"/);
+    assert.match(command, /--output "\$diagnostics\/[A-Za-z]+\.json"$/);
+  }
+  const copyCommandLines = wrapper
+    .split(/\r\n|\n|\r/)
+    .map((line) => line.trim())
+    .filter((line) => /\bcp\b/.test(line));
+  assert.deepEqual(
+    copyCommandLines,
+    exactIosCopyCommandLines,
+    "iOS persistence cp commands must remain exactly allowlisted so raw bytes cannot reach the always-uploaded .artifacts/launch tree",
+  );
+}
+
 function assertPersistenceWrapper(wrapper: string, platform: "android" | "ios") {
   assert.match(wrapper, /set -euo pipefail/);
   assert.match(wrapper, /-wal/);
@@ -2752,13 +2811,20 @@ function assertPersistenceWrapper(wrapper: string, platform: "android" | "ios") 
   if (platform === "ios") {
     assertIosPersistenceTerminatePolicy(wrapper);
     assertIosPersistencePushPolicy(wrapper);
+    assertIosDestinationReadbackPolicy(wrapper);
   }
+  const migrationRetry = platform === "ios"
+    ? `push_db destination-readback\n${exactIosDestinationReadbackCommands.migrationHashRetry}\nretry; stop; pull_db`
+    : "push_db; retry; stop; pull_db";
+  const rollbackRetry = platform === "ios"
+    ? `push_db destination-readback\n${exactIosDestinationReadbackCommands.failedMigrationRollback}\nretry; stop`
+    : "push_db; retry; stop";
   ordered(
     wrapper,
     'node tools/persistence-evidence.mjs --action corrupt-hash --database "$local_db"',
     "push_db; launch; error_screen",
     'node tools/persistence-evidence.mjs --action repair-hash --database "$local_db"',
-    "push_db; retry; stop; pull_db",
+    migrationRetry,
     'node tools/persistence-evidence.mjs --action snapshot --database "$local_db" --output "$artifacts/retried.json"',
     'cp "$local_db" "$artifacts/canonical.db"',
     'rm -f "$local_db"',
@@ -2767,7 +2833,7 @@ function assertPersistenceWrapper(wrapper: string, platform: "android" | "ios") 
     "push_db; launch; error_screen; pull_db",
     'node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison-after.json"',
     'cp "$artifacts/canonical.db" "$local_db"',
-    "push_db; retry; stop",
+    rollbackRetry,
     `node tools/persistence-evidence.mjs --action report --platform ${platform}`,
     '--poison-before "$artifacts/poison-before.json" --poison-after "$artifacts/poison-after.json"',
     'rm -f "$artifacts"/*.db "$artifacts"/*.db-wal "$artifacts"/*.db-shm',
@@ -2856,8 +2922,9 @@ test("iOS persistence replacement uses SQLite restore and rejects live sidecar d
   assertIosPersistencePushPolicy(wrapper);
   for (const [label, mutation] of [
     ["raw overwrite", wrapper.replace(exactIosPersistencePushHelper, 'push_db() { cp "$local_db" "$device_db"; }')],
-    ["sidecar deletion", wrapper.replace("  sqlite3 \"$device_db\" \"PRAGMA wal_checkpoint(TRUNCATE);\"", '  rm -f "$device_db-wal" "$device_db-shm"')],
-    ["missing checkpoint", wrapper.replace('  sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);"\n', "")],
+    ["sidecar deletion", wrapper.replace('  destination_checkpoint=$(sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);") || destination_checkpoint_status=$?', '  rm -f "$device_db-wal" "$device_db-shm"')],
+    ["missing checkpoint", wrapper.replace('  destination_checkpoint=$(sqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);") || destination_checkpoint_status=$?\n', "")],
+    ["swallowed checkpoint failure", wrapper.replace('    [ "${1-}" = destination-readback ] || return "$destination_checkpoint_status"', "    true")],
   ] as const) {
     assert.notEqual(mutation, wrapper, `${label} fixture must change the iOS persistence wrapper`);
     assert.throws(
@@ -2872,14 +2939,21 @@ directory=$(mktemp -d)
 trap 'rm -rf "$directory"' EXIT
 local_db="$directory/local.db"
 device_db="$directory/device.db"
+sqlite_log="$directory/sqlite.log"
 : > "$local_db"
-sqlite3() { printf '<%s>\\n' "$@"; }
+sqlite3() {
+  printf '<%s>\\n' "$@" >> "$sqlite_log"
+  [ "$2" != "PRAGMA wal_checkpoint(TRUNCATE);" ] || printf '0|0|0\\n'
+}
 ${exactIosPersistencePushHelper}
 push_db
+cat "$sqlite_log"
+printf '<checkpoint=%s>\\n' "$destination_checkpoint"
+printf '<checkpoint-status=%s>\\n' "$destination_checkpoint_status"
 `], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   const calls = result.stdout.trimEnd().split("\n");
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 6);
   assert.match(calls[0]!, /^<.*\/device\.db>$/);
   const devicePath = calls[0]!.slice(1, -1);
   assert.deepEqual(calls, [
@@ -2887,7 +2961,151 @@ push_db
     `<.restore '${devicePath.replace("device.db", "local.db")}'>`,
     `<${devicePath}>`,
     "<PRAGMA wal_checkpoint(TRUNCATE);>",
+    "<checkpoint=0|0|0>",
+    "<checkpoint-status=0>",
   ]);
+
+  for (const [label, mode, expectedStatus] of [
+    ["ordinary checkpoint failure", "", 73],
+    ["deferred checkpoint failure", "destination-readback", 0],
+  ] as const) {
+    const failedCheckpoint = spawnSync("bash", ["-c", `set -euo pipefail
+directory=$(mktemp -d)
+trap 'rm -rf "$directory"' EXIT
+local_db="$directory/local.db"
+device_db="$directory/device.db"
+: > "$local_db"
+sqlite3() {
+  if [ "$2" = "PRAGMA wal_checkpoint(TRUNCATE);" ]; then
+    printf 'checkpoint-failed\\n' >&2
+    return 73
+  fi
+}
+${exactIosPersistencePushHelper}
+push_db ${mode}
+printf '<checkpoint=%s>\\n' "$destination_checkpoint"
+printf '<checkpoint-status=%s>\\n' "$destination_checkpoint_status"
+`], { encoding: "utf8" });
+    assert.equal(failedCheckpoint.status, expectedStatus, label);
+    assert.equal(failedCheckpoint.stderr, "checkpoint-failed\n", label);
+    assert.equal(
+      failedCheckpoint.stdout,
+      mode === "" ? "" : "<checkpoint=>\n<checkpoint-status=73>\n",
+      label,
+    );
+  }
+
+  const failedRestore = spawnSync("bash", ["-c", `set -euo pipefail
+directory=$(mktemp -d)
+trap 'rm -rf "$directory"' EXIT
+local_db="$directory/local.db"
+device_db="$directory/device.db"
+: > "$local_db"
+sqlite3() {
+  printf 'restore-failed\\n' >&2
+  return 71
+}
+${exactIosPersistencePushHelper}
+push_db destination-readback
+printf 'checkpoint-or-proof-ran\\n'
+`], { encoding: "utf8" });
+  assert.equal(failedRestore.status, 71, "restore failure must remain fail closed");
+  assert.equal(failedRestore.stdout, "", "restore failure must not reach checkpoint or proof");
+  assert.equal(failedRestore.stderr, "restore-failed\n");
+});
+
+test("iOS destination readback rejects substitution, reordering, and observer-effect additions", async () => {
+  const wrapper = await readFile("scripts/e2e/run-persistence-ios.sh", "utf8");
+  assertIosDestinationReadbackPolicy(wrapper);
+  const firstProof = exactIosDestinationReadbackCommands.migrationHashRetry;
+  const firstBoundary = `push_db destination-readback\n${firstProof}\nretry; stop; pull_db`;
+  const hostileMutations = [
+    ["wrong source", wrapper.replace('--source "$local_db" --destination "$device_db"', '--source "$device_db" --destination "$device_db"')],
+    ["wrong destination", wrapper.replace('--source "$local_db" --destination "$device_db"', '--source "$local_db" --destination "$local_db"')],
+    ["warning suppression removed", wrapper.replace("NODE_NO_WARNINGS=1 node tools/persistence-evidence.mjs --action destination-readback", "node tools/persistence-evidence.mjs --action destination-readback")],
+    ["checkpoint status removed", wrapper.replace('--destination-checkpoint-status "$destination_checkpoint_status" ', "")],
+    ["missing proof", wrapper.replace(`${firstProof}\n`, "")],
+    ["proof after retry", wrapper.replace(firstBoundary, `push_db destination-readback\nretry; stop; pull_db\n${firstProof}`)],
+    ["extra checkpoint", wrapper.replace(firstBoundary, `push_db destination-readback\nsqlite3 "$device_db" "PRAGMA wal_checkpoint(TRUNCATE);"\n${firstProof}\nretry; stop; pull_db`)],
+    ["extra copy", wrapper.replace(firstBoundary, `push_db destination-readback\ncp "$device_db" "$diagnostics/readback.db"\n${firstProof}\nretry; stop; pull_db`)],
+    ["sleep", wrapper.replace(firstBoundary, `push_db destination-readback\nsleep 1\n${firstProof}\nretry; stop; pull_db`)],
+    ["loop", wrapper.replace(firstBoundary, `push_db destination-readback\nfor attempt in 1; do :; done\n${firstProof}\nretry; stop; pull_db`)],
+    ["log delay", wrapper.replace(firstBoundary, `push_db destination-readback\nprintf 'probe\\n'\n${firstProof}\nretry; stop; pull_db`)],
+    ["extra retry", wrapper.replace(firstBoundary, `${firstBoundary}\nretry`)],
+    ["raw launch upload", wrapper.replace(firstBoundary, `${firstBoundary}\ncp "$device_db" "$diagnostics/raw.db"`)],
+    ["renamed raw launch upload", wrapper.replace(firstBoundary, `${firstBoundary}\ncp "$device_db" "$diagnostics/readback.bin"`)],
+    ["raw launch root upload", `${wrapper}\ncp "$device_db" ".artifacts/launch/readback.bin"\n`],
+    ["WAL launch sibling upload", `${wrapper}\ncp "$device_db-wal" ".artifacts/launch/maestro/readback.txt"\n`],
+    ["SHM launch variable upload", `${wrapper}\nlaunch_dump=.artifacts/launch/simulator\ncp "$device_db-shm" "$launch_dump/readback.json"\n`],
+    ["canonical renamed launch upload", `${wrapper}\ncp "$artifacts/canonical.db" ".artifacts/launch/persistence/renamed.txt"\n`],
+    ["two-step renamed launch upload", `${wrapper}\ncp "$device_db" "$artifacts/readback.bin"\ncp "$artifacts/readback.bin" ".artifacts/launch/readback.txt"\n`],
+    ["aliased raw source launch upload", `${wrapper}\nraw_source=$device_db\ncp "$raw_source" ".artifacts/launch/readback.bin"\n`],
+    ["aliased raw destination launch upload", `${wrapper}\nraw_dest=.artifacts/launch/readback.bin\ncp "$device_db" "$raw_dest"\n`],
+    ["both aliased raw launch upload", `${wrapper}\nraw_source=$device_db\nraw_dest=.artifacts/launch/readback.bin\ncp "$raw_source" "$raw_dest"\n`],
+    ["continued both aliased raw launch upload", `${wrapper}\nraw_source=$device_db\nraw_dest=.artifacts/launch/readback.bin\ncp \\\n  "$raw_source" \\\n  "$raw_dest"\n`],
+  ] as const;
+  for (const [label, mutation] of hostileMutations) {
+    assert.notEqual(mutation, wrapper, `${label} fixture must change the iOS persistence wrapper`);
+    assert.throws(() => assertIosDestinationReadbackPolicy(mutation), label);
+  }
+});
+
+test("iOS checkpoint failure hands status and empty tuple to silent proof before exiting", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ios-checkpoint-failure-handoff-"));
+  try {
+    const diagnostics = join(directory, "launch");
+    await mkdir(diagnostics, { recursive: true });
+    const result = spawnSync("bash", ["-c", `set -euo pipefail
+local_db="$TEST_DIRECTORY/local.db"
+device_db="$TEST_DIRECTORY/device.db"
+diagnostics="$TEST_DIRECTORY/launch"
+expected_sha=${"a".repeat(40)}
+: > "$local_db"
+: > "$device_db"
+sqlite3() {
+  if [ "$2" = "PRAGMA wal_checkpoint(TRUNCATE);" ]; then
+    printf 'checkpoint-failed\\n' >&2
+    return 73
+  fi
+}
+node() {
+  [ "\${NODE_NO_WARNINGS-}" = 1 ]
+  local checkpoint_status= checkpoint_tuple= output=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --destination-checkpoint-status) checkpoint_status=$2; shift 2 ;;
+      --destination-checkpoint) checkpoint_tuple=$2; shift 2 ;;
+      --output) output=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ "$checkpoint_status" = "$destination_checkpoint_status" ]
+  [ "$checkpoint_status" = 73 ]
+  [ -z "$checkpoint_tuple" ]
+  printf '{"schemaVersion":1,"reportType":"destination-database-readback","scenario":"migrationHashRetry","status":"fail"}\\n' > "$output"
+  return "$checkpoint_status"
+}
+retry() { printf 'retry-ran\\n'; }
+${exactIosPersistencePushHelper}
+push_db destination-readback
+${exactIosDestinationReadbackCommands.migrationHashRetry}
+retry
+`], {
+      encoding: "utf8",
+      env: { ...process.env, TEST_DIRECTORY: directory },
+    });
+    assert.equal(result.status, 73, "checkpoint status must remain the wrapper exit status");
+    assert.equal(result.stdout, "", "retry must not run after checkpoint failure proof");
+    assert.equal(result.stderr, "checkpoint-failed\n", "checkpoint failure must not be hidden");
+    assert.deepEqual(JSON.parse(await readFile(join(diagnostics, "migrationHashRetry.json"), "utf8")), {
+      schemaVersion: 1,
+      reportType: "destination-database-readback",
+      scenario: "migrationHashRetry",
+      status: "fail",
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only uploads", async () => {
@@ -2914,8 +3132,12 @@ test("persistence wrappers lock WAL-safe retry and rollback order with JSON-only
   for (const [platform, wrapper] of [["android", android], ["ios", ios]] as const) {
     assertPersistenceWrapper(wrapper, platform);
     const mutations = [
-      wrapper.replace("push_db; retry; stop; pull_db", "push_db; launch; ready; stop; pull_db"),
-      wrapper.replace("push_db; retry; stop", "push_db; launch; ready; stop"),
+      platform === "ios"
+        ? wrapper.replace(`retry; stop; pull_db`, "launch; ready; stop; pull_db")
+        : wrapper.replace("push_db; retry; stop; pull_db", "push_db; launch; ready; stop; pull_db"),
+      platform === "ios"
+        ? wrapper.replace(`retry; stop\nnode tools/persistence-evidence.mjs --action report`, "launch; ready; stop\nnode tools/persistence-evidence.mjs --action report")
+        : wrapper.replace("push_db; retry; stop", "push_db; launch; ready; stop"),
       wrapper.replace("push_db; launch; error_screen; pull_db", "push_db; launch; error_screen; stop; pull_db"),
       wrapper.replace('node tools/persistence-evidence.mjs --action poison-snapshot --database "$local_db" --output "$artifacts/poison-before.json"\n', ""),
       wrapper.replace('poison-after.json"', 'poison-before.json"'),
