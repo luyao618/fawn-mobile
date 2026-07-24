@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -52,6 +52,124 @@ const EXACT_G017_SOURCE_PATHS = [
   "dependencies.slice0.lock.json",
   "licenses.slice0.json",
 ] as const;
+
+const EXACT_AUDIT_SCOPES = [
+  ["sqlite-fts-production", "../spikes/sqlite-fts"],
+  ["backup-crypto-production", "../spikes/backup-crypto"],
+  ["model-transport-production", "../spikes/model-transport"],
+] as const;
+const EXACT_AUDIT_OPTIONS = ["audit", "--omit=dev", "--workspaces=false", "--json"] as const;
+const EXACT_AUDIT_SEVERITIES = ["info", "low", "moderate", "high", "critical"] as const;
+const EXACT_AUDIT_CONSTANT_SOURCE = `const AUDIT_SCOPES = Object.freeze([
+  Object.freeze(["sqlite-fts-production", "../spikes/sqlite-fts"]),
+  Object.freeze(["backup-crypto-production", "../spikes/backup-crypto"]),
+  Object.freeze(["model-transport-production", "../spikes/model-transport"]),
+]);
+const AUDIT_OPTIONS = Object.freeze(["audit", "--omit=dev", "--workspaces=false", "--json"]);
+const SEVERITIES = Object.freeze(["info", "low", "moderate", "high", "critical"]);`;
+const EXACT_AUDIT_SCRIPTS = {
+  "test:audit:slice0": "node tools/check-audit.mjs",
+  "test:audit:app": "node tools/check-app-audit.mjs",
+  "test:audit": "npm run test:audit:slice0 && npm run test:audit:app",
+} as const;
+const AUDIT_COUNTS_BY_DIRECTORY = {
+  "sqlite-fts": { info: 0, low: 1, moderate: 2, high: 0, critical: 0, total: 3 },
+  "backup-crypto": { info: 1, low: 0, moderate: 3, high: 0, critical: 0, total: 4 },
+  "model-transport": { info: 2, low: 1, moderate: 4, high: 0, critical: 0, total: 7 },
+} as const;
+
+type AuditCall = { cwd: string; argv: readonly string[] };
+
+function assertAuditSourceContract(source: string): void {
+  assert.equal(source.split(EXACT_AUDIT_CONSTANT_SOURCE).length - 1, 1, "Audit constants must remain exact and deeply frozen");
+  assert.equal((source.match(/for \(const \[scope, relativePath\] of AUDIT_SCOPES\)/g) ?? []).length, 1, "Audit scopes must drive exactly one loop");
+  assert.equal((source.match(/spawnSync\("npm", AUDIT_OPTIONS, \{/g) ?? []).length, 1, "Audit options must drive the npm invocation");
+  assert.equal((source.match(/cwd: new URL\(relativePath, import\.meta\.url\),/g) ?? []).length, 1, "Audit scope path must drive the npm cwd");
+}
+
+function assertAuditScriptContract(scripts: Record<string, string>): void {
+  assert.deepEqual({
+    "test:audit:slice0": scripts["test:audit:slice0"],
+    "test:audit:app": scripts["test:audit:app"],
+    "test:audit": scripts["test:audit"],
+  }, EXACT_AUDIT_SCRIPTS, "Audit scripts must run the exact slice0 then app chain");
+}
+
+function assertExactAuditCalls(actual: readonly AuditCall[], expected: readonly AuditCall[]): void {
+  assert.deepEqual(actual, expected, "Audit CLI must make exactly three ordered cwd/argv calls");
+}
+
+async function readAuditCalls(logPath: string): Promise<AuditCall[]> {
+  const source = await readFile(logPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  return source.trim() === ""
+    ? []
+    : source.trim().split("\n").map((line) => JSON.parse(line) as AuditCall);
+}
+
+async function runAuditCli(root: string, pathValue: string, name: string, mode: string, field = "") {
+  const logPath = join(root, `${name}.jsonl`);
+  const result = spawnSync(process.execPath, [resolve("tools/check-audit.mjs")], {
+    cwd: resolve("."),
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+    env: {
+      ...process.env,
+      PATH: pathValue,
+      FAKE_NPM_LOG: logPath,
+      FAKE_NPM_MODE: mode,
+      FAKE_NPM_FIELD: field,
+    },
+  });
+  return { result, calls: await readAuditCalls(logPath) };
+}
+
+async function createFakeNpm(root: string): Promise<string> {
+  const bin = join(root, "bin");
+  const executable = join(bin, "npm");
+  await mkdir(bin, { recursive: true });
+  await writeFile(executable, `#!${process.execPath}
+const { appendFileSync } = require("node:fs");
+const { basename } = require("node:path");
+
+appendFileSync(process.env.FAKE_NPM_LOG, JSON.stringify({
+  cwd: process.cwd(),
+  argv: process.argv.slice(2),
+}) + "\\n");
+
+const mode = process.env.FAKE_NPM_MODE;
+const counts = { ...${JSON.stringify(AUDIT_COUNTS_BY_DIRECTORY)}[basename(process.cwd())] };
+if (mode === "signal") {
+  process.kill(process.pid, "SIGTERM");
+} else if (mode === "status") {
+  process.exitCode = 2;
+} else if (mode === "blank") {
+  process.stdout.write("   \\n");
+} else if (mode === "malformed") {
+  process.stdout.write("{");
+} else if (mode === "missing-counts") {
+  process.stdout.write(JSON.stringify({ metadata: {} }));
+} else {
+  if (mode === "missing-count") delete counts[process.env.FAKE_NPM_FIELD];
+  if (mode === "invalid-count") counts[process.env.FAKE_NPM_FIELD] = -1;
+  if (mode === "total-mismatch") counts.total += 1;
+  if (mode === "high") {
+    counts.high = 1;
+    counts.total += 1;
+  }
+  if (mode === "critical") {
+    counts.critical = 1;
+    counts.total += 1;
+  }
+  process.stdout.write(JSON.stringify({ metadata: { vulnerabilities: counts } }));
+  process.exitCode = 1;
+}
+`);
+  await chmod(executable, 0o755);
+  return bin;
+}
 
 function proofRecord(platform: "android" | "ios", fingerprint: string) {
   return `G017_TRANSPORT_PROOF ${JSON.stringify({
@@ -248,7 +366,127 @@ test("fresh canonical Android and iOS exports pass Hermes validation and local-c
   assert.equal(result.status, "PASS", result.failures.join("; "));
 });
 
-test("G017 source boundary remains exactly 34 unique existing spike-owned paths", async () => {
+test("audit CLI executes the exact production contract and fails closed", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "g017-audit-cli-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const fakeBin = await createFakeNpm(root);
+  const expectedCalls: AuditCall[] = [];
+  for (const [, relativePath] of EXACT_AUDIT_SCOPES) {
+    expectedCalls.push({
+      cwd: await realpath(resolve("tools", relativePath)),
+      argv: [...EXACT_AUDIT_OPTIONS],
+    });
+  }
+
+  const passing = await runAuditCli(root, fakeBin, "pass", "pass");
+  assert.equal(passing.result.error, undefined);
+  assert.equal(passing.result.signal, null);
+  assert.equal(passing.result.status, 0, passing.result.stderr);
+  assertExactAuditCalls(passing.calls, expectedCalls);
+  assert.deepEqual(JSON.parse(passing.result.stdout), {
+    audit: "pass",
+    scopes: [
+      { scope: "sqlite-fts-production", ...AUDIT_COUNTS_BY_DIRECTORY["sqlite-fts"] },
+      { scope: "backup-crypto-production", ...AUDIT_COUNTS_BY_DIRECTORY["backup-crypto"] },
+      { scope: "model-transport-production", ...AUDIT_COUNTS_BY_DIRECTORY["model-transport"] },
+    ],
+    moderate_policy: "documented inherited Expo chain; unsafe force-downgrade rejected",
+  });
+
+  const cloneCall = (call: AuditCall): AuditCall => ({ cwd: call.cwd, argv: [...call.argv] });
+  const hostileObservedCalls: [string, AuditCall[]][] = [
+    ["scope omission", expectedCalls.slice(0, 2).map(cloneCall)],
+    ["scope reorder", [expectedCalls[1], expectedCalls[0], expectedCalls[2]].map(cloneCall)],
+    ["path substitution", expectedCalls.map((call, index) => index === 1
+      ? { cwd: expectedCalls[0].cwd, argv: [...call.argv] }
+      : cloneCall(call))],
+    ["options mutation", expectedCalls.map((call, index) => index === 1
+      ? { cwd: call.cwd, argv: ["audit", "--include=dev", "--workspaces=false", "--json"] }
+      : cloneCall(call))],
+    ["conditional skip", [expectedCalls[0], expectedCalls[2]].map(cloneCall)],
+  ];
+  for (const [name, calls] of hostileObservedCalls) {
+    assert.throws(() => assertExactAuditCalls(calls, expectedCalls), /Audit CLI/, name);
+  }
+
+  const emptyBin = join(root, "empty-bin");
+  await mkdir(emptyBin);
+  const startFailure = await runAuditCli(root, emptyBin, "start-failure", "pass");
+  assert.notEqual(startFailure.result.status, 0);
+  assert.match(startFailure.result.stderr, /npm audit could not start/);
+  assert.deepEqual(startFailure.calls, []);
+
+  const failureCases: [string, string, RegExp][] = [
+    ["signal", "signal", /npm audit was terminated by SIGTERM/],
+    ["unexpected-status", "status", /npm audit exited unexpectedly with 2/],
+    ["blank", "blank", /npm audit produced no JSON/],
+    ["malformed", "malformed", /SyntaxError/],
+    ["missing-counts", "missing-counts", /npm audit metadata is missing/],
+    ["total-mismatch", "total-mismatch", /total does not match severity counts/],
+    ["high", "high", /High vulnerabilities fail/],
+    ["critical", "critical", /Critical vulnerabilities fail/],
+  ];
+  for (const [name, mode, errorPattern] of failureCases) {
+    const failed = await runAuditCli(root, fakeBin, name, mode);
+    assert.notEqual(failed.result.status, 0, `${name} must fail closed`);
+    assert.match(failed.result.stderr, errorPattern, name);
+  }
+  for (const field of [...EXACT_AUDIT_SEVERITIES, "total"] as const) {
+    for (const mode of ["missing-count", "invalid-count"] as const) {
+      const failed = await runAuditCli(root, fakeBin, `${mode}-${field}`, mode, field);
+      assert.notEqual(failed.result.status, 0, `${mode} ${field} must fail closed`);
+      assert.match(failed.result.stderr, /count is missing or invalid/, `${mode} ${field}`);
+    }
+  }
+});
+
+test("package audit scripts preserve the exact slice0 then app chain", async () => {
+  const manifest = JSON.parse(await readFile(resolve("package.json"), "utf8")) as { scripts: Record<string, string> };
+  assert.doesNotThrow(() => assertAuditScriptContract(manifest.scripts));
+  const hostileScripts: [string, Record<string, string>][] = [
+    ["drop slice0", { ...manifest.scripts, "test:audit": "npm run test:audit:app" }],
+    ["drop app", { ...manifest.scripts, "test:audit": "npm run test:audit:slice0" }],
+    ["reorder", { ...manifest.scripts, "test:audit": "npm run test:audit:app && npm run test:audit:slice0" }],
+    ["replace slice0 leaf", { ...manifest.scripts, "test:audit:slice0": "node tools/check-app-audit.mjs" }],
+    ["replace app leaf", { ...manifest.scripts, "test:audit:app": "node tools/check-audit.mjs" }],
+    ["conditional bypass", { ...manifest.scripts, "test:audit": "npm run test:audit:slice0 || npm run test:audit:app" }],
+  ];
+  for (const [name, scripts] of hostileScripts) {
+    assert.throws(() => assertAuditScriptContract(scripts), /Audit scripts/, name);
+  }
+});
+
+test("G017 source boundary remains exact and rejects hostile audit-scope mutations", async () => {
+  const auditSource = await readFile(resolve("tools/check-audit.mjs"), "utf8");
+  assert.doesNotThrow(() => assertAuditSourceContract(auditSource));
+  const hostileAuditSources = [
+    ["scope omission", auditSource.replace('  Object.freeze(["backup-crypto-production", "../spikes/backup-crypto"]),\n', "")],
+    ["scope substitution", auditSource.replace('"../spikes/backup-crypto"', '"../spikes/sqlite-fts"')],
+    ["scope reorder", auditSource.replace(
+      '  Object.freeze(["sqlite-fts-production", "../spikes/sqlite-fts"]),\n  Object.freeze(["backup-crypto-production", "../spikes/backup-crypto"]),',
+      '  Object.freeze(["backup-crypto-production", "../spikes/backup-crypto"]),\n  Object.freeze(["sqlite-fts-production", "../spikes/sqlite-fts"]),',
+    )],
+    ["option substitution", auditSource.replace('"--omit=dev"', '"--include=dev"')],
+    ["invocation substitution", auditSource.replace('spawnSync("npm", AUDIT_OPTIONS, {', 'spawnSync("npm", ["audit", "--json"], {')],
+    ["mutable scope container", auditSource.replace("const AUDIT_SCOPES = Object.freeze([", "const AUDIT_SCOPES = [")],
+    ["mutable scope row", auditSource.replace(
+      'Object.freeze(["backup-crypto-production", "../spikes/backup-crypto"])',
+      '["backup-crypto-production", "../spikes/backup-crypto"]',
+    )],
+    ["mutable options", auditSource.replace(
+      'const AUDIT_OPTIONS = Object.freeze(["audit", "--omit=dev", "--workspaces=false", "--json"]);',
+      'const AUDIT_OPTIONS = ["audit", "--omit=dev", "--workspaces=false", "--json"];',
+    )],
+    ["mutable severities", auditSource.replace(
+      'const SEVERITIES = Object.freeze(["info", "low", "moderate", "high", "critical"]);',
+      'const SEVERITIES = ["info", "low", "moderate", "high", "critical"];',
+    )],
+  ] as const;
+  for (const [name, hostileSource] of hostileAuditSources) {
+    assert.notEqual(hostileSource, auditSource, `${name} fixture must mutate the audit source`);
+    assert.throws(() => assertAuditSourceContract(hostileSource), /audit/i, name);
+  }
+
   const excludedRootAppPaths = [
     ".gitignore",
     "package.json",
