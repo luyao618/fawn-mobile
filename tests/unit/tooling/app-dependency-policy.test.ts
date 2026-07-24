@@ -97,6 +97,21 @@ test("app dependency policy rejects approved inventory and integrity drift", asy
   assert.throws(() => validateAppDependencyPolicy(packageJson, packageLock, artifact, { ...inventory, development_dependencies: [...inventory.development_dependencies, { ...artifact.packages.find((item: { name: string }) => item.name === "typescript"), license: "Apache-2.0", maintenance_status: "active", purpose: "test", platform_support: "host", removal_path: "replace" }] }), /integrity/);
 });
 
+test("app dependency policy rejects artifact registry drift", async () => {
+  const [packageJson, packageLock, artifact, inventory] = await fixtures();
+  artifact.registry = "https://registry.example.test";
+  assert.throws(() => validateAppDependencyPolicy(packageJson, packageLock, artifact, inventory), /App dependency lock registry must exactly match/);
+});
+
+test("app dependency policy rejects direct resolved URL drift for scoped and unscoped packages", async () => {
+  const [packageJson, basePackageLock, artifact, inventory] = await fixtures();
+  for (const name of ["expo", "@types/react"]) {
+    const packageLock = clone(basePackageLock);
+    packageLock.packages[`node_modules/${name}`].resolved = `https://registry.example.test/${name}.tgz`;
+    assert.throws(() => validateAppDependencyPolicy(packageJson, packageLock, artifact, inventory), new RegExp(`${name} root lock registry resolution drifted`));
+  }
+});
+
 test("app dependency policy rejects exact approved license/SPDX mutations", async () => {
   const [packageJson, packageLock, artifact, baseInventory] = await fixtures();
   for (const [name, forged] of [["expo", "GPL-3.0-only"], ["typescript", "MIT"]] as const) {
