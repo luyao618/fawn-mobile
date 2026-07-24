@@ -23,6 +23,7 @@ import { sha256 } from "../../../src/infrastructure/db/migrations/sha256.ts";
 import {
   configureUserDatabase,
   initializeUserDatabase,
+  openConfiguredUserDatabase,
   USER_DATABASE_NAME,
   USER_DATABASE_OPEN_OPTIONS,
   type UserDatabaseConnection,
@@ -165,9 +166,12 @@ test("user.db initialization uses the approved open contract", async (context) =
   context.after(() => opened.closeAsync());
 
   assert.equal(openedName, USER_DATABASE_NAME);
-  assert.deepEqual(openedOptions, USER_DATABASE_OPEN_OPTIONS);
-  assert.equal(USER_DATABASE_OPEN_OPTIONS.enableChangeListener, true);
-  assert.equal(USER_DATABASE_OPEN_OPTIONS.finalizeUnusedStatementsBeforeClosing, false);
+  assert.equal(openedOptions, USER_DATABASE_OPEN_OPTIONS);
+  assert.deepEqual(USER_DATABASE_OPEN_OPTIONS, {
+    enableChangeListener: true,
+    finalizeUnusedStatementsBeforeClosing: false,
+    useNewConnection: true,
+  });
 });
 
 test("initialization preserves pragma failure and secondary close failure", async () => {
@@ -523,19 +527,51 @@ test("generating turn with an assistant fails closed and rolls back prior lease 
   assert.deepEqual((await database.getAllAsync<Record<string, unknown>>("SELECT status, lease_owner FROM local_jobs WHERE id = 'j'")).map((row) => ({ ...row })), [{ status: "leased", lease_owner: "old" }]);
 });
 
-test("startup failure closes before a later retry can reopen", async () => {
-  const closeCalls: number[] = [];
+test("bootstrap retry bypasses cached connections after failed-attempt close completes", async () => {
+  type CacheShapedConnection = UserDatabaseConnection & { readonly id: number };
+  const events: string[] = [];
+  const attemptConnections: CacheShapedConnection[] = [];
+  let cachedConnection: CacheShapedConnection | undefined;
+  let connectionSequence = 0;
+  const openDatabase = async (_name: string, options: typeof USER_DATABASE_OPEN_OPTIONS): Promise<CacheShapedConnection> => {
+    const useNewConnection = options.useNewConnection;
+    let connection = useNewConnection ? undefined : cachedConnection;
+    if (!connection) {
+      const id = ++connectionSequence;
+      connection = {
+        id,
+        async closeAsync() {
+          events.push(`close-start:${id}`);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          events.push(`close-complete:${id}`);
+        },
+        async execAsync() {},
+        async getAllAsync<T>(source: string) {
+          if (source === "PRAGMA foreign_keys") return [{ foreign_keys: 1 }] as T[];
+          if (source === "PRAGMA journal_mode") return [{ journal_mode: "wal" }] as T[];
+          if (source === "PRAGMA busy_timeout") return [{ timeout: 5_000 }] as T[];
+          return [] as T[];
+        },
+        async runAsync() {},
+      };
+      if (!useNewConnection) cachedConnection = connection;
+    }
+    events.push(`open:${connection.id}`);
+    attemptConnections.push(connection);
+    return connection;
+  };
   let attempt = 0;
   const dependencies = () => ({
     coordinator: new DataMutationCoordinator(),
     services: noServices,
     restore: { async recover() {} },
     database: { async openConfigured() {
+      const connection = await openConfiguredUserDatabase(openDatabase);
       const current = ++attempt;
       return {
         transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
         async migrate() { if (current === 1) throw new Error("migration drift"); },
-        async close() { closeCalls.push(current); },
+        async close() { await connection.closeAsync(); },
       };
     } },
     album: { async reconcile() {} },
@@ -547,9 +583,13 @@ test("startup failure closes before a later retry can reopen", async () => {
   });
   await assert.rejects(recoverAndOpen(dependencies(), new AbortController().signal), /migration drift/);
   const runtime = await recoverAndOpen(dependencies(), new AbortController().signal);
-  assert.deepEqual(closeCalls, [1]);
+  assert.equal(attemptConnections.length, 2);
+  assert.notEqual(attemptConnections[0], attemptConnections[1]);
+  assert.deepEqual(events, ["open:1", "close-start:1", "close-complete:1", "open:2"]);
   await runtime.close();
-  assert.deepEqual(closeCalls, [1, 2]);
+  assert.deepEqual(events, [
+    "open:1", "close-start:1", "close-complete:1", "open:2", "close-start:2", "close-complete:2",
+  ]);
 });
 
 test("startup close failure is marked with startup then close errors", async () => {
