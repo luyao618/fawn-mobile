@@ -263,14 +263,14 @@ function validatePrebuiltPodReport(report, flavor, expectedSha) {
   exactKeys(report, ["schemaVersion", "reportType", "platform", "flavor", "checkedOutSha", "expectedSha", "status", "selectors", "attempts", "acceptedAttempt", "configurations", "pods", "podVersions", "frameworks", "privacy", "graph"], `${flavor} prebuilt pod report`);
   validateCommonReport(report, "ios-react-native-prebuilt-pods", "ios", flavor, expectedSha, 3);
   assert.equal(report.status, "pass", `${flavor} prebuilt pod gate did not pass`);
-  assert.deepEqual(report.selectors, { EXPO_USE_PRECOMPILED_MODULES: "0", RCT_USE_RN_DEP: "1", RCT_USE_PREBUILT_RNCORE: "1" }, `${flavor} prebuilt selectors are invalid`);
+  assert.deepEqual(report.selectors, { EXPO_USE_PRECOMPILED_MODULES: "1", RCT_USE_RN_DEP: "1", RCT_USE_PREBUILT_RNCORE: "1" }, `${flavor} prebuilt selectors are invalid`);
   assert.deepEqual(report.configurations, IOS_PREBUILT_CONFIGURATIONS, `${flavor} prebuilt configurations are invalid`);
   assert.deepEqual(report.pods, IOS_PREBUILT_PODS, `${flavor} prebuilt pods are invalid`);
   assert.deepEqual(report.podVersions, IOS_PREBUILT_POD_VERSIONS, `${flavor} prebuilt pod versions are invalid`);
   assert.deepEqual(report.frameworks, IOS_PREBUILT_FRAMEWORKS, `${flavor} prebuilt frameworks are invalid`);
   assert.deepEqual(report.privacy, { rawOutputRetained: false }, `${flavor} prebuilt log privacy is invalid`);
-  assert(Array.isArray(report.attempts) && [1, 2].includes(report.attempts.length), `${flavor} prebuilt attempts are invalid`);
-  assert.equal(report.acceptedAttempt, report.attempts.length, `${flavor} accepted prebuilt attempt is invalid`);
+  assert(Array.isArray(report.attempts) && report.attempts.length === 1, `${flavor} prebuilt attempts are invalid`);
+  assert.equal(report.acceptedAttempt, 1, `${flavor} accepted prebuilt attempt is invalid`);
   report.attempts.forEach((attempt, index) => {
     const attemptNumber = index + 1;
     exactKeys(attempt, ["attempt", "command", "exit", "log", "diagnostics", "resolverModes"], `${flavor} prebuilt attempt ${attemptNumber}`);
@@ -287,11 +287,7 @@ function validatePrebuiltPodReport(report, flavor, expectedSha) {
     }
     exactKeys(attempt.resolverModes, IOS_PREBUILT_RESOLVERS, `${flavor} prebuilt attempt resolver modes`);
     for (const mode of Object.values(attempt.resolverModes)) assert.equal(typeof mode, "boolean", `${flavor} prebuilt resolver mode is invalid`);
-    if (attemptNumber < report.acceptedAttempt) {
-      assert(Object.values(attempt.resolverModes).some(Boolean), `${flavor} retry lacks a source-mode trigger`);
-    } else {
-      assert(Object.values(attempt.resolverModes).every((mode) => mode === false), `${flavor} accepted attempt is not fully prebuilt`);
-    }
+    assert(Object.values(attempt.resolverModes).every((mode) => mode === false), `${flavor} accepted attempt is not fully prebuilt`);
   });
   exactKeys(report.graph, ["lockfiles", "supportPlan"], `${flavor} prebuilt graph`);
   exactKeys(report.graph.lockfiles, ["equal", "files"], `${flavor} prebuilt lock proof`);

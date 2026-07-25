@@ -233,7 +233,11 @@ function completeCocoaPodsSupportScript() {
     ],
   } as const;
   const calls = [
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFileSystem/ExpoFileSystem.framework"',
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFont/ExpoFont.framework"',
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesCore/ExpoModulesCore.framework"',
     '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesJSI/ExpoModulesJSI.framework"',
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesWorklets/ExpoModulesWorklets.framework"',
     '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/React-Core-prebuilt/React.framework"',
     '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ReactNativeDependencies/ReactNativeDependencies.framework"',
     '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/hermes-engine/Pre-built/hermesvm.framework"',
@@ -302,7 +306,7 @@ async function prebuiltPodFixture(root: string, flavor: "production" | "e2e") {
     checkedOutSha: sha,
     expectedSha: sha,
     status: "pass",
-    selectors: { EXPO_USE_PRECOMPILED_MODULES: "0", RCT_USE_RN_DEP: "1", RCT_USE_PREBUILT_RNCORE: "1" },
+    selectors: { EXPO_USE_PRECOMPILED_MODULES: "1", RCT_USE_RN_DEP: "1", RCT_USE_PREBUILT_RNCORE: "1" },
     attempts: [{
       attempt: 1,
       command: ["install"],
@@ -545,9 +549,16 @@ test("report reads reject an atomically replaced parent even when its symlink pr
 test("same-SHA collector rejects stale, failed, drifted, and malformed iOS prebuilt reports", async () => {
   const mutations = [
     (value: any) => { value.pods.production.schemaVersion = 1; },
+    (value: any) => { value.pods.production.selectors.EXPO_USE_PRECOMPILED_MODULES = "0"; },
     (value: any) => { value.pods.production.checkedOutSha = "c".repeat(40); },
     (value: any) => { value.pods.e2e.status = "fail"; },
     (value: any) => { value.pods.production.attempts[0].resolverModes.ReactNativeCore = true; },
+    (value: any) => {
+      value.pods.production.attempts.unshift({ ...value.pods.production.attempts[0], resolverModes: { ReactNativeDependencies: true, ReactNativeCore: true } });
+      value.pods.production.attempts.forEach((attempt: any, index: number) => { attempt.attempt = index + 1; });
+      value.pods.production.attempts[1].command = ["install", "--clean-install"];
+      value.pods.production.acceptedAttempt = 2;
+    },
     (value: any) => { value.pods.e2e.graph.lockfiles.equal = false; },
     (value: any) => { value.pods.production.graph.supportPlan.configurations.Release.frameworks.pop(); },
     (value: any) => { value.pods.production.podVersions["React-Core-prebuilt"] = "0.85.0"; },
@@ -570,6 +581,39 @@ test("same-SHA collector rejects stale, failed, drifted, and malformed iOS prebu
     try {
       mutate(fixture.reports);
       await assert.rejects(() => validateIosPrebuiltReports(fixture.reports, sha, fixture.inputs), `mutation ${index + 1} must fail`);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("same-SHA collector rejects full-plan laundering behind unchanged RN report entries", async () => {
+  const mutations = [
+    (source: string) => source.replace('  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFileSystem/ExpoFileSystem.framework"\n', ""),
+    (source: string) => source.replace(
+      '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFont/ExpoFont.framework"',
+      '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/Unapproved/Unapproved.framework"\n  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFont/ExpoFont.framework"',
+    ),
+    (source: string) => source.replace(
+      '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFileSystem/ExpoFileSystem.framework"\n  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFont/ExpoFont.framework"',
+      '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFont/ExpoFont.framework"\n  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFileSystem/ExpoFileSystem.framework"',
+    ),
+  ];
+  for (const mutate of mutations) {
+    const fixture = await prebuiltFixture();
+    try {
+      const supportPath = fixture.leaves.pods.production.find((path: string) => path.endsWith("Pods-ForMobile-frameworks.sh"));
+      assert(supportPath);
+      const source = await readFile(supportPath, "utf8");
+      const changed = mutate(source);
+      assert.notEqual(changed, source);
+      await writeFile(supportPath, changed);
+      fixture.reports.pods.production.graph.supportPlan.file.sha256 = hash(changed);
+      assert.deepEqual(fixture.reports.pods.production.graph.supportPlan.configurations.Debug.entries, [
+        "${PODS_XCFRAMEWORKS_BUILD_DIR}/React-Core-prebuilt/React.framework",
+        "${PODS_XCFRAMEWORKS_BUILD_DIR}/ReactNativeDependencies/ReactNativeDependencies.framework",
+      ]);
+      await assert.rejects(() => validateIosPrebuiltReports(fixture.reports, sha, fixture.inputs));
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

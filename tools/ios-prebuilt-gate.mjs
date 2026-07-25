@@ -14,11 +14,20 @@ const REQUIRED_POD_VERSIONS = Object.freeze({
 });
 const REQUIRED_FRAMEWORKS = ["React.framework", "ReactNativeDependencies.framework"];
 const COCOAPODS_CONFIGURATION_ENTRIES = [
+  "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFileSystem/ExpoFileSystem.framework",
+  "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFont/ExpoFont.framework",
+  "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesCore/ExpoModulesCore.framework",
   "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesJSI/ExpoModulesJSI.framework",
+  "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesWorklets/ExpoModulesWorklets.framework",
   "${PODS_XCFRAMEWORKS_BUILD_DIR}/React-Core-prebuilt/React.framework",
   "${PODS_XCFRAMEWORKS_BUILD_DIR}/ReactNativeDependencies/ReactNativeDependencies.framework",
   "${PODS_XCFRAMEWORKS_BUILD_DIR}/hermes-engine/Pre-built/hermesvm.framework",
 ];
+const POD_SELECTORS = Object.freeze({
+  EXPO_USE_PRECOMPILED_MODULES: "1",
+  RCT_USE_RN_DEP: "1",
+  RCT_USE_PREBUILT_RNCORE: "1",
+});
 const REQUIRED_ARCHITECTURES = ["arm64"];
 const CONFIGURATIONS = ["Debug", "Release"];
 const RESOLVERS = ["ReactNativeDependencies", "ReactNativeCore"];
@@ -281,9 +290,7 @@ async function runPodAttempt({ iosDirectory, logDirectory, attempt }) {
     cwd: iosDirectory,
     env: {
       ...process.env,
-      EXPO_USE_PRECOMPILED_MODULES: "0",
-      RCT_USE_RN_DEP: "1",
-      RCT_USE_PREBUILT_RNCORE: "1",
+      ...POD_SELECTORS,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -644,7 +651,7 @@ export async function inspectRetainedPodInputs(input) {
 export async function installPrebuiltPods({ iosDirectory, logDirectory, retainedDirectory, reportPath, expectedSha, checkedOutSha, flavor }) {
   const base = commonReport(POD_REPORT_TYPE, flavor, checkedOutSha, expectedSha);
   const attempts = [];
-  const selectors = { EXPO_USE_PRECOMPILED_MODULES: "0", RCT_USE_RN_DEP: "1", RCT_USE_PREBUILT_RNCORE: "1" };
+  const selectors = { ...POD_SELECTORS };
   try {
     validateIdentity({ checkedOutSha, expectedSha, flavor, allowedFlavors: ["production", "e2e"] }, "pod-install");
     let acceptedAttempt = null;
@@ -661,11 +668,14 @@ export async function installPrebuiltPods({ iosDirectory, logDirectory, retained
       }
       await retainSafePodDiagnostics(result);
       if (attemptError !== null) throw attemptError;
-      if (!Object.values(result.record.resolverModes).some(Boolean)) {
-        acceptedAttempt = attempt;
-        break;
-      }
-      if (attempt === 2) fail("pod-install", "persistent-source-mode", "React Native pod resolvers remained in source mode after bounded recovery");
+      requireGate(
+        Object.values(result.record.resolverModes).every((mode) => mode === false),
+        "pod-install",
+        "source-mode-fallback",
+        "React Native pod resolvers selected source mode despite pinned prebuilt selectors",
+      );
+      acceptedAttempt = attempt;
+      break;
     }
     requireGate(acceptedAttempt !== null, "pod-install", "missing-prebuilt-mode", "React Native pod resolvers did not reach prebuilt mode");
     const graph = await verifyPodGraph(iosDirectory);

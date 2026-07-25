@@ -383,7 +383,7 @@ function assertExactIosRunStepBytes(steps: WorkflowStep[]): void {
     "77487e02167e5c6147e5431c183abc823d241c51b891c4eba9afad934dc8b097",
     "ae1914e2f036397428f8a38a37c09ac565a98edfb60cebd062c3d4c3b91802cb",
     "7a2df45b461d8f4b8c12e1f58e4e5fcfc0800dfbaf48e550f5729e41ccef7307",
-    "2605c2ac2c29f3ea12ae1816983d9dcf86332044df74e30c9c3f0679b31d5f38",
+    "31d0a006b0c9fab77850623ddc8378dd4e940b8ff3179ab049decdc90a2ff0a9",
     "6bb325664bf2c015f82a2f548f2951489804ec51999be3a41b396c516d207260",
   ], "iOS run step bytes must remain exact");
 }
@@ -688,12 +688,24 @@ const exactIosAppGate = `node tools/ios-prebuilt-gate.mjs verify-apps --debug-ap
 const exactIosRpathCleanup = [
   `/usr/bin/install_name_tool -delete_rpath "/Users/runner/work/react-native/react-native/packages/react-native/.build/output/spm/Debug/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/React.framework/React" >/dev/null 2>&1`,
   `/usr/bin/install_name_tool -delete_rpath "/Users/runner/work/react-native/react-native/packages/react-native/third-party/.build/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ReactNativeDependencies.framework/ReactNativeDependencies" >/dev/null 2>&1`,
+  `/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-file-system/output/debug/frameworks/ExpoFileSystem/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoFileSystem.framework/ExpoFileSystem" >/dev/null 2>&1`,
+  `/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-font/output/debug/frameworks/ExpoFont/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoFont.framework/ExpoFont" >/dev/null 2>&1`,
+  `/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-modules-core/output/debug/frameworks/ExpoModulesCore/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesCore.framework/ExpoModulesCore" >/dev/null 2>&1`,
+  `/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-modules-core/output/debug/frameworks/ExpoModulesWorklets/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesWorklets.framework/ExpoModulesWorklets" >/dev/null 2>&1`,
   `/usr/bin/codesign --force --sign - "$app_path/Frameworks/React.framework" >/dev/null 2>&1`,
   `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ReactNativeDependencies.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoFileSystem.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoFont.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoModulesCore.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoModulesWorklets.framework" >/dev/null 2>&1`,
   `/usr/bin/codesign --verify --strict "$app_path/Frameworks/React.framework" >/dev/null 2>&1`,
   `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ReactNativeDependencies.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoFileSystem.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoFont.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoModulesCore.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoModulesWorklets.framework" >/dev/null 2>&1`,
 ] as const;
-const exactIosPreinstallSha256 = "684a52e5b8c241276df8030c02892ef90f659ff8632640ea7f9aa9b807e27ec3";
+const exactIosPreinstallSha256 = "49a27c40a82467e248abf5192843af49d46bc2d6b4bddd5297a2d80db8431beb";
 const exactIosDownstreamSha256 = "c4060cc9aaab299ed0e0618ac6d6a3491901069d08776ae30f47a4cb5a6f860e";
 
 const exactIosOpenConfirmationFlow = `appId: com.luyao618.formobile
@@ -1057,7 +1069,7 @@ function assertIosPrebuiltGatePolicy(script: string): void {
   assert.deepEqual(
     lines.filter((line) => line.includes("install_name_tool -delete_rpath") || line.includes("/usr/bin/codesign")),
     exactIosRpathCleanup,
-    "iOS must normalize, re-sign, and strictly verify only the two exact RN 0.86 Debug frameworks before closure verification",
+    "iOS must normalize, re-sign, and strictly verify only the six exact Debug frameworks before closure verification",
   );
   const productionPrebuild = lines.indexOf("npm run prebuild:ios:production");
   const productionGate = lines.indexOf(exactIosProductionPodGate);
@@ -1865,7 +1877,16 @@ test("iOS prebuilt pod and app gates reject hostile workflow mutations", async (
     smoke.run.replace(`${exactIosAppGate}\nxcrun simctl install`, `xcrun simctl install\n${exactIosAppGate}`),
     smoke.run.replace(exactIosAppGate, `${exactIosAppGate} || true`),
     smoke.run.replace(`${exactIosRpathCleanup[0]}\n`, ""),
-    smoke.run.replace(`${exactIosRpathCleanup[4]}\n`, ""),
+    smoke.run.replace(`${exactIosRpathCleanup[0]}\n`, `${exactIosRpathCleanup[0]}\n${exactIosRpathCleanup[0]}\n`),
+    smoke.run.replace(`${exactIosRpathCleanup[2]}\n${exactIosRpathCleanup[3]}\n`, `${exactIosRpathCleanup[3]}\n${exactIosRpathCleanup[2]}\n`),
+    smoke.run.replace("/Users/alanhughes/Work/expo/packages/precompile/.build/expo-file-system/output/debug/frameworks/ExpoFileSystem/Build/Products/Debug-iphonesimulator/PackageFrameworks", "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-file-system/output/release/frameworks/ExpoFileSystem/Build/Products/Release-iphonesimulator/PackageFrameworks"),
+    smoke.run.replace('"$app_path/Frameworks/ExpoFont.framework/ExpoFont"', '"$app_path/Frameworks/ExpoModulesJSI.framework/ExpoModulesJSI"'),
+    smoke.run.replace(exactIosRpathCleanup[4], '/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/*/output/debug/frameworks/*/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesCore.framework/ExpoModulesCore" >/dev/null 2>&1'),
+    smoke.run.replace(exactIosRpathCleanup[5], 'find "$app_path/Frameworks" -type f -perm +111 -exec /usr/bin/install_name_tool -delete_rpath "$producer_path" {} \\;'),
+    smoke.run.replace(exactIosRpathCleanup[6], `${exactIosRpathCleanup[6]} || true`),
+    smoke.run.replace(`${exactIosRpathCleanup[17]}\n${exactIosAppGate}`, `${exactIosAppGate}\n${exactIosRpathCleanup[17]}`),
+    smoke.run.replace(`${exactIosRpathCleanup[8]}\n`, ""),
+    smoke.run.replace(`${exactIosRpathCleanup[14]}\n`, ""),
     smoke.run.replace(`${exactIosProductionPodGate}\n`, ""),
     smoke.run.replace("maestro --device", "maestro  --device"),
   ];

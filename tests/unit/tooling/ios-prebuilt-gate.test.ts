@@ -169,7 +169,11 @@ function frameworkCalls(frameworks: readonly string[] = requiredFrameworks) {
 
 function configurationCalls(frameworks: readonly string[] = requiredFrameworks) {
   return [
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFileSystem/ExpoFileSystem.framework"',
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoFont/ExpoFont.framework"',
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesCore/ExpoModulesCore.framework"',
     '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesJSI/ExpoModulesJSI.framework"',
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesWorklets/ExpoModulesWorklets.framework"',
     ...frameworkCalls(frameworks),
     '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/hermes-engine/Pre-built/hermesvm.framework"',
   ];
@@ -252,7 +256,7 @@ async function makePodHarness(outputs: (string | readonly string[])[], statuses 
   await writeFile(join(root, "statuses.json"), JSON.stringify(statuses));
   await writeFile(join(bin, "pod"), `#!/usr/bin/env node
 const { appendFileSync, existsSync, readFileSync } = require("node:fs");
-if (process.env.EXPO_USE_PRECOMPILED_MODULES !== "0" || process.env.RCT_USE_RN_DEP !== "1" || process.env.RCT_USE_PREBUILT_RNCORE !== "1") process.exit(97);
+if (process.env.EXPO_USE_PRECOMPILED_MODULES !== "1" || process.env.RCT_USE_RN_DEP !== "1" || process.env.RCT_USE_PREBUILT_RNCORE !== "1") process.exit(97);
 const count = existsSync(process.env.CALLS_FILE) ? readFileSync(process.env.CALLS_FILE, "utf8").trim().split("\\n").filter(Boolean).length : 0;
 appendFileSync(process.env.CALLS_FILE, process.argv.slice(2).join(" ") + "\\n");
 const chunks = JSON.parse(readFileSync(process.env.OUTPUTS_FILE, "utf8"))[count];
@@ -312,6 +316,11 @@ test("pod install pins both selectors and records a same-SHA prebuilt attempt", 
     assert.equal(report.checkedOutSha, sha);
     assert.equal(report.expectedSha, sha);
     assert.equal(report.acceptedAttempt, 1);
+    assert.deepEqual(report.selectors, {
+      EXPO_USE_PRECOMPILED_MODULES: "1",
+      RCT_USE_RN_DEP: "1",
+      RCT_USE_PREBUILT_RNCORE: "1",
+    });
     assert.deepEqual(report.attempts, [{
       attempt: 1,
       command: ["install"],
@@ -332,72 +341,64 @@ test("pod install pins both selectors and records a same-SHA prebuilt attempt", 
   }
 });
 
-test("source fallback gets one clean recovery and retains both structured modes", async () => {
+test("source-mode RN fallback fails closed without a clean-install acceptance path", async () => {
   const fixture = await makePodHarness([sourceTrue, prebuiltFalse]);
   try {
     const result = runInstall(fixture);
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(await readFile(fixture.calls, "utf8"), "install\ninstall --clean-install\n");
+    assert.notEqual(result.status, 0);
+    assert.equal(await readFile(fixture.calls, "utf8"), "install\n");
     assert.doesNotMatch(await readFile(join(fixture.logs, "attempt-1.log"), "utf8"), /Building from source/);
-    assert.doesNotMatch(await readFile(join(fixture.logs, "attempt-2.log"), "utf8"), /Building from source/);
     const report = await loadReport(fixture.report);
-    assert.equal(report.acceptedAttempt, 2);
+    assert.equal(report.status, "fail");
+    assert.equal(report.failure.code, "source-mode-fallback");
     assert.deepEqual(report.attempts.map((attempt: any) => attempt.resolverModes), [
       { ReactNativeDependencies: true, ReactNativeCore: true },
-      { ReactNativeDependencies: false, ReactNativeCore: false },
     ]);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
 
-test("first and second pod command failures retain only privacy-safe structured diagnostics", async () => {
+test("pod command and source-mode failures retain only privacy-safe structured diagnostics", async () => {
   const rawFirst = "artifact transport failed https://user:credential@example.invalid/pod?token=query-secret /private/tmp/private-token\n";
-  const rawSecond = `Authorization: Bearer header-secret\n${process.env.HOME}/private-pod\n`;
-  const first = await makePodHarness([["artifact transport ", "failed https://user:credential@", "example.invalid/pod?token=query-secret /private/tmp/private-token\n"]], [7]);
-  const second = await makePodHarness([sourceTrue, ["Authorization: Bearer header-", `secret\n${process.env.HOME}/private-pod\n`]], [0, 9]);
+  const commandFailure = await makePodHarness([["artifact transport ", "failed https://user:credential@", "example.invalid/pod?token=query-secret /private/tmp/private-token\n"]], [7]);
+  const sourceFallback = await makePodHarness([sourceTrue]);
   try {
-    const firstResult = runInstall(first);
-    assert.notEqual(firstResult.status, 0);
-    assert.equal(await readFile(first.calls, "utf8"), "install\n");
-    const firstPublicBytes = `${firstResult.stdout}${firstResult.stderr}${await readFile(join(first.logs, "attempt-1.log"), "utf8")}`;
-    assert.doesNotMatch(firstPublicBytes, /credential|query-secret|private-token|example\.invalid|\/private\/tmp/);
-    assert.match(firstPublicBytes, /raw CocoaPods output suppressed/);
-    const firstReport = await loadReport(first.report);
-    assert.equal(firstReport.status, "fail");
-    assert.equal(firstReport.failure.stage, "pod-install");
-    assert.equal(firstReport.failure.code, "pod-command-failed");
-    assert.deepEqual(firstReport.attempts[0].exit, { code: 7, signal: null });
+    const commandResult = runInstall(commandFailure);
+    assert.notEqual(commandResult.status, 0);
+    assert.equal(await readFile(commandFailure.calls, "utf8"), "install\n");
+    const commandPublicBytes = `${commandResult.stdout}${commandResult.stderr}${await readFile(join(commandFailure.logs, "attempt-1.log"), "utf8")}`;
+    assert.doesNotMatch(commandPublicBytes, /credential|query-secret|private-token|example\.invalid|\/private\/tmp/);
+    assert.match(commandPublicBytes, /raw CocoaPods output suppressed/);
+    const commandReport = await loadReport(commandFailure.report);
+    assert.equal(commandReport.status, "fail");
+    assert.equal(commandReport.failure.stage, "pod-install");
+    assert.equal(commandReport.failure.code, "pod-command-failed");
+    assert.deepEqual(commandReport.attempts[0].exit, { code: 7, signal: null });
+    assert.equal(commandReport.attempts[0].diagnostics.stdoutBytes, Buffer.byteLength(rawFirst));
 
-    const secondResult = runInstall(second);
-    assert.notEqual(secondResult.status, 0);
-    assert.equal(await readFile(second.calls, "utf8"), "install\ninstall --clean-install\n");
-    const secondPublicBytes = `${secondResult.stdout}${secondResult.stderr}${await readFile(join(second.logs, "attempt-2.log"), "utf8")}`;
-    assert.doesNotMatch(secondPublicBytes, /header-secret|Authorization|Bearer|private-pod/);
-    assert.equal(secondPublicBytes.includes(process.env.HOME ?? "<absent-home>"), false);
-    const secondReport = await loadReport(second.report);
-    assert.equal(secondReport.status, "fail");
-    assert.equal(secondReport.attempts.length, 2);
-    assert.deepEqual(secondReport.attempts[0].resolverModes, { ReactNativeDependencies: true, ReactNativeCore: true });
-    assert.equal(secondReport.attempts[1].resolverModes, null);
-    assert.deepEqual(secondReport.attempts[1].exit, { code: 9, signal: null });
-    assert.equal(firstReport.attempts[0].diagnostics.stdoutBytes, Buffer.byteLength(rawFirst));
-    assert.equal(secondReport.attempts[1].diagnostics.stdoutBytes, Buffer.byteLength(rawSecond));
+    const sourceResult = runInstall(sourceFallback);
+    assert.notEqual(sourceResult.status, 0);
+    const sourcePublicBytes = `${sourceResult.stdout}${sourceResult.stderr}${await readFile(join(sourceFallback.logs, "attempt-1.log"), "utf8")}`;
+    assert.doesNotMatch(sourcePublicBytes, /Building from source/);
+    const sourceReport = await loadReport(sourceFallback.report);
+    assert.equal(sourceReport.failure.code, "source-mode-fallback");
+    assert.deepEqual(sourceReport.attempts[0].resolverModes, { ReactNativeDependencies: true, ReactNativeCore: true });
   } finally {
-    await rm(first.root, { recursive: true, force: true });
-    await rm(second.root, { recursive: true, force: true });
+    await rm(commandFailure.root, { recursive: true, force: true });
+    await rm(sourceFallback.root, { recursive: true, force: true });
   }
 });
 
-test("persistent and malformed resolver output fail closed with durable diagnostics", async () => {
+test("source-mode and malformed resolver output fail closed with durable diagnostics", async () => {
   const persistent = await makePodHarness([sourceTrue, sourceTrue]);
   const malformed = await makePodHarness([`[ReactNativeDependencies] Building from source: false\n`]);
   try {
     const persistentResult = runInstall(persistent);
     assert.notEqual(persistentResult.status, 0);
     const persistentReport = await loadReport(persistent.report);
-    assert.equal(persistentReport.failure.code, "persistent-source-mode");
-    assert.equal(persistentReport.attempts.length, 2);
+    assert.equal(persistentReport.failure.code, "source-mode-fallback");
+    assert.equal(persistentReport.attempts.length, 1);
 
     const malformedResult = runInstall(malformed);
     assert.notEqual(malformedResult.status, 0);
@@ -503,6 +504,7 @@ test("each exact Pods-ForMobile configuration must embed both required framework
 test("Debug and Release embed plans reject extra, executable, duplicate, and reordered entries", async () => {
   const canonical = configurationCalls();
   const hostilePlans = [
+    ...canonical.map((_, omittedIndex) => canonical.filter((__, index) => index !== omittedIndex)),
     [...canonical, '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/Unapproved/Unapproved.framework"'],
     [...canonical, '  install_framework "$(id)"'],
     [...canonical, '  install_framework "`id`"'],

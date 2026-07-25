@@ -103,10 +103,22 @@ jobs:
           test -s "$release_app_path/main.jsbundle"
           /usr/bin/install_name_tool -delete_rpath "/Users/runner/work/react-native/react-native/packages/react-native/.build/output/spm/Debug/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/React.framework/React" >/dev/null 2>&1
           /usr/bin/install_name_tool -delete_rpath "/Users/runner/work/react-native/react-native/packages/react-native/third-party/.build/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ReactNativeDependencies.framework/ReactNativeDependencies" >/dev/null 2>&1
+          /usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-file-system/output/debug/frameworks/ExpoFileSystem/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoFileSystem.framework/ExpoFileSystem" >/dev/null 2>&1
+          /usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-font/output/debug/frameworks/ExpoFont/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoFont.framework/ExpoFont" >/dev/null 2>&1
+          /usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-modules-core/output/debug/frameworks/ExpoModulesCore/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesCore.framework/ExpoModulesCore" >/dev/null 2>&1
+          /usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-modules-core/output/debug/frameworks/ExpoModulesWorklets/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesWorklets.framework/ExpoModulesWorklets" >/dev/null 2>&1
           /usr/bin/codesign --force --sign - "$app_path/Frameworks/React.framework" >/dev/null 2>&1
           /usr/bin/codesign --force --sign - "$app_path/Frameworks/ReactNativeDependencies.framework" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoFileSystem.framework" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoFont.framework" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoModulesCore.framework" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoModulesWorklets.framework" >/dev/null 2>&1
           /usr/bin/codesign --verify --strict "$app_path/Frameworks/React.framework" >/dev/null 2>&1
           /usr/bin/codesign --verify --strict "$app_path/Frameworks/ReactNativeDependencies.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoFileSystem.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoFont.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoModulesCore.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoModulesWorklets.framework" >/dev/null 2>&1
           node tools/ios-prebuilt-gate.mjs verify-apps --debug-app "$app_path" --release-app "$release_app_path" --report .artifacts/launch/native/ios-apps/e2e/report.json --expected-sha "${{ inputs.expected_sha }}" --flavor e2e
           xcrun simctl install "$simulator_udid" "$app_path"
           set -m
