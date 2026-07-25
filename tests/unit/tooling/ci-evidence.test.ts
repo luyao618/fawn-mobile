@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -12,12 +13,19 @@ import {
   collectFaultBundleEvidence,
   collectProfileRestartEvidence,
   collectProfilePrivacyProof,
+  loadReport,
   validateNativeReports,
+  validateIosPrebuiltReports,
   validateProfileRestartReport,
   validateTestResultInput,
   validatePersistenceReport,
 } from "../../../tools/collect-ci-evidence.mjs";
 import { NATIVE_EVIDENCE_PATHS, NATIVE_SCHEME_PLACEMENTS } from "../../../tools/check-native-schemes.mjs";
+import {
+  inspectRetainedPodInputs,
+  PINNED_APP_TOOLS,
+  verifyPrebuiltApps,
+} from "../../../tools/ios-prebuilt-gate.mjs";
 
 const sha = "a".repeat(40);
 const opening = `<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application><activity android:name=".MainActivity">`;
@@ -91,6 +99,281 @@ function rehashConfig(report: any) {
   report.configSha256 = hash(JSON.stringify(report.config));
 }
 
+function simulatorTbd(installName: string) {
+  return `--- !tapi-tbd\ntbd-version: 4\ntargets: [ x86_64-ios-simulator, arm64-ios-simulator ]\ninstall-name: '${installName}'\nexports: []\n`;
+}
+
+function completeCocoaPodsSupportScript() {
+  const functions = {
+    on_error: [
+      "function on_error {",
+      '  echo "$(realpath -mq "${0}"):$1: error: Unexpected failure"',
+      "}",
+    ],
+    install_framework: [
+      "install_framework()",
+      "{",
+      '  if [ -r "${BUILT_PRODUCTS_DIR}/$1" ]; then',
+      '    local source="${BUILT_PRODUCTS_DIR}/$1"',
+      '  elif [ -r "${BUILT_PRODUCTS_DIR}/$(basename "$1")" ]; then',
+      '    local source="${BUILT_PRODUCTS_DIR}/$(basename "$1")"',
+      '  elif [ -r "$1" ]; then',
+      '    local source="$1"',
+      "  fi",
+      '  local destination="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"',
+      '  if [ -L "${source}" ]; then',
+      '    echo "Symlinked..."',
+      '    source="$(readlink -f "${source}")"',
+      "  fi",
+      '  if [ -d "${source}/${BCSYMBOLMAP_DIR}" ]; then',
+      '    find "${source}/${BCSYMBOLMAP_DIR}" -name "*.bcsymbolmap"|while read f; do',
+      '      echo "Installing $f"',
+      '      install_bcsymbolmap "$f" "$destination"',
+      '      rm "$f"',
+      "    done",
+      '    rmdir "${source}/${BCSYMBOLMAP_DIR}"',
+      "  fi",
+      '  echo "rsync --delete -av "${RSYNC_PROTECT_TMP_FILES[@]}" --links --filter \\"- CVS/\\" --filter \\"- .svn/\\" --filter \\"- .git/\\" --filter \\"- .hg/\\" --filter \\"- Headers\\" --filter \\"- PrivateHeaders\\" --filter \\"- Modules\\" \\"${source}\\" \\"${destination}\\""',
+      '  rsync --delete -av "${RSYNC_PROTECT_TMP_FILES[@]}" --links --filter "- CVS/" --filter "- .svn/" --filter "- .git/" --filter "- .hg/" --filter "- Headers" --filter "- PrivateHeaders" --filter "- Modules" "${source}" "${destination}"',
+      "  local basename",
+      '  basename="$(basename -s .framework "$1")"',
+      '  binary="${destination}/${basename}.framework/${basename}"',
+      '  if ! [ -r "$binary" ]; then',
+      '    binary="${destination}/${basename}"',
+      '  elif [ -L "${binary}" ]; then',
+      '    echo "Destination binary is symlinked..."',
+      '    dirname="$(dirname "${binary}")"',
+      '    binary="${dirname}/$(readlink "${binary}")"',
+      "  fi",
+      '  if [[ "$(file "$binary")" == *"dynamically linked shared library"* ]]; then',
+      '    strip_invalid_archs "$binary"',
+      "  fi",
+      '  code_sign_if_enabled "${destination}/$(basename "$1")"',
+      '  if [ "${XCODE_VERSION_MAJOR}" -lt 7 ]; then',
+      "    local swift_runtime_libs",
+      '    swift_runtime_libs=$(xcrun otool -LX "$binary" | grep --color=never @rpath/libswift | sed -E s/@rpath\\\\/\\(.+dylib\\).*/\\\\1/g | uniq -u)',
+      "    for lib in $swift_runtime_libs; do",
+      '      echo "rsync -auv \\"${SWIFT_STDLIB_PATH}/${lib}\\" \\"${destination}\\""',
+      '      rsync -auv "${SWIFT_STDLIB_PATH}/${lib}" "${destination}"',
+      '      code_sign_if_enabled "${destination}/${lib}"',
+      "    done",
+      "  fi",
+      "}",
+    ],
+    install_dsym: [
+      "install_dsym() {",
+      '  local source="$1"',
+      "  warn_missing_arch=${2:-true}",
+      '  if [ -r "$source" ]; then',
+      '    echo "rsync --delete -av "${RSYNC_PROTECT_TMP_FILES[@]}" --filter \\"- CVS/\\" --filter \\"- .svn/\\" --filter \\"- .git/\\" --filter \\"- .hg/\\" --filter \\"- Headers\\" --filter \\"- PrivateHeaders\\" --filter \\"- Modules\\" \\"${source}\\" \\"${DERIVED_FILES_DIR}\\""',
+      '    rsync --delete -av "${RSYNC_PROTECT_TMP_FILES[@]}" --filter "- CVS/" --filter "- .svn/" --filter "- .git/" --filter "- .hg/" --filter "- Headers" --filter "- PrivateHeaders" --filter "- Modules" "${source}" "${DERIVED_FILES_DIR}"',
+      "    local basename",
+      '    basename="$(basename -s .dSYM "$source")"',
+      '    binary_name="$(ls "$source/Contents/Resources/DWARF")"',
+      '    binary="${DERIVED_FILES_DIR}/${basename}.dSYM/Contents/Resources/DWARF/${binary_name}"',
+      '    if [[ "$(file "$binary")" == *"Mach-O "*"dSYM companion"* ]]; then',
+      '      strip_invalid_archs "$binary" "$warn_missing_arch"',
+      "    fi",
+      "    if [[ $STRIP_BINARY_RETVAL == 0 ]]; then",
+      '      echo "rsync --delete -av "${RSYNC_PROTECT_TMP_FILES[@]}" --links --filter \\"- CVS/\\" --filter \\"- .svn/\\" --filter \\"- .git/\\" --filter \\"- .hg/\\" --filter \\"- Headers\\" --filter \\"- PrivateHeaders\\" --filter \\"- Modules\\" \\"${DERIVED_FILES_DIR}/${basename}.framework.dSYM\\" \\"${DWARF_DSYM_FOLDER_PATH}\\""',
+      '      rsync --delete -av "${RSYNC_PROTECT_TMP_FILES[@]}" --links --filter "- CVS/" --filter "- .svn/" --filter "- .git/" --filter "- .hg/" --filter "- Headers" --filter "- PrivateHeaders" --filter "- Modules" "${DERIVED_FILES_DIR}/${basename}.dSYM" "${DWARF_DSYM_FOLDER_PATH}"',
+      "    else",
+      '      mkdir -p "${DWARF_DSYM_FOLDER_PATH}"',
+      '      touch "${DWARF_DSYM_FOLDER_PATH}/${basename}.dSYM"',
+      "    fi",
+      "  fi",
+      "}",
+    ],
+    strip_invalid_archs: [
+      "strip_invalid_archs() {",
+      '  binary="$1"',
+      "  warn_missing_arch=${2:-true}",
+      '  binary_archs="$(lipo -info "$binary" | rev | cut -d \':\' -f1 | awk \'{$1=$1;print}\' | rev)"',
+      '  intersected_archs="$(echo ${ARCHS[@]} ${binary_archs[@]} | tr \' \' \'\\n\' | sort | uniq -d)"',
+      '  if [[ -z "$intersected_archs" ]]; then',
+      '    if [[ "$warn_missing_arch" == "true" ]]; then',
+      '      echo "warning: [CP] Vendored binary \'$binary\' contains architectures ($binary_archs) none of which match the current build architectures ($ARCHS)."',
+      "    fi",
+      "    STRIP_BINARY_RETVAL=1",
+      "    return",
+      "  fi",
+      '  stripped=""',
+      "  for arch in $binary_archs; do",
+      '    if ! [[ "${ARCHS}" == *"$arch"* ]]; then',
+      '      lipo -remove "$arch" -output "$binary" "$binary"',
+      '      stripped="$stripped $arch"',
+      "    fi",
+      "  done",
+      '  if [[ "$stripped" ]]; then',
+      '    echo "Stripped $binary of architectures:$stripped"',
+      "  fi",
+      "  STRIP_BINARY_RETVAL=0",
+      "}",
+    ],
+    install_bcsymbolmap: [
+      "install_bcsymbolmap() {",
+      '  local bcsymbolmap_path="$1"',
+      '  local destination="${BUILT_PRODUCTS_DIR}"',
+      '  echo "rsync --delete -av "${RSYNC_PROTECT_TMP_FILES[@]}" --filter "- CVS/" --filter "- .svn/" --filter "- .git/" --filter "- .hg/" --filter "- Headers" --filter "- PrivateHeaders" --filter "- Modules" "${bcsymbolmap_path}" "${destination}""',
+      '  rsync --delete -av "${RSYNC_PROTECT_TMP_FILES[@]}" --filter "- CVS/" --filter "- .svn/" --filter "- .git/" --filter "- .hg/" --filter "- Headers" --filter "- PrivateHeaders" --filter "- Modules" "${bcsymbolmap_path}" "${destination}"',
+      "}",
+    ],
+    code_sign_if_enabled: [
+      "code_sign_if_enabled() {",
+      '  if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" -a "${CODE_SIGNING_REQUIRED:-}" != "NO" -a "${CODE_SIGNING_ALLOWED}" != "NO" ]; then',
+      '    echo "Code Signing $1 with Identity ${EXPANDED_CODE_SIGN_IDENTITY_NAME}"',
+      '    local code_sign_cmd="/usr/bin/codesign --force --sign ${EXPANDED_CODE_SIGN_IDENTITY} ${OTHER_CODE_SIGN_FLAGS:-} --preserve-metadata=identifier,entitlements \'$1\'"',
+      '    if [ "${COCOAPODS_PARALLEL_CODE_SIGN}" == "true" ]; then',
+      '      code_sign_cmd="$code_sign_cmd &"',
+      "    fi",
+      '    echo "$code_sign_cmd"',
+      '    eval "$code_sign_cmd"',
+      "  fi",
+      "}",
+    ],
+  } as const;
+  const calls = [
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ExpoModulesJSI/ExpoModulesJSI.framework"',
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/React-Core-prebuilt/React.framework"',
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/ReactNativeDependencies/ReactNativeDependencies.framework"',
+    '  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/hermes-engine/Pre-built/hermesvm.framework"',
+  ];
+  return [
+    "#!/bin/sh",
+    "set -e",
+    "set -u",
+    "set -o pipefail",
+    ...functions.on_error,
+    "trap 'on_error $LINENO' ERR",
+    "if [ -z ${FRAMEWORKS_FOLDER_PATH+x} ]; then",
+    "  exit 0",
+    "fi",
+    'echo "mkdir -p ${CONFIGURATION_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"',
+    'mkdir -p "${CONFIGURATION_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"',
+    'COCOAPODS_PARALLEL_CODE_SIGN="${COCOAPODS_PARALLEL_CODE_SIGN:-false}"',
+    'SWIFT_STDLIB_PATH="${TOOLCHAIN_DIR}/usr/lib/swift/${PLATFORM_NAME}"',
+    'BCSYMBOLMAP_DIR="BCSymbolMaps"',
+    'RSYNC_PROTECT_TMP_FILES=(--filter "P .*.??????")',
+    ...functions.install_framework,
+    ...functions.install_dsym,
+    "STRIP_BINARY_RETVAL=0",
+    ...functions.strip_invalid_archs,
+    ...functions.install_bcsymbolmap,
+    ...functions.code_sign_if_enabled,
+    'if [[ "$CONFIGURATION" == "Debug" ]]; then',
+    ...calls,
+    "fi",
+    'if [[ "$CONFIGURATION" == "Release" ]]; then',
+    ...calls,
+    "fi",
+    'if [ "${COCOAPODS_PARALLEL_CODE_SIGN}" == "true" ]; then',
+    "  wait",
+    "fi",
+    "",
+  ].join("\n");
+}
+
+async function prebuiltPodFixture(root: string, flavor: "production" | "e2e") {
+  const retainedDirectory = join(root, flavor, "retained");
+  const logDirectory = join(root, flavor, "logs");
+  await mkdir(retainedDirectory, { recursive: true });
+  await mkdir(logDirectory, { recursive: true });
+  const lock = `PODS:\n  - React-Core-prebuilt (0.86.0)\n  - ReactNativeDependencies (0.86.0)\n`;
+  const support = completeCocoaPodsSupportScript();
+  await writeFile(join(retainedDirectory, "Podfile.lock"), lock);
+  await writeFile(join(retainedDirectory, "Manifest.lock"), lock);
+  await writeFile(join(retainedDirectory, "Pods-ForMobile-frameworks.sh"), support);
+  const attemptLog = "pod attempt 1: raw CocoaPods output suppressed\nstdoutBytes=100\nstderrBytes=0\nexitCode=0\nsignal=none\nReactNativeDependencies=false\nReactNativeCore=false\n";
+  await writeFile(join(logDirectory, "attempt-1.log"), attemptLog);
+  const inspected = await inspectRetainedPodInputs({ retainedDirectory, logDirectory, attemptCount: 1 });
+  return {
+    input: { retainedDirectory, logDirectory },
+    leaves: [
+      join(logDirectory, "attempt-1.log"),
+      join(retainedDirectory, "Podfile.lock"),
+      join(retainedDirectory, "Manifest.lock"),
+      join(retainedDirectory, "Pods-ForMobile-frameworks.sh"),
+    ],
+    report: {
+      schemaVersion: 3,
+    reportType: "ios-react-native-prebuilt-pods",
+    platform: "ios",
+    flavor,
+    checkedOutSha: sha,
+    expectedSha: sha,
+    status: "pass",
+    selectors: { EXPO_USE_PRECOMPILED_MODULES: "0", RCT_USE_RN_DEP: "1", RCT_USE_PREBUILT_RNCORE: "1" },
+    attempts: [{
+      attempt: 1,
+      command: ["install"],
+      exit: { code: 0, signal: null },
+      log: inspected.attempts[0].log,
+      diagnostics: { rawOutputRetained: false, stderrBytes: 0, stdoutBytes: 100 },
+      resolverModes: { ReactNativeDependencies: false, ReactNativeCore: false },
+    }],
+    acceptedAttempt: 1,
+    configurations: ["Debug", "Release"],
+    pods: ["React-Core-prebuilt", "ReactNativeDependencies"],
+    podVersions: { "React-Core-prebuilt": "0.86.0", ReactNativeDependencies: "0.86.0" },
+    frameworks: ["React.framework", "ReactNativeDependencies.framework"],
+    privacy: { rawOutputRetained: false },
+      graph: inspected.graph,
+    },
+  };
+}
+
+async function collectorAppFixture(root: string) {
+  const sdk = join(root, "iPhoneSimulator.sdk");
+  await mkdir(join(sdk, "usr/lib"), { recursive: true });
+  await writeFile(join(sdk, "usr/lib/libSystem.B.tbd"), simulatorTbd("/usr/lib/libSystem.B.dylib"));
+  const binaries: string[] = [];
+  const makeApp = async (configuration: "Debug" | "Release") => {
+    const app = join(root, `${configuration}.app`);
+    await mkdir(join(app, "Frameworks"), { recursive: true });
+    const executable = join(app, "ForMobile");
+    await writeFile(executable, configuration);
+    binaries.push(executable);
+    for (const name of ["React", "ReactNativeDependencies", "ExpoModulesCore"]) {
+      const binary = join(app, `Frameworks/${name}.framework/${name}`);
+      await mkdir(dirname(binary), { recursive: true });
+      await writeFile(binary, name);
+      binaries.push(binary);
+    }
+    return app;
+  };
+  const debugApp = await makeApp("Debug");
+  const releaseApp = await makeApp("Release");
+  const runTool = async (command: string, args: readonly string[]) => {
+    if (command === PINNED_APP_TOOLS.xcrun) return { code: 0, signal: null, stdout: `${sdk}\n`, stderr: "" };
+    if (command === PINNED_APP_TOOLS.lipo) return { code: 0, signal: null, stdout: "arm64\n", stderr: "" };
+    const binary = args.at(-1) ?? "";
+    if (args[2] === "-L") {
+      const dependencies = basename(binary) === "ForMobile"
+        ? ["@rpath/React.framework/React", "@rpath/ReactNativeDependencies.framework/ReactNativeDependencies"]
+        : ["/usr/lib/libSystem.B.dylib"];
+      return { code: 0, signal: null, stdout: `${binary}:\n${dependencies.map((dependency) => `\t${dependency} (compatibility version 1.0.0, current version 1.0.0)`).join("\n")}\n`, stderr: "" };
+    }
+    return { code: 0, signal: null, stdout: "Load command 0\n          cmd LC_RPATH\n      cmdsize 48\n         path @executable_path/Frameworks (offset 12)\n", stderr: "" };
+  };
+  const reportPath = join(root, "apps-report.json");
+  const report = await verifyPrebuiltApps({ debugApp, releaseApp, reportPath, expectedSha: sha, checkedOutSha: sha, flavor: "e2e", runTool });
+  return { report, binaries, input: { debugApp, releaseApp, runTool } };
+}
+
+async function prebuiltFixture() {
+  const root = await mkdtemp(join(tmpdir(), "g018-prebuilt-evidence-"));
+  const production = await prebuiltPodFixture(root, "production");
+  const e2e = await prebuiltPodFixture(root, "e2e");
+  const apps = await collectorAppFixture(root);
+  const reports: any = structuredClone({ pods: { production: production.report, e2e: e2e.report }, apps: apps.report });
+  return {
+    root,
+    reports,
+    inputs: { pods: { production: production.input, e2e: e2e.input }, apps: apps.input },
+    leaves: { pods: { production: production.leaves, e2e: e2e.leaves }, apps: apps.binaries },
+  };
+}
+
 test("CI evidence reparses and hashes both canonical retained native files", async () => {
   const { root, value } = await fixture();
   try {
@@ -103,6 +386,262 @@ test("CI evidence reparses and hashes both canonical retained native files", asy
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("same-SHA collector independently reparses and rehashes all successful iOS prebuilt inputs", async () => {
+  const fixture = await prebuiltFixture();
+  try {
+    const summary: any = await validateIosPrebuiltReports(fixture.reports, sha, fixture.inputs);
+    assert.deepEqual(summary.pods, {
+      production: { acceptedAttempt: 1, attempts: 1 },
+      e2e: { acceptedAttempt: 1, attempts: 1 },
+    });
+    for (const configuration of ["Debug", "Release"] as const) {
+      assert.equal(summary.apps[configuration].checkedBinaries, fixture.reports.apps.apps[configuration].checkedBinaries);
+      assert.equal(summary.apps[configuration].resolvedLoads, fixture.reports.apps.apps[configuration].resolvedLoads);
+    }
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("same-SHA collector rejects a transient Debug executable swap-back during its first RPATH probe", async () => {
+  const fixture = await prebuiltFixture();
+  const executable = join(fixture.inputs.apps.debugApp, "ForMobile");
+  const original = join(fixture.inputs.apps.debugApp, "ForMobile.original");
+  const replacement = join(fixture.inputs.apps.debugApp, "ForMobile.replacement");
+  await writeFile(replacement, "replacement-with-rpath");
+  const stableRunTool = fixture.inputs.apps.runTool;
+  let swapped = false;
+  let restored = false;
+  fixture.inputs.apps.runTool = async (command: string, args: readonly string[]) => {
+    if (!swapped && command === PINNED_APP_TOOLS.otool && args[2] === "-l" && args.at(-1) === executable) {
+      await rename(executable, original);
+      await rename(replacement, executable);
+      swapped = true;
+      try {
+        return await stableRunTool(command, args);
+      } finally {
+        await rename(executable, replacement);
+        await rename(original, executable);
+        restored = true;
+      }
+    }
+    return stableRunTool(command, args);
+  };
+  try {
+    await assert.rejects(validateIosPrebuiltReports(fixture.reports, sha, fixture.inputs), (error: any) => {
+      assert.equal(error.name, "GateError");
+      assert.equal(error.stage, "app-closure");
+      assert.equal(error.code, "unstable-app-binary");
+      return true;
+    });
+    assert.equal(swapped, true);
+    assert.equal(restored, true);
+    assert.equal(await readFile(executable, "utf8"), "Debug");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+function openWithInjectedCloseFailure(onClose: () => void) {
+  return async (path: string, flags: number) => {
+    const handle = await open(path, flags);
+    const close = handle.close.bind(handle);
+    handle.close = async () => {
+      onClose();
+      await close();
+      throw new Error("injected per-handle close failure");
+    };
+    return handle;
+  };
+}
+
+test("report parsing and SHA use one stable byte read and reject atomic path replacement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "g018-stable-report-"));
+  const path = join(root, "report.json");
+  const originalBytes = Buffer.from('{"value":"original"}\n');
+  try {
+    await writeFile(path, originalBytes);
+    const loaded = await loadReport(path);
+    assert.deepEqual(loaded.report, { value: "original" });
+    assert.equal(loaded.sha256, createHash("sha256").update(originalBytes).digest("hex"));
+
+    const replacement = join(root, "replacement.json");
+    await writeFile(replacement, '{"value":"replacement"}\n');
+    let closeAttempts = 0;
+    await assert.rejects(loadReport(path, {
+      afterRead: async () => rename(replacement, path),
+      openFile: openWithInjectedCloseFailure(() => { closeAttempts += 1; }),
+    }), (error: any) => {
+      assert.match(error.message, /changed during read/);
+      assert.doesNotMatch(`${error.message}\n${error.stack ?? ""}`, /injected per-handle close failure/);
+      return true;
+    });
+    assert.equal(closeAttempts, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("report parse failure remains primary when the same real handle close also fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "g018-stable-report-parse-close-"));
+  const path = join(root, "report.json");
+  let closeAttempts = 0;
+  try {
+    await writeFile(path, "{malformed-json\n");
+    await assert.rejects(loadReport(path, {
+      openFile: openWithInjectedCloseFailure(() => { closeAttempts += 1; }),
+    }), (error: any) => {
+      assert.match(error.message, /absent or malformed/);
+      assert.equal(error.cause?.name, "SyntaxError");
+      assert.doesNotMatch(`${error.cause?.message ?? ""}\n${error.cause?.stack ?? ""}`, /injected per-handle close failure/);
+      return true;
+    });
+    assert.equal(closeAttempts, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("report close failure is surfaced when stable parsing has no primary error", async () => {
+  const root = await mkdtemp(join(tmpdir(), "g018-stable-report-close-only-"));
+  const path = join(root, "report.json");
+  let closeAttempts = 0;
+  try {
+    await writeFile(path, '{"value":"stable"}\n');
+    await assert.rejects(loadReport(path, {
+      openFile: openWithInjectedCloseFailure(() => { closeAttempts += 1; }),
+    }), (error: any) => {
+      assert.match(error.message, /absent or malformed/);
+      assert.equal(error.cause?.message, "injected per-handle close failure");
+      return true;
+    });
+    assert.equal(closeAttempts, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("report reads reject an atomically replaced parent even when its symlink preserves the leaf identity", async () => {
+  const outer = await mkdtemp(join(tmpdir(), "g018-stable-report-parent-"));
+  const parent = join(outer, "reports");
+  const movedParent = join(outer, "reports-pinned");
+  const path = join(parent, "report.json");
+  try {
+    await mkdir(parent);
+    await writeFile(path, '{"value":"original"}\n');
+    await assert.rejects(loadReport(path, {
+      afterRead: async () => {
+        await rename(parent, movedParent);
+        await symlink(movedParent, parent);
+      },
+    }), /parent|ancestor|changed during read/i);
+  } finally {
+    await rm(outer, { recursive: true, force: true });
+  }
+});
+
+test("same-SHA collector rejects stale, failed, drifted, and malformed iOS prebuilt reports", async () => {
+  const mutations = [
+    (value: any) => { value.pods.production.schemaVersion = 1; },
+    (value: any) => { value.pods.production.checkedOutSha = "c".repeat(40); },
+    (value: any) => { value.pods.e2e.status = "fail"; },
+    (value: any) => { value.pods.production.attempts[0].resolverModes.ReactNativeCore = true; },
+    (value: any) => { value.pods.e2e.graph.lockfiles.equal = false; },
+    (value: any) => { value.pods.production.graph.supportPlan.configurations.Release.frameworks.pop(); },
+    (value: any) => { value.pods.production.podVersions["React-Core-prebuilt"] = "0.85.0"; },
+    (value: any) => { value.pods.e2e.graph.supportPlan.file.token = "release-xcfilelist"; },
+    (value: any) => { value.pods.e2e.graph.supportPlan.configurations.Debug.extra = true; },
+    (value: any) => { value.pods.production.attempts[0].log.sha256 = "a".repeat(64); },
+    (value: any) => { value.pods.e2e.graph.lockfiles.files[0].sha256 = "b".repeat(64); },
+    (value: any) => { value.apps.tools.otool = "otool"; },
+    (value: any) => { value.apps.systemRuntime.sdk = "iphoneos"; },
+    (value: any) => { value.apps.systemRuntime.target = "arm64-ios"; },
+    (value: any) => { value.apps.systemRuntime.ownershipSha256 = "c".repeat(64); },
+    (value: any) => { value.apps.requiredArchitectures = ["x86_64"]; },
+    (value: any) => { value.apps.apps.Debug.architectures.arm64 = 0; },
+    (value: any) => { value.apps.apps.Release.resolvedLoads = 0; },
+    (value: any) => { value.apps.apps.Release.runpathContexts = 3; },
+    (value: any) => { value.apps.forged = true; },
+  ];
+  for (const [index, mutate] of mutations.entries()) {
+    const fixture = await prebuiltFixture();
+    try {
+      mutate(fixture.reports);
+      await assert.rejects(() => validateIosPrebuiltReports(fixture.reports, sha, fixture.inputs), `mutation ${index + 1} must fail`);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("same-SHA collector rejects mutation and symlink replacement of every retained prebuilt leaf", async () => {
+  for (const mode of ["mutation", "replacement"] as const) {
+    const template = await prebuiltFixture();
+    const leafCount = [
+      ...template.leaves.pods.production,
+      ...template.leaves.pods.e2e,
+      ...template.leaves.apps,
+    ].length;
+    await rm(template.root, { recursive: true, force: true });
+    for (let index = 0; index < leafCount; index += 1) {
+      const fixture = await prebuiltFixture();
+      try {
+        const leaves = [...fixture.leaves.pods.production, ...fixture.leaves.pods.e2e, ...fixture.leaves.apps];
+        const leaf = leaves[index];
+        if (mode === "mutation") {
+          await writeFile(leaf, `mutated retained leaf ${index}\n`);
+        } else {
+          const replacement = join(fixture.root, `replacement-${index}`);
+          await writeFile(replacement, await readFile(leaf));
+          await rm(leaf);
+          await symlink(replacement, leaf);
+        }
+        await assert.rejects(validateIosPrebuiltReports(fixture.reports, sha, fixture.inputs));
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("same-SHA collector rejects nonexistent retained prebuilt inputs despite syntactically valid hashes", async () => {
+  const fixture = await prebuiltFixture();
+  try {
+    await rm(fixture.leaves.pods.production[0]);
+    await assert.rejects(validateIosPrebuiltReports(fixture.reports, sha, fixture.inputs));
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("same-SHA collector rejects retained inputs reached through a symlinked parent directory", async () => {
+  const fixture = await prebuiltFixture();
+  try {
+    const retained = fixture.inputs.pods.production.retainedDirectory;
+    const parentAlias = join(fixture.root, "retained-parent-alias");
+    await symlink(dirname(retained), parentAlias);
+    fixture.inputs.pods.production.retainedDirectory = join(parentAlias, basename(retained));
+    await assert.rejects(validateIosPrebuiltReports(fixture.reports, sha, fixture.inputs), /non-symlink directory/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("spawned collector failures never echo hostile report or output paths", () => {
+  const secret = "/private/tmp/user:credential-token/report.json";
+  const result = spawnSync(process.execPath, [
+    "tools/collect-ci-evidence.mjs",
+    "--expected-sha", sha,
+    "--platform", "ios",
+    "--prebuilt-apps-report", secret,
+    "--output", secret,
+  ], { encoding: "utf8" });
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "CI evidence collection failed closed\n");
+  assert.doesNotMatch(`${result.stdout}${result.stderr}`, /credential-token|\/private|\/tmp/);
 });
 
 test("CI evidence rejects forged config identity, privacy, plugins, native placement, paths, and counts", async () => {
