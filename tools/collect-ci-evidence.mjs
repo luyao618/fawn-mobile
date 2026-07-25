@@ -2,14 +2,20 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { constants as fsConstants, readFileSync } from "node:fs";
+import { lstat, mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { validateResolvedConfigs } from "./check-app-config.mjs";
 import { validateFaultBundleProof } from "./check-fault-bundles.mjs";
 import { inspectNativeScheme, NATIVE_EVIDENCE_PATHS } from "./check-native-schemes.mjs";
+import {
+  inspectPrebuiltAppInputs,
+  inspectRetainedPodInputs,
+  pinPathAncestors,
+  verifyPinnedAncestors,
+} from "./ios-prebuilt-gate.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 export const CI_EVIDENCE_SCHEMA_VERSION = 5;
@@ -25,6 +31,21 @@ const PROFILE_VALUES = Object.freeze({
   sex: "female",
 });
 const PROFILE_REPORT_KEYS = ["schemaVersion", "reportType", "platform", "flavor", "checkedOutSha", "expectedSha", "testId", "fixture", "calendar", "ageOracle", "binary", "database", "lifecycle", "privacy", "migration", "evidence", "status", "skipped"];
+const IOS_PREBUILT_PODS = ["React-Core-prebuilt", "ReactNativeDependencies"];
+const IOS_PREBUILT_FRAMEWORKS = ["React.framework", "ReactNativeDependencies.framework"];
+const IOS_PREBUILT_CONFIGURATIONS = ["Debug", "Release"];
+const IOS_PREBUILT_RESOLVERS = ["ReactNativeDependencies", "ReactNativeCore"];
+const IOS_PREBUILT_POD_VERSIONS = { "React-Core-prebuilt": "0.86.0", ReactNativeDependencies: "0.86.0" };
+const IOS_PREBUILT_TOOLS = { otool: "/usr/bin/otool", lipo: "/usr/bin/lipo", xcrun: "/usr/bin/xcrun" };
+const IOS_PREBUILT_REPORT_PATHS = Object.freeze({
+  productionPods: ".artifacts/launch/native/ios-pods/production/report.json",
+  e2ePods: ".artifacts/launch/native/ios-pods/e2e/report.json",
+  apps: ".artifacts/launch/native/ios-apps/e2e/report.json",
+});
+const IOS_PREBUILT_APP_PATHS = Object.freeze({
+  Debug: "/tmp/g018-ios-e2e/Build/Products/Debug-iphonesimulator/ForMobile.app",
+  Release: "/tmp/g031-ios-e2e-release/Build/Products/Release-iphonesimulator/ForMobile.app",
+});
 
 export const CLEAN_REPOSITORY_STATUS_ARGS = ["status", "--porcelain=v1", "--untracked-files=all"];
 
@@ -45,6 +66,57 @@ async function sha256(path) {
 
 function hashJson(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameStableMetadata(left, right) {
+  return sameFileIdentity(left, right)
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+async function stableReportBytes(path, { afterRead, openFile = open } = {}) {
+  let pinned;
+  try {
+    pinned = await pinPathAncestors(path);
+  } catch {
+    assert.fail("Required CI report has an invalid parent directory");
+  }
+  const handle = await openFile(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let result;
+  let operationError = null;
+  try {
+    const before = await handle.stat({ bigint: true });
+    const pathBefore = await lstat(path, { bigint: true });
+    assert(before.isFile() && pathBefore.isFile() && !pathBefore.isSymbolicLink() && sameFileIdentity(before, pathBefore), "Required CI report is not one stable regular file");
+    const bytes = await handle.readFile();
+    await afterRead?.();
+    const after = await handle.stat({ bigint: true });
+    const pathAfter = await lstat(path, { bigint: true });
+    assert(
+      sameStableMetadata(before, after) && pathAfter.isFile() && !pathAfter.isSymbolicLink() && sameFileIdentity(after, pathAfter),
+      "Required CI report changed during read",
+    );
+    try {
+      await verifyPinnedAncestors(pinned);
+    } catch {
+      assert.fail("Required CI report parent directory changed during read");
+    }
+    result = { bytes, report: JSON.parse(bytes.toString("utf8")) };
+  } catch (error) {
+    operationError = error;
+  }
+  try {
+    await handle.close();
+  } catch (error) {
+    operationError ??= error;
+  }
+  if (operationError !== null) throw operationError;
+  return result;
 }
 
 function exactKeys(value, keys, label) {
@@ -123,9 +195,9 @@ export function collectProfilePrivacyProof(root = repoRoot) {
   };
 }
 
-function validateCommonReport(report, reportType, platform, flavor, expectedSha) {
+function validateCommonReport(report, reportType, platform, flavor, expectedSha, schemaVersion = 1) {
   assert(report && typeof report === "object" && !Array.isArray(report), `${reportType} ${flavor} report is malformed`);
-  assert.equal(report.schemaVersion, 1, `${reportType} ${flavor} report schema is invalid`);
+  assert.equal(report.schemaVersion, schemaVersion, `${reportType} ${flavor} report schema is invalid`);
   assert.equal(report.reportType, reportType, `${flavor} report type is invalid`);
   assert.equal(report.platform, platform, `${reportType} ${flavor} report platform is invalid`);
   assert.equal(report.flavor, flavor, `${reportType} report flavor is invalid`);
@@ -184,6 +256,126 @@ export async function validateNativeReports({ platform, expectedSha, configRepor
     summary.scheme[flavor] = { count: inspected.structure.count, placement: inspected.structure.placement };
     summary.nativeFiles[flavor] = { path: canonicalPath, sha256: inspected.nativeInputSha256 };
   }
+  return summary;
+}
+
+function validatePrebuiltPodReport(report, flavor, expectedSha) {
+  exactKeys(report, ["schemaVersion", "reportType", "platform", "flavor", "checkedOutSha", "expectedSha", "status", "selectors", "attempts", "acceptedAttempt", "configurations", "pods", "podVersions", "frameworks", "privacy", "graph"], `${flavor} prebuilt pod report`);
+  validateCommonReport(report, "ios-react-native-prebuilt-pods", "ios", flavor, expectedSha, 3);
+  assert.equal(report.status, "pass", `${flavor} prebuilt pod gate did not pass`);
+  assert.deepEqual(report.selectors, { EXPO_USE_PRECOMPILED_MODULES: "1", RCT_USE_RN_DEP: "1", RCT_USE_PREBUILT_RNCORE: "1" }, `${flavor} prebuilt selectors are invalid`);
+  assert.deepEqual(report.configurations, IOS_PREBUILT_CONFIGURATIONS, `${flavor} prebuilt configurations are invalid`);
+  assert.deepEqual(report.pods, IOS_PREBUILT_PODS, `${flavor} prebuilt pods are invalid`);
+  assert.deepEqual(report.podVersions, IOS_PREBUILT_POD_VERSIONS, `${flavor} prebuilt pod versions are invalid`);
+  assert.deepEqual(report.frameworks, IOS_PREBUILT_FRAMEWORKS, `${flavor} prebuilt frameworks are invalid`);
+  assert.deepEqual(report.privacy, { rawOutputRetained: false }, `${flavor} prebuilt log privacy is invalid`);
+  assert(Array.isArray(report.attempts) && report.attempts.length === 1, `${flavor} prebuilt attempts are invalid`);
+  assert.equal(report.acceptedAttempt, 1, `${flavor} accepted prebuilt attempt is invalid`);
+  report.attempts.forEach((attempt, index) => {
+    const attemptNumber = index + 1;
+    exactKeys(attempt, ["attempt", "command", "exit", "log", "diagnostics", "resolverModes"], `${flavor} prebuilt attempt ${attemptNumber}`);
+    assert.equal(attempt.attempt, attemptNumber, `${flavor} prebuilt attempt order is invalid`);
+    assert.deepEqual(attempt.command, attemptNumber === 1 ? ["install"] : ["install", "--clean-install"], `${flavor} prebuilt attempt command is invalid`);
+    assert.deepEqual(attempt.exit, { code: 0, signal: null }, `${flavor} prebuilt attempt exit is invalid`);
+    exactKeys(attempt.log, ["token", "sha256"], `${flavor} prebuilt attempt ${attemptNumber} log`);
+    assert.equal(attempt.log.token, `pod-attempt-${attemptNumber}`, `${flavor} prebuilt attempt log is invalid`);
+    assert.match(attempt.log.sha256, /^[0-9a-f]{64}$/, `${flavor} prebuilt attempt log hash is invalid`);
+    exactKeys(attempt.diagnostics, ["rawOutputRetained", "stderrBytes", "stdoutBytes"], `${flavor} prebuilt attempt ${attemptNumber} diagnostics`);
+    assert.equal(attempt.diagnostics.rawOutputRetained, false, `${flavor} prebuilt attempt retained raw output`);
+    for (const key of ["stderrBytes", "stdoutBytes"]) {
+      assert(Number.isInteger(attempt.diagnostics[key]) && attempt.diagnostics[key] >= 0, `${flavor} prebuilt attempt ${key} is invalid`);
+    }
+    exactKeys(attempt.resolverModes, IOS_PREBUILT_RESOLVERS, `${flavor} prebuilt attempt resolver modes`);
+    for (const mode of Object.values(attempt.resolverModes)) assert.equal(typeof mode, "boolean", `${flavor} prebuilt resolver mode is invalid`);
+    assert(Object.values(attempt.resolverModes).every((mode) => mode === false), `${flavor} accepted attempt is not fully prebuilt`);
+  });
+  exactKeys(report.graph, ["lockfiles", "supportPlan"], `${flavor} prebuilt graph`);
+  exactKeys(report.graph.lockfiles, ["equal", "files"], `${flavor} prebuilt lock proof`);
+  assert.equal(report.graph.lockfiles.equal, true, `${flavor} prebuilt locks disagree`);
+  assert.deepEqual(report.graph.lockfiles.files.map((file) => file.token), ["podfile-lock", "manifest-lock"], `${flavor} retained lock tokens are invalid`);
+  for (const file of report.graph.lockfiles.files) {
+    exactKeys(file, ["token", "sha256"], `${flavor} retained lock file`);
+    assert.match(file.sha256, /^[0-9a-f]{64}$/, `${flavor} prebuilt lock hash is invalid`);
+  }
+  exactKeys(report.graph.supportPlan, ["file", "configurations"], `${flavor} prebuilt support plan`);
+  exactKeys(report.graph.supportPlan.file, ["token", "sha256"], `${flavor} prebuilt support file`);
+  assert.equal(report.graph.supportPlan.file.token, "framework-support-script", `${flavor} prebuilt support file token is noncanonical`);
+  assert.match(report.graph.supportPlan.file.sha256, /^[0-9a-f]{64}$/, `${flavor} prebuilt support file hash is invalid`);
+  exactKeys(report.graph.supportPlan.configurations, IOS_PREBUILT_CONFIGURATIONS, `${flavor} prebuilt support configurations`);
+  for (const configuration of IOS_PREBUILT_CONFIGURATIONS) {
+    const plan = report.graph.supportPlan.configurations[configuration];
+    exactKeys(plan, ["entries", "frameworks"], `${flavor} ${configuration} prebuilt support plan`);
+    assert.deepEqual(plan.entries, [
+      "${PODS_XCFRAMEWORKS_BUILD_DIR}/React-Core-prebuilt/React.framework",
+      "${PODS_XCFRAMEWORKS_BUILD_DIR}/ReactNativeDependencies/ReactNativeDependencies.framework",
+    ], `${flavor} ${configuration} prebuilt entries are invalid`);
+    assert.deepEqual(plan.frameworks, IOS_PREBUILT_FRAMEWORKS, `${flavor} ${configuration} prebuilt framework plan is invalid`);
+  }
+  return { acceptedAttempt: report.acceptedAttempt, attempts: report.attempts.length };
+}
+
+function validatePrebuiltAppReport(report, expectedSha) {
+  exactKeys(report, ["schemaVersion", "reportType", "platform", "flavor", "checkedOutSha", "expectedSha", "status", "tools", "requiredArchitectures", "frameworks", "systemRuntime", "apps"], "iOS prebuilt app report");
+  validateCommonReport(report, "ios-react-native-prebuilt-app-closure", "ios", "e2e", expectedSha, 3);
+  assert.equal(report.status, "pass", "iOS prebuilt app closure did not pass");
+  assert.deepEqual(report.tools, IOS_PREBUILT_TOOLS, "iOS prebuilt app tools are not pinned");
+  assert.deepEqual(report.requiredArchitectures, ["arm64"], "iOS prebuilt app architecture requirement is invalid");
+  assert.deepEqual(report.frameworks, IOS_PREBUILT_FRAMEWORKS, "iOS prebuilt app frameworks are invalid");
+  exactKeys(report.systemRuntime, ["sdk", "target", "verifiedLoads", "uniqueInstallNames", "ownershipSha256"], "iOS prebuilt system runtime");
+  assert.equal(report.systemRuntime.sdk, "iphonesimulator", "iOS prebuilt system runtime SDK is invalid");
+  assert.equal(report.systemRuntime.target, "arm64-ios-simulator", "iOS prebuilt system runtime target is invalid");
+  assert(Number.isInteger(report.systemRuntime.verifiedLoads) && report.systemRuntime.verifiedLoads > 0, "iOS prebuilt system runtime loads are invalid");
+  assert(Number.isInteger(report.systemRuntime.uniqueInstallNames) && report.systemRuntime.uniqueInstallNames > 0, "iOS prebuilt system runtime ownership count is invalid");
+  assert.match(report.systemRuntime.ownershipSha256, /^[0-9a-f]{64}$/, "iOS prebuilt system runtime ownership hash is invalid");
+  exactKeys(report.apps, IOS_PREBUILT_CONFIGURATIONS, "iOS prebuilt app configurations");
+  const summary = {};
+  for (const configuration of IOS_PREBUILT_CONFIGURATIONS) {
+    const app = report.apps[configuration];
+    exactKeys(app, ["requiredFrameworks", "checkedBinaries", "resolvedLoads", "runpathContexts", "architectures", "input"], `${configuration} prebuilt app closure`);
+    assert.equal(app.requiredFrameworks, IOS_PREBUILT_FRAMEWORKS.length, `${configuration} prebuilt frameworks are incomplete`);
+    assert(Number.isInteger(app.checkedBinaries) && app.checkedBinaries >= IOS_PREBUILT_FRAMEWORKS.length + 1, `${configuration} checked binary count is invalid`);
+    assert(Number.isInteger(app.resolvedLoads) && app.resolvedLoads > 0, `${configuration} resolved load count is invalid`);
+    assert(Number.isInteger(app.runpathContexts) && app.runpathContexts >= app.checkedBinaries, `${configuration} runpath context count is invalid`);
+    assert.deepEqual(app.architectures, { arm64: app.checkedBinaries }, `${configuration} arm64 closure is incomplete`);
+    exactKeys(app.input, ["token", "binaryCount", "binaryManifestSha256"], `${configuration} prebuilt app input`);
+    assert.equal(app.input.token, configuration === "Debug" ? "e2e-debug-app" : "e2e-release-app", `${configuration} prebuilt app token is invalid`);
+    assert(Number.isInteger(app.input.binaryCount) && app.input.binaryCount >= app.checkedBinaries, `${configuration} prebuilt app binary count is invalid`);
+    assert.match(app.input.binaryManifestSha256, /^[0-9a-f]{64}$/, `${configuration} prebuilt app binary manifest is invalid`);
+    summary[configuration] = { checkedBinaries: app.checkedBinaries, resolvedLoads: app.resolvedLoads };
+  }
+  return summary;
+}
+
+export async function validateIosPrebuiltReports(reports, expectedSha, inputs) {
+  exactKeys(reports, ["pods", "apps"], "iOS prebuilt reports");
+  exactKeys(reports.pods, ["production", "e2e"], "iOS prebuilt pod reports");
+  const summary = {
+    pods: {
+      production: validatePrebuiltPodReport(reports.pods.production, "production", expectedSha),
+      e2e: validatePrebuiltPodReport(reports.pods.e2e, "e2e", expectedSha),
+    },
+    apps: validatePrebuiltAppReport(reports.apps, expectedSha),
+  };
+  for (const flavor of ["production", "e2e"]) {
+    const input = inputs?.pods?.[flavor];
+    assert(input, `${flavor} retained pod inputs are absent`);
+    const inspected = await inspectRetainedPodInputs({
+      retainedDirectory: input.retainedDirectory,
+      logDirectory: input.logDirectory,
+      attemptCount: reports.pods[flavor].attempts.length,
+    });
+    assert.deepEqual(inspected.graph, reports.pods[flavor].graph, `${flavor} retained pod graph disagrees with report`);
+    assert.deepEqual(inspected.attempts, reports.pods[flavor].attempts.map((attempt) => ({
+      attempt: attempt.attempt,
+      exit: attempt.exit,
+      diagnostics: attempt.diagnostics,
+      resolverModes: attempt.resolverModes,
+      log: attempt.log,
+    })), `${flavor} retained pod logs disagree with report`);
+  }
+  assert(inputs?.apps?.debugApp && inputs?.apps?.releaseApp, "Retained app inputs are absent");
+  const inspectedApps = await inspectPrebuiltAppInputs(inputs.apps);
+  assert.deepEqual(inspectedApps, { systemRuntime: reports.apps.systemRuntime, apps: reports.apps.apps }, "Retained app closure disagrees with report");
   return summary;
 }
 
@@ -403,15 +595,16 @@ async function frozenMigrationSha() {
   return match[1];
 }
 
-async function loadReport(path) {
+export async function loadReport(path, hooks) {
   assert(path, "Required CI report path is absent");
-  let report;
+  let stable;
   try {
-    report = JSON.parse(await readFile(path, "utf8"));
+    stable = await stableReportBytes(path, hooks);
   } catch (error) {
+    if (error?.code === "ERR_ASSERTION") throw error;
     throw new Error(`Required CI report is absent or malformed: ${path}`, { cause: error });
   }
-  return { path, sha256: await sha256(path), report };
+  return { path, sha256: createHash("sha256").update(stable.bytes).digest("hex"), report: stable.report };
 }
 
 async function main() {
@@ -466,6 +659,32 @@ async function main() {
     };
     for (const group of Object.values(reports)) for (const entry of Object.values(group)) delete entry.report;
     nativeFiles = validated.nativeFiles;
+    if (platform === "ios") {
+      const prebuiltPodsProduction = await loadReport(option("--prebuilt-pods-report-production", null));
+      const prebuiltPodsE2e = await loadReport(option("--prebuilt-pods-report-e2e", null));
+      const prebuiltApps = await loadReport(option("--prebuilt-apps-report", null));
+      assert.equal(prebuiltPodsProduction.path, IOS_PREBUILT_REPORT_PATHS.productionPods, "Production prebuilt pod report path is noncanonical");
+      assert.equal(prebuiltPodsE2e.path, IOS_PREBUILT_REPORT_PATHS.e2ePods, "E2E prebuilt pod report path is noncanonical");
+      assert.equal(prebuiltApps.path, IOS_PREBUILT_REPORT_PATHS.apps, "Prebuilt app report path is noncanonical");
+      const retainedRoot = `/tmp/fawn-ios-prebuilt-gate-${expectedSha}`;
+      const prebuiltSummary = await validateIosPrebuiltReports({
+        pods: { production: prebuiltPodsProduction.report, e2e: prebuiltPodsE2e.report },
+        apps: prebuiltApps.report,
+      }, expectedSha, {
+        pods: {
+          production: { retainedDirectory: `${retainedRoot}/production`, logDirectory: dirname(prebuiltPodsProduction.path) },
+          e2e: { retainedDirectory: `${retainedRoot}/e2e`, logDirectory: dirname(prebuiltPodsE2e.path) },
+        },
+        apps: { debugApp: IOS_PREBUILT_APP_PATHS.Debug, releaseApp: IOS_PREBUILT_APP_PATHS.Release },
+      });
+      reports.prebuilt = {
+        pods: {
+          production: { path: prebuiltPodsProduction.path, sha256: prebuiltPodsProduction.sha256, ...prebuiltSummary.pods.production },
+          e2e: { path: prebuiltPodsE2e.path, sha256: prebuiltPodsE2e.sha256, ...prebuiltSummary.pods.e2e },
+        },
+        apps: { path: prebuiltApps.path, sha256: prebuiltApps.sha256, configurations: prebuiltSummary.apps },
+      };
+    }
     const persistenceReport = await loadReport(option("--persistence-report", null));
     persistence = {
       path: persistenceReport.path,
@@ -507,7 +726,12 @@ async function main() {
   };
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(evidence, null, 2)}\n`, { flag: "wx" });
-  console.log(JSON.stringify({ evidence: "pass", output, checked_out_sha: checkedOutSha, test_result_sha256: testResult.file.sha256 }));
+  console.log(JSON.stringify({ evidence: "pass", checked_out_sha: checkedOutSha, test_result_sha256: testResult.file.sha256 }));
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(() => {
+    console.error("CI evidence collection failed closed");
+    process.exitCode = 1;
+  });
+}
