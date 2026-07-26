@@ -85,22 +85,41 @@ jobs:
           mkdir -p .artifacts/native/ios/production
           cp ios/ForMobile/Info.plist .artifacts/native/ios/production/Info.plist
           node tools/check-native-schemes.mjs --platform ios --flavor production --input .artifacts/native/ios/production/Info.plist --expected-sha "${{ inputs.expected_sha }}" --output .artifacts/schemes/ios-production.json
-          (cd ios && pod install)
+          RCT_USE_RN_DEP=1 RCT_USE_PREBUILT_RNCORE=1 node tools/ios-prebuilt-gate.mjs install-pods --ios-dir ios --log-dir .artifacts/launch/native/ios-pods/production --retained-dir "/tmp/fawn-ios-prebuilt-gate-${{ inputs.expected_sha }}/production" --report .artifacts/launch/native/ios-pods/production/report.json --expected-sha "${{ inputs.expected_sha }}" --flavor production
           xcodebuild -workspace ios/ForMobile.xcworkspace -scheme ForMobile -configuration Debug -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_udid" -derivedDataPath /tmp/g018-ios-production CODE_SIGNING_ALLOWED=NO build
 
           npm run prebuild:ios:e2e
           mkdir -p .artifacts/native/ios/e2e
           cp ios/ForMobile/Info.plist .artifacts/native/ios/e2e/Info.plist
           node tools/check-native-schemes.mjs --platform ios --flavor e2e --input .artifacts/native/ios/e2e/Info.plist --expected-sha "${{ inputs.expected_sha }}" --output .artifacts/schemes/ios-e2e.json
-          (cd ios && pod install)
+          RCT_USE_RN_DEP=1 RCT_USE_PREBUILT_RNCORE=1 node tools/ios-prebuilt-gate.mjs install-pods --ios-dir ios --log-dir .artifacts/launch/native/ios-pods/e2e --retained-dir "/tmp/fawn-ios-prebuilt-gate-${{ inputs.expected_sha }}/e2e" --report .artifacts/launch/native/ios-pods/e2e/report.json --expected-sha "${{ inputs.expected_sha }}" --flavor e2e
           xcodebuild -workspace ios/ForMobile.xcworkspace -scheme ForMobile -configuration Debug -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_udid" -derivedDataPath /tmp/g018-ios-e2e CODE_SIGNING_ALLOWED=NO build
-          app_path=$(find /tmp/g018-ios-e2e/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' -print -quit)
-          test -n "$app_path"
+          app_path=/tmp/g018-ios-e2e/Build/Products/Debug-iphonesimulator/ForMobile.app
+          test -d "$app_path"
           xcodebuild -workspace ios/ForMobile.xcworkspace -scheme ForMobile -configuration Release -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_udid" -derivedDataPath /tmp/g031-ios-e2e-release CODE_SIGNING_ALLOWED=NO build
-          release_app_path=$(find /tmp/g031-ios-e2e-release/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' -print -quit)
-          test -n "$release_app_path"
+          release_app_path=/tmp/g031-ios-e2e-release/Build/Products/Release-iphonesimulator/ForMobile.app
+          test -d "$release_app_path"
           test -x "$release_app_path/ForMobile"
           test -s "$release_app_path/main.jsbundle"
+          /usr/bin/install_name_tool -delete_rpath "/Users/runner/work/react-native/react-native/packages/react-native/.build/output/spm/Debug/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/React.framework/React" >/dev/null 2>&1
+          /usr/bin/install_name_tool -delete_rpath "/Users/runner/work/react-native/react-native/packages/react-native/third-party/.build/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ReactNativeDependencies.framework/ReactNativeDependencies" >/dev/null 2>&1
+          /usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-file-system/output/debug/frameworks/ExpoFileSystem/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoFileSystem.framework/ExpoFileSystem" >/dev/null 2>&1
+          /usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-font/output/debug/frameworks/ExpoFont/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoFont.framework/ExpoFont" >/dev/null 2>&1
+          /usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-modules-core/output/debug/frameworks/ExpoModulesCore/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesCore.framework/ExpoModulesCore" >/dev/null 2>&1
+          /usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-modules-core/output/debug/frameworks/ExpoModulesWorklets/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesWorklets.framework/ExpoModulesWorklets" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/React.framework" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/ReactNativeDependencies.framework" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoFileSystem.framework" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoFont.framework" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoModulesCore.framework" >/dev/null 2>&1
+          /usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoModulesWorklets.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/React.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/ReactNativeDependencies.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoFileSystem.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoFont.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoModulesCore.framework" >/dev/null 2>&1
+          /usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoModulesWorklets.framework" >/dev/null 2>&1
+          node tools/ios-prebuilt-gate.mjs verify-apps --debug-app "$app_path" --release-app "$release_app_path" --report .artifacts/launch/native/ios-apps/e2e/report.json --expected-sha "${{ inputs.expected_sha }}" --flavor e2e
           xcrun simctl install "$simulator_udid" "$app_path"
           set -m
           CI=1 EXPO_NO_TELEMETRY=1 EXPO_UNSTABLE_HEADLESS=1 EXPO_UNSTABLE_BONJOUR=0 NODE_OPTIONS=--dns-result-order=ipv4first REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1 EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e npx --no-install expo start --dev-client --localhost --port 8081 > /tmp/metro.log 2>&1 &
@@ -161,6 +180,9 @@ jobs:
             --config-report-e2e .artifacts/config/ios-e2e.json \
             --scheme-report-production .artifacts/schemes/ios-production.json \
             --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
+            --prebuilt-pods-report-production .artifacts/launch/native/ios-pods/production/report.json \
+            --prebuilt-pods-report-e2e .artifacts/launch/native/ios-pods/e2e/report.json \
+            --prebuilt-apps-report .artifacts/launch/native/ios-apps/e2e/report.json \
             --persistence-report .artifacts/ios-persistence.json \
             --profile-restart-report .artifacts/ios-profile-restart.json \
             --tracker-restart-report .artifacts/ios-tracker-restart.json \

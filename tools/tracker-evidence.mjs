@@ -3,10 +3,11 @@ import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+const require = createRequire(import.meta.url);
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const FIXTURE_PATH = "tests/fixtures/tracker/manual-tracker-v1.json";
 const FIXTURE_BYTE_SHA256 = "4960045548664bbabea2de291827b91ff9d1f2407630e16a0eb13117b92af69d";
@@ -376,6 +377,7 @@ function migrationSource(root) {
 export function migrationIdentity(root = repoRoot) {
   const { bytes, sql, recorded } = migrationSource(root);
   assert.equal(sha256Bytes(Buffer.from(sql)), recorded, "Migration SQL bytes disagree with the frozen SHA");
+  const { DatabaseSync } = require("node:sqlite");
   const db = new DatabaseSync(":memory:");
   let counts;
   try {
@@ -426,6 +428,7 @@ function snapshotCounts(rows) {
 }
 
 export function snapshotTrackerDatabase(path) {
+  const { DatabaseSync } = require("node:sqlite");
   const db = new DatabaseSync(path);
   try {
     const checkpoint = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();

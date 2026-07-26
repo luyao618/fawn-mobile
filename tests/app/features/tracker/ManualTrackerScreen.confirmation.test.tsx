@@ -242,16 +242,22 @@ afterEach(() => {
 
 test("rejected missing-record reload transition suppresses its fallback list", async () => {
   const rows = Object.freeze([records.growth]);
-  const list = jest.fn(async () => rows);
+  const initialList = deferred<typeof rows>();
+  const list = jest.fn(() => initialList.promise);
   const missingRecord = deferred<null>();
   const getById = jest.fn(() => missingRecord.promise);
   const service = createServiceMock({ list: list as ManualTrackerServicePort["list"], getById: getById as ManualTrackerServicePort["getById"] });
   renderTracker(service);
   mockTrackerReducerRejector.mockImplementation((action) => action.type === "GET_MISSING_RELOAD_STARTED");
-  fireEvent.press(await screen.findByRole("button", { name: /生长记录，/ }));
+  expect(list).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    initialList.resolve(rows);
+    await initialList.promise;
+  });
+  fireEvent.press(screen.getByRole("button", { name: /生长记录，/ }));
   expect(getById).toHaveBeenCalledTimes(1);
   missingRecord.resolve(null);
-  await Promise.resolve();
+  await missingRecord.promise;
   expect(mockTrackerReducerRejector).toHaveBeenCalledWith(
     expect.objectContaining({ type: "GET_MISSING_RELOAD_STARTED" }),
     expect.objectContaining({ tag: "edit.loading" }),

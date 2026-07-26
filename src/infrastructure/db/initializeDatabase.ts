@@ -7,6 +7,7 @@ export const USER_DATABASE_BUSY_TIMEOUT_MS = 5_000;
 export const USER_DATABASE_OPEN_OPTIONS = Object.freeze({
   enableChangeListener: true,
   finalizeUnusedStatementsBeforeClosing: false,
+  useNewConnection: true,
 });
 
 export interface UserDatabaseConnection extends MigrationDatabase {
