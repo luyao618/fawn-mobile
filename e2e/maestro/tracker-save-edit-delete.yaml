@@ -562,6 +562,18 @@ appId: com.luyao618.formobile
       platform: Android
     commands:
       - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^夜醒次数$'
+            below:
+              text: '^夜醒次数$'
+          direction: DOWN
 - tapOn:
     text: '^夜醒次数$'
     below:
@@ -983,6 +995,18 @@ appId: com.luyao618.formobile
       platform: Android
     commands:
       - hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+            text: '^量（毫升）$'
+            below:
+              text: '^量（毫升）$'
+          direction: DOWN
 - tapOn:
     text: '^量（毫升）$'
     below:

@@ -4344,18 +4344,35 @@ const trackerAndroidDoubleClearRefocus = `- runFlow:
       platform: Android
     commands:
       - hideKeyboard`;
-const trackerAndroidRefocusFields = new Set(["夜醒次数", "量（毫升）"]);
+const trackerDoubleClearRefocusFields = new Set(["夜醒次数", "量（毫升）"]);
 
 function trackerFieldTap(label: string): string {
   return `- tapOn:\n${trackerCompoundSelector(label, label, 4)}`;
 }
 
-function trackerClearWithAndroidRefocus(label: string): string {
-  return `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerFieldTap(label)}\n- eraseText`;
+function trackerIosDoubleClearRefocus(label: string): string {
+  return `- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN
+      - scrollUntilVisible:
+          element:
+${trackerCompoundSelector(label, label, 12)}
+          direction: DOWN`;
 }
 
-const trackerNightWakingsClearWithRefocus = trackerClearWithAndroidRefocus("夜醒次数");
-const trackerFeedingAmountClearWithRefocus = trackerClearWithAndroidRefocus("量（毫升）");
+function trackerDoubleClearRefocus(label: string): string {
+  return `${trackerAndroidDoubleClearRefocus}\n${trackerIosDoubleClearRefocus(label)}`;
+}
+
+function trackerClearWithPlatformRefocus(label: string): string {
+  return `- eraseText\n${trackerDoubleClearRefocus(label)}\n${trackerFieldTap(label)}\n- eraseText`;
+}
+
+const trackerNightWakingsClearWithRefocus = trackerClearWithPlatformRefocus("夜醒次数");
+const trackerFeedingAmountClearWithRefocus = trackerClearWithPlatformRefocus("量（毫升）");
 const trackerHealthConfirmationRevealAndAssert = `- scrollUntilVisible:
     element:
       text: '^确认新增健康记录$'
@@ -4370,8 +4387,8 @@ function trackerInputSequence(label: string, value: string, erase: boolean): str
   const iosAssertEntered = trackerCompoundSelector(label, value, 10);
   const tap = `- tapOn:\n${tapField}`;
   // Pinned Android eraseText backspaces from the caret, so retapping and erasing clears a surviving right-side suffix.
-  const androidRefocus = erase && trackerAndroidRefocusFields.has(label) ? `\n${trackerAndroidDoubleClearRefocus}` : "";
-  const entryStart = erase ? `${tap}\n- eraseText${androidRefocus}\n${tap}\n- eraseText` : tap;
+  const platformRefocus = erase && trackerDoubleClearRefocusFields.has(label) ? `\n${trackerDoubleClearRefocus(label)}` : "";
+  const entryStart = erase ? `${tap}\n- eraseText${platformRefocus}\n${tap}\n- eraseText` : tap;
   return `- scrollUntilVisible:
     element:
 ${scrollField}
@@ -4401,8 +4418,8 @@ ${iosAssertEntered}`;
 
 const trackerCommandInventories = Object.freeze({
   save: Object.freeze({
-    extendedWaitUntil: 2, tapOn: 63, assertVisible: 77, scrollUntilVisible: 69,
-    eraseText: 20, inputText: 22, runFlow: 46, hideKeyboard: 24, swipe: 22, assertNotVisible: 1,
+    extendedWaitUntil: 2, tapOn: 63, assertVisible: 77, scrollUntilVisible: 71,
+    eraseText: 20, inputText: 22, runFlow: 48, hideKeyboard: 24, swipe: 24, assertNotVisible: 1,
   }),
   restart: Object.freeze({
     extendedWaitUntil: 2, tapOn: 6, scrollUntilVisible: 4, assertVisible: 5, assertNotVisible: 1,
@@ -4563,9 +4580,9 @@ test("G035 C2 tracker flows lock the exact pinned native scenario", async () => 
     assert.equal((saveFlow.split(exact).length - 1), 1, `${label}=${value} must use the exact compound entry sequence`);
   }
   assert.equal(saveFlow.split(trackerNightWakingsClearWithRefocus).length - 1, 1,
-    "night wakings must use the Android refocus block exactly between its clear cycles");
+    "night wakings must use the complete two-platform refocus sequence exactly between its clear cycles");
   assert.equal(saveFlow.split(trackerFeedingAmountClearWithRefocus).length - 1, 1,
-    "feeding amount edit must use the Android refocus block exactly between its clear cycles");
+    "feeding amount edit must use the complete two-platform refocus sequence exactly between its clear cycles");
   assertTrackerHealthConfirmationReveal(saveFlow);
   assert.doesNotMatch(saveFlow, /时长（分钟）[\s\S]{0,220}inputText/);
   for (const radio of ["喂养类型配方奶", "睡眠类型夜间睡眠", "类型混合", "健康记录类型常规检查"]) {
@@ -4993,6 +5010,12 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
   const measurementDateSecondClear = `- tapOn:\n${trackerCompoundSelector("测量日期", "测量日期", 4)}\n- eraseText\n`;
   const measurementDateDoubleClear = `${measurementDateSecondClear}${measurementDateSecondClear}`;
   const measurementDateFinalClear = `${measurementDateSecondClear}- inputText: "2026-07-19"`;
+  const trackerIosSwipeOnlyDoubleClearRefocus = `- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          direction: DOWN`;
   const flowMutations: readonly [string, string, "save" | "restart", RegExp?][] = [
     ["label-only input", saveFlow.replace(trackerCompoundSelector("测量日期", "测量日期", 4), "    text: '^测量日期$'"), "save"],
     ["one clear cycle", replaceExactlyOnce(
@@ -5010,26 +5033,86 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
     ["missing night-wakings Android refocus", replaceExactlyOnce(
       saveFlow,
       trackerNightWakingsClearWithRefocus,
-      `- eraseText\n${trackerFieldTap("夜醒次数")}\n- eraseText`,
+      `- eraseText\n${trackerIosDoubleClearRefocus("夜醒次数")}\n${trackerFieldTap("夜醒次数")}\n- eraseText`,
       "missing night-wakings Android refocus",
     ), "save", /missing night-wakings Android refocus command inventory drifted/],
     ["moved night-wakings Android refocus", replaceExactlyOnce(
       saveFlow,
       trackerNightWakingsClearWithRefocus,
-      `- eraseText\n${trackerFieldTap("夜醒次数")}\n- eraseText\n${trackerAndroidDoubleClearRefocus}`,
+      `- eraseText\n${trackerIosDoubleClearRefocus("夜醒次数")}\n${trackerFieldTap("夜醒次数")}\n- eraseText\n${trackerAndroidDoubleClearRefocus}`,
       "moved night-wakings Android refocus",
+    ), "save", /夜醒次数=2 must use the exact compound entry sequence/],
+    ["missing night-wakings iOS refocus", replaceExactlyOnce(
+      saveFlow,
+      trackerNightWakingsClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerFieldTap("夜醒次数")}\n- eraseText`,
+      "missing night-wakings iOS refocus",
+    ), "save", /missing night-wakings iOS refocus command inventory drifted/],
+    ["night-wakings iOS refocus missing compound scroll", replaceExactlyOnce(
+      saveFlow,
+      trackerNightWakingsClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerIosSwipeOnlyDoubleClearRefocus}\n${trackerFieldTap("夜醒次数")}\n- eraseText`,
+      "night-wakings iOS refocus missing compound scroll",
+    ), "save", /night-wakings iOS refocus missing compound scroll command inventory drifted/],
+    ["night-wakings iOS refocus wrong field target", replaceExactlyOnce(
+      saveFlow,
+      trackerNightWakingsClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerIosDoubleClearRefocus("量（毫升）")}\n${trackerFieldTap("夜醒次数")}\n- eraseText`,
+      "night-wakings iOS refocus wrong field target",
+    ), "save", /夜醒次数=2 must use the exact compound entry sequence/],
+    ["night-wakings iOS refocus wrong direction", replaceExactlyOnce(
+      saveFlow,
+      trackerNightWakingsClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerIosDoubleClearRefocus("夜醒次数").replaceAll("direction: DOWN", "direction: UP")}\n${trackerFieldTap("夜醒次数")}\n- eraseText`,
+      "night-wakings iOS refocus wrong direction",
+    ), "save", /夜醒次数=2 must use the exact compound entry sequence/],
+    ["night-wakings iOS refocus moved after second erase", replaceExactlyOnce(
+      saveFlow,
+      trackerNightWakingsClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerFieldTap("夜醒次数")}\n- eraseText\n${trackerIosDoubleClearRefocus("夜醒次数")}`,
+      "night-wakings iOS refocus moved after second erase",
     ), "save", /夜醒次数=2 must use the exact compound entry sequence/],
     ["missing feeding-amount Android refocus", replaceExactlyOnce(
       saveFlow,
       trackerFeedingAmountClearWithRefocus,
-      `- eraseText\n${trackerFieldTap("量（毫升）")}\n- eraseText`,
+      `- eraseText\n${trackerIosDoubleClearRefocus("量（毫升）")}\n${trackerFieldTap("量（毫升）")}\n- eraseText`,
       "missing feeding-amount Android refocus",
     ), "save", /missing feeding-amount Android refocus command inventory drifted/],
     ["moved feeding-amount Android refocus", replaceExactlyOnce(
       saveFlow,
       trackerFeedingAmountClearWithRefocus,
-      `- eraseText\n${trackerFieldTap("量（毫升）")}\n- eraseText\n${trackerAndroidDoubleClearRefocus}`,
+      `- eraseText\n${trackerIosDoubleClearRefocus("量（毫升）")}\n${trackerFieldTap("量（毫升）")}\n- eraseText\n${trackerAndroidDoubleClearRefocus}`,
       "moved feeding-amount Android refocus",
+    ), "save", /量（毫升）=100 must use the exact compound entry sequence/],
+    ["missing feeding-amount iOS refocus", replaceExactlyOnce(
+      saveFlow,
+      trackerFeedingAmountClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerFieldTap("量（毫升）")}\n- eraseText`,
+      "missing feeding-amount iOS refocus",
+    ), "save", /missing feeding-amount iOS refocus command inventory drifted/],
+    ["feeding-amount iOS refocus missing compound scroll", replaceExactlyOnce(
+      saveFlow,
+      trackerFeedingAmountClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerIosSwipeOnlyDoubleClearRefocus}\n${trackerFieldTap("量（毫升）")}\n- eraseText`,
+      "feeding-amount iOS refocus missing compound scroll",
+    ), "save", /feeding-amount iOS refocus missing compound scroll command inventory drifted/],
+    ["feeding-amount iOS refocus wrong field target", replaceExactlyOnce(
+      saveFlow,
+      trackerFeedingAmountClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerIosDoubleClearRefocus("夜醒次数")}\n${trackerFieldTap("量（毫升）")}\n- eraseText`,
+      "feeding-amount iOS refocus wrong field target",
+    ), "save", /量（毫升）=100 must use the exact compound entry sequence/],
+    ["feeding-amount iOS refocus wrong direction", replaceExactlyOnce(
+      saveFlow,
+      trackerFeedingAmountClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerIosDoubleClearRefocus("量（毫升）").replaceAll("direction: DOWN", "direction: UP")}\n${trackerFieldTap("量（毫升）")}\n- eraseText`,
+      "feeding-amount iOS refocus wrong direction",
+    ), "save", /量（毫升）=100 must use the exact compound entry sequence/],
+    ["feeding-amount iOS refocus moved after second erase", replaceExactlyOnce(
+      saveFlow,
+      trackerFeedingAmountClearWithRefocus,
+      `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerFieldTap("量（毫升）")}\n- eraseText\n${trackerIosDoubleClearRefocus("量（毫升）")}`,
+      "feeding-amount iOS refocus moved after second erase",
     ), "save", /量（毫升）=100 must use the exact compound entry sequence/],
     ["missing health confirmation reveal", replaceExactlyOnce(
       saveFlow,
