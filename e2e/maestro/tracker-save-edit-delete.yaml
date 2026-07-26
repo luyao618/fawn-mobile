@@ -557,6 +557,11 @@ appId: com.luyao618.formobile
     below:
       text: '^夜醒次数$'
 - eraseText
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
 - tapOn:
     text: '^夜醒次数$'
     below:

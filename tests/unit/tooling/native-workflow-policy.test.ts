@@ -4339,6 +4339,14 @@ function trackerCompoundSelector(label: string, value = label, indentation = 0):
   return `${outer}text: '${`^${escapeRegex(value)}$`}'\n${outer}below:\n${inner}text: '${`^${escapeRegex(label)}$`}'`;
 }
 
+const trackerNightWakingsAndroidRefocus = `- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard`;
+const trackerNightWakingsTap = `- tapOn:\n${trackerCompoundSelector("夜醒次数", "夜醒次数", 4)}`;
+const trackerNightWakingsClearWithRefocus = `- eraseText\n${trackerNightWakingsAndroidRefocus}\n${trackerNightWakingsTap}\n- eraseText`;
+
 function trackerInputSequence(label: string, value: string, erase: boolean): string {
   const scrollField = trackerCompoundSelector(label, label, 6);
   const tapField = trackerCompoundSelector(label, label, 4);
@@ -4347,7 +4355,8 @@ function trackerInputSequence(label: string, value: string, erase: boolean): str
   const iosAssertEntered = trackerCompoundSelector(label, value, 10);
   const tap = `- tapOn:\n${tapField}`;
   // Pinned Android eraseText backspaces from the caret, so retapping and erasing clears a surviving right-side suffix.
-  const entryStart = erase ? `${tap}\n- eraseText\n${tap}\n- eraseText` : tap;
+  const androidRefocus = label === "夜醒次数" ? `\n${trackerNightWakingsAndroidRefocus}` : "";
+  const entryStart = erase ? `${tap}\n- eraseText${androidRefocus}\n${tap}\n- eraseText` : tap;
   return `- scrollUntilVisible:
     element:
 ${scrollField}
@@ -4378,7 +4387,7 @@ ${iosAssertEntered}`;
 const trackerCommandInventories = Object.freeze({
   save: Object.freeze({
     extendedWaitUntil: 2, tapOn: 63, assertVisible: 77, scrollUntilVisible: 67,
-    eraseText: 20, inputText: 22, runFlow: 44, hideKeyboard: 22, swipe: 22, assertNotVisible: 1,
+    eraseText: 20, inputText: 22, runFlow: 45, hideKeyboard: 23, swipe: 22, assertNotVisible: 1,
   }),
   restart: Object.freeze({
     extendedWaitUntil: 2, tapOn: 6, scrollUntilVisible: 4, assertVisible: 5, assertNotVisible: 1,
@@ -4528,10 +4537,13 @@ test("G035 C2 tracker flows lock the exact pinned native scenario", async () => 
     ["备注", "synthetic diaper", false], ["记录日期", "2026-07-18", true], ["标题", "Synthetic checkup", false],
     ["说明", "synthetic health", false], ["量（毫升）", "100", true],
   ] as const;
+  assert.equal(entries.filter(([, , erase]) => erase).length, 10, "all ten prefilled replacements must retain double-clear coverage");
   for (const [label, value, erase] of entries) {
     const exact = trackerInputSequence(label, value, erase);
     assert.equal((saveFlow.split(exact).length - 1), 1, `${label}=${value} must use the exact compound entry sequence`);
   }
+  assert.equal(saveFlow.split(trackerNightWakingsClearWithRefocus).length - 1, 1,
+    "night wakings must use the Android refocus block exactly between its clear cycles");
   assert.doesNotMatch(saveFlow, /时长（分钟）[\s\S]{0,220}inputText/);
   for (const radio of ["喂养类型配方奶", "睡眠类型夜间睡眠", "类型混合", "健康记录类型常规检查"]) {
     assert.match(saveFlow, new RegExp(`tapOn: ['\"]\\^${radio}\\$['\"]`));
@@ -4972,6 +4984,18 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
       `- tapOn:\n${trackerCompoundSelector("喂养日期", "喂养日期", 4)}\n- eraseText\n- inputText: "2026-07-19"`,
       "wrong second-cycle field",
     ), "save", /测量日期=2026-07-19 must use the exact compound entry sequence/],
+    ["missing night-wakings Android refocus", replaceExactlyOnce(
+      saveFlow,
+      trackerNightWakingsClearWithRefocus,
+      `- eraseText\n${trackerNightWakingsTap}\n- eraseText`,
+      "missing night-wakings Android refocus",
+    ), "save", /missing night-wakings Android refocus command inventory drifted/],
+    ["moved night-wakings Android refocus", replaceExactlyOnce(
+      saveFlow,
+      trackerNightWakingsClearWithRefocus,
+      `- eraseText\n${trackerNightWakingsTap}\n- eraseText\n${trackerNightWakingsAndroidRefocus}`,
+      "moved night-wakings Android refocus",
+    ), "save", /夜醒次数=2 must use the exact compound entry sequence/],
     ["wrong decimal escaping", restartFlow.replace("68\\.5", "68.5"), "restart"],
     ["coordinate", `${saveFlow}\n- tapOn:\n    point: \"50%,50%\"\n`, "save"],
     ["optional", `${saveFlow}\n- tapOn:\n    text: '^生长$'\n    optional: true\n`, "save"],
@@ -4987,6 +5011,8 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
         assert.equal(mutation.split(trackerInputSequence(field, value, erase)).length - 1, 1,
           `${field}=${value} must use the exact compound entry sequence`);
       }
+      assert.equal(mutation.split(trackerInputSequence("夜醒次数", "2", true)).length - 1, 1,
+        "夜醒次数=2 must use the exact compound entry sequence");
       assert.match(mutation, /68\\\.5/);
     };
     if (expectedError) assert.throws(enforceMutation, expectedError, label);
