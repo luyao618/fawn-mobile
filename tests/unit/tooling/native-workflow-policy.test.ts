@@ -4339,13 +4339,23 @@ function trackerCompoundSelector(label: string, value = label, indentation = 0):
   return `${outer}text: '${`^${escapeRegex(value)}$`}'\n${outer}below:\n${inner}text: '${`^${escapeRegex(label)}$`}'`;
 }
 
-const trackerNightWakingsAndroidRefocus = `- runFlow:
+const trackerAndroidDoubleClearRefocus = `- runFlow:
     when:
       platform: Android
     commands:
       - hideKeyboard`;
-const trackerNightWakingsTap = `- tapOn:\n${trackerCompoundSelector("夜醒次数", "夜醒次数", 4)}`;
-const trackerNightWakingsClearWithRefocus = `- eraseText\n${trackerNightWakingsAndroidRefocus}\n${trackerNightWakingsTap}\n- eraseText`;
+const trackerAndroidRefocusFields = new Set(["夜醒次数", "量（毫升）"]);
+
+function trackerFieldTap(label: string): string {
+  return `- tapOn:\n${trackerCompoundSelector(label, label, 4)}`;
+}
+
+function trackerClearWithAndroidRefocus(label: string): string {
+  return `- eraseText\n${trackerAndroidDoubleClearRefocus}\n${trackerFieldTap(label)}\n- eraseText`;
+}
+
+const trackerNightWakingsClearWithRefocus = trackerClearWithAndroidRefocus("夜醒次数");
+const trackerFeedingAmountClearWithRefocus = trackerClearWithAndroidRefocus("量（毫升）");
 const trackerHealthConfirmationRevealAndAssert = `- scrollUntilVisible:
     element:
       text: '^确认新增健康记录$'
@@ -4360,7 +4370,7 @@ function trackerInputSequence(label: string, value: string, erase: boolean): str
   const iosAssertEntered = trackerCompoundSelector(label, value, 10);
   const tap = `- tapOn:\n${tapField}`;
   // Pinned Android eraseText backspaces from the caret, so retapping and erasing clears a surviving right-side suffix.
-  const androidRefocus = label === "夜醒次数" ? `\n${trackerNightWakingsAndroidRefocus}` : "";
+  const androidRefocus = erase && trackerAndroidRefocusFields.has(label) ? `\n${trackerAndroidDoubleClearRefocus}` : "";
   const entryStart = erase ? `${tap}\n- eraseText${androidRefocus}\n${tap}\n- eraseText` : tap;
   return `- scrollUntilVisible:
     element:
@@ -4392,7 +4402,7 @@ ${iosAssertEntered}`;
 const trackerCommandInventories = Object.freeze({
   save: Object.freeze({
     extendedWaitUntil: 2, tapOn: 63, assertVisible: 77, scrollUntilVisible: 69,
-    eraseText: 20, inputText: 22, runFlow: 45, hideKeyboard: 23, swipe: 22, assertNotVisible: 1,
+    eraseText: 20, inputText: 22, runFlow: 46, hideKeyboard: 24, swipe: 22, assertNotVisible: 1,
   }),
   restart: Object.freeze({
     extendedWaitUntil: 2, tapOn: 6, scrollUntilVisible: 4, assertVisible: 5, assertNotVisible: 1,
@@ -4554,6 +4564,8 @@ test("G035 C2 tracker flows lock the exact pinned native scenario", async () => 
   }
   assert.equal(saveFlow.split(trackerNightWakingsClearWithRefocus).length - 1, 1,
     "night wakings must use the Android refocus block exactly between its clear cycles");
+  assert.equal(saveFlow.split(trackerFeedingAmountClearWithRefocus).length - 1, 1,
+    "feeding amount edit must use the Android refocus block exactly between its clear cycles");
   assertTrackerHealthConfirmationReveal(saveFlow);
   assert.doesNotMatch(saveFlow, /时长（分钟）[\s\S]{0,220}inputText/);
   for (const radio of ["喂养类型配方奶", "睡眠类型夜间睡眠", "类型混合", "健康记录类型常规检查"]) {
@@ -4998,15 +5010,27 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
     ["missing night-wakings Android refocus", replaceExactlyOnce(
       saveFlow,
       trackerNightWakingsClearWithRefocus,
-      `- eraseText\n${trackerNightWakingsTap}\n- eraseText`,
+      `- eraseText\n${trackerFieldTap("夜醒次数")}\n- eraseText`,
       "missing night-wakings Android refocus",
     ), "save", /missing night-wakings Android refocus command inventory drifted/],
     ["moved night-wakings Android refocus", replaceExactlyOnce(
       saveFlow,
       trackerNightWakingsClearWithRefocus,
-      `- eraseText\n${trackerNightWakingsTap}\n- eraseText\n${trackerNightWakingsAndroidRefocus}`,
+      `- eraseText\n${trackerFieldTap("夜醒次数")}\n- eraseText\n${trackerAndroidDoubleClearRefocus}`,
       "moved night-wakings Android refocus",
     ), "save", /夜醒次数=2 must use the exact compound entry sequence/],
+    ["missing feeding-amount Android refocus", replaceExactlyOnce(
+      saveFlow,
+      trackerFeedingAmountClearWithRefocus,
+      `- eraseText\n${trackerFieldTap("量（毫升）")}\n- eraseText`,
+      "missing feeding-amount Android refocus",
+    ), "save", /missing feeding-amount Android refocus command inventory drifted/],
+    ["moved feeding-amount Android refocus", replaceExactlyOnce(
+      saveFlow,
+      trackerFeedingAmountClearWithRefocus,
+      `- eraseText\n${trackerFieldTap("量（毫升）")}\n- eraseText\n${trackerAndroidDoubleClearRefocus}`,
+      "moved feeding-amount Android refocus",
+    ), "save", /量（毫升）=100 must use the exact compound entry sequence/],
     ["missing health confirmation reveal", replaceExactlyOnce(
       saveFlow,
       `${trackerHealthConfirmationRevealAndAssert}\n- tapOn: '^返回修改$'`,
@@ -5035,6 +5059,8 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
       }
       assert.equal(mutation.split(trackerInputSequence("夜醒次数", "2", true)).length - 1, 1,
         "夜醒次数=2 must use the exact compound entry sequence");
+      assert.equal(mutation.split(trackerInputSequence("量（毫升）", "100", true)).length - 1, 1,
+        "量（毫升）=100 must use the exact compound entry sequence");
       assert.match(mutation, /68\\\.5/);
     };
     if (expectedError) assert.throws(enforceMutation, expectedError, label);

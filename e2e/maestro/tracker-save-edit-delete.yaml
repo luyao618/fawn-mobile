@@ -978,6 +978,11 @@ appId: com.luyao618.formobile
     below:
       text: '^量（毫升）$'
 - eraseText
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
 - tapOn:
     text: '^量（毫升）$'
     below:
