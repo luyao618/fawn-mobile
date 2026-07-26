@@ -904,6 +904,10 @@ appId: com.luyao618.formobile
       text: '^保存健康记录$'
     direction: DOWN
 - tapOn: '^保存健康记录$'
+- scrollUntilVisible:
+    element:
+      text: '^确认新增健康记录$'
+    direction: UP
 - assertVisible: '^确认新增健康记录$'
 - tapOn: '^返回修改$'
 - assertVisible: '^新增健康记录$'
@@ -942,6 +946,10 @@ appId: com.luyao618.formobile
       text: '^保存健康记录$'
     direction: DOWN
 - tapOn: '^保存健康记录$'
+- scrollUntilVisible:
+    element:
+      text: '^确认新增健康记录$'
+    direction: UP
 - assertVisible: '^确认新增健康记录$'
 - assertVisible: '^健康记录类型$'
 - assertVisible: '^常规检查$'

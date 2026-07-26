@@ -4346,6 +4346,11 @@ const trackerNightWakingsAndroidRefocus = `- runFlow:
       - hideKeyboard`;
 const trackerNightWakingsTap = `- tapOn:\n${trackerCompoundSelector("夜醒次数", "夜醒次数", 4)}`;
 const trackerNightWakingsClearWithRefocus = `- eraseText\n${trackerNightWakingsAndroidRefocus}\n${trackerNightWakingsTap}\n- eraseText`;
+const trackerHealthConfirmationRevealAndAssert = `- scrollUntilVisible:
+    element:
+      text: '^确认新增健康记录$'
+    direction: UP
+- assertVisible: '^确认新增健康记录$'`;
 
 function trackerInputSequence(label: string, value: string, erase: boolean): string {
   const scrollField = trackerCompoundSelector(label, label, 6);
@@ -4386,7 +4391,7 @@ ${iosAssertEntered}`;
 
 const trackerCommandInventories = Object.freeze({
   save: Object.freeze({
-    extendedWaitUntil: 2, tapOn: 63, assertVisible: 77, scrollUntilVisible: 67,
+    extendedWaitUntil: 2, tapOn: 63, assertVisible: 77, scrollUntilVisible: 69,
     eraseText: 20, inputText: 22, runFlow: 45, hideKeyboard: 23, swipe: 22, assertNotVisible: 1,
   }),
   restart: Object.freeze({
@@ -4435,6 +4440,11 @@ function assertTrackerFlowSafety(flow: string, path: string, kind: "save" | "res
   assert.equal((flow.match(/id: "tab-RecordsTab"/g) ?? []).length, 2, `${path} must wait for and enter Records by ID`);
   assert.equal((flow.match(/- tapOn:\n    id: "tab-RecordsTab"/g) ?? []).length, 1, `${path} must enter Records exactly once`);
   assert.deepEqual(trackerCommandInventory(flow), trackerCommandInventories[kind], `${path} command inventory drifted`);
+}
+
+function assertTrackerHealthConfirmationReveal(flow: string): void {
+  assert.equal(flow.split(trackerHealthConfirmationRevealAndAssert).length - 1, 2,
+    "health confirmation heading must be revealed UP then asserted exactly twice");
 }
 
 function assertTrackerRunnerPolicy(script: string, platform: "android" | "ios"): void {
@@ -4544,6 +4554,7 @@ test("G035 C2 tracker flows lock the exact pinned native scenario", async () => 
   }
   assert.equal(saveFlow.split(trackerNightWakingsClearWithRefocus).length - 1, 1,
     "night wakings must use the Android refocus block exactly between its clear cycles");
+  assertTrackerHealthConfirmationReveal(saveFlow);
   assert.doesNotMatch(saveFlow, /时长（分钟）[\s\S]{0,220}inputText/);
   for (const radio of ["喂养类型配方奶", "睡眠类型夜间睡眠", "类型混合", "健康记录类型常规检查"]) {
     assert.match(saveFlow, new RegExp(`tapOn: ['\"]\\^${radio}\\$['\"]`));
@@ -4996,6 +5007,16 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
       `- eraseText\n${trackerNightWakingsTap}\n- eraseText\n${trackerNightWakingsAndroidRefocus}`,
       "moved night-wakings Android refocus",
     ), "save", /夜醒次数=2 must use the exact compound entry sequence/],
+    ["missing health confirmation reveal", replaceExactlyOnce(
+      saveFlow,
+      `${trackerHealthConfirmationRevealAndAssert}\n- tapOn: '^返回修改$'`,
+      `- assertVisible: '^确认新增健康记录$'\n- tapOn: '^返回修改$'`,
+      "missing health confirmation reveal",
+    ), "save", /missing health confirmation reveal command inventory drifted/],
+    ["wrong health confirmation reveal direction", saveFlow.replace(
+      trackerHealthConfirmationRevealAndAssert,
+      () => trackerHealthConfirmationRevealAndAssert.replace("direction: UP", () => "direction: DOWN"),
+    ), "save", /health confirmation heading must be revealed UP then asserted exactly twice/],
     ["wrong decimal escaping", restartFlow.replace("68\\.5", "68.5"), "restart"],
     ["coordinate", `${saveFlow}\n- tapOn:\n    point: \"50%,50%\"\n`, "save"],
     ["optional", `${saveFlow}\n- tapOn:\n    text: '^生长$'\n    optional: true\n`, "save"],
@@ -5007,6 +5028,7 @@ test("G035 C2 hostile mutations fail the frozen flow and runner contracts", asyn
     assert.ok(mutation !== saveFlow && mutation !== restartFlow, `${label} mutation must change a flow`);
     const enforceMutation = () => {
       assertTrackerFlowSafety(mutation, label, kind);
+      if (kind === "save") assertTrackerHealthConfirmationReveal(mutation);
       for (const [field, value, erase] of [["测量日期", "2026-07-19", true]] as const) {
         assert.equal(mutation.split(trackerInputSequence(field, value, erase)).length - 1, 1,
           `${field}=${value} must use the exact compound entry sequence`);
