@@ -59,6 +59,10 @@ const exactChildShaAssertion = `test "$(git rev-parse HEAD)" = "${expectedShaInp
 const iosDeveloperDir = "/Applications/Xcode_26.3.app/Contents/Developer";
 const iosPreflightStepName = "Preflight pinned Xcode and Swift";
 const exactIosJobEnv = { DEVELOPER_DIR: iosDeveloperDir };
+const exactIosPrebuildScripts = {
+  "prebuild:ios:production": "EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=production expo prebuild --clean --platform ios --no-install",
+  "prebuild:ios:e2e": "EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e expo prebuild --clean --platform ios --no-install",
+} as const;
 const exactIosPreflightScript = String.raw`set -euo pipefail
 test "$DEVELOPER_DIR" = "/Applications/Xcode_26.3.app/Contents/Developer"
 test -d "$DEVELOPER_DIR"
@@ -170,6 +174,9 @@ const exactChildCollectorRuns = {
   --config-report-e2e .artifacts/config/ios-e2e.json \
   --scheme-report-production .artifacts/schemes/ios-production.json \
   --scheme-report-e2e .artifacts/schemes/ios-e2e.json \
+  --prebuilt-pods-report-production .artifacts/launch/native/ios-pods/production/report.json \
+  --prebuilt-pods-report-e2e .artifacts/launch/native/ios-pods/e2e/report.json \
+  --prebuilt-apps-report .artifacts/launch/native/ios-apps/e2e/report.json \
   --persistence-report .artifacts/ios-persistence.json \
   --profile-restart-report .artifacts/ios-profile-restart.json \
   --output .artifacts/ios-e2e.json` + "\n",
@@ -335,6 +342,58 @@ function assertPreflightSemanticPolicy(script: string): void {
   );
 }
 
+function normalizeShellContinuations(script: string): string {
+  return script.replace(/\\\r?\n[ \t]*/g, " ");
+}
+
+function assertNoDirectPodInstalls(steps: WorkflowStep[]): void {
+  const directPodInstall = /(?:^|[^A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+\/)*pod[ \t]+install(?:[ \t]|[;&|)]|$)/m;
+  const offending = steps.flatMap((step) => typeof step.run === "string" && directPodInstall.test(normalizeShellContinuations(step.run))
+    ? [step.run]
+    : []);
+  assert.deepEqual(offending, [], "iOS workflow must not contain a direct, path-qualified, wrapped, or multiline pod install in any step");
+}
+
+function assertExactIosStepInventory(steps: WorkflowStep[]): void {
+  const inventory = steps.map((step) => step.uses === undefined
+    ? `run:${step.name ?? ""}`
+    : `uses:${step.name ?? ""}:${step.uses}`);
+  assert.deepEqual(inventory, [
+    `uses::${checkoutAction}`,
+    `uses::${setupNodeAction}`,
+    "run:",
+    `run:${iosPreflightStepName}`,
+    "run:",
+    "run:Install pinned Maestro",
+    "run:Resolve config reports",
+    "run:Serial production and E2E builds, install, and smoke",
+    "run:Collect same-SHA evidence",
+    `uses::${uploadArtifactAction}`,
+    `uses:Retain Ios launch and Maestro diagnostics:${uploadArtifactAction}`,
+  ], "iOS workflow step inventory must remain exact and ordered");
+}
+
+function assertExactIosRunStepBytes(steps: WorkflowStep[]): void {
+  const hashes = steps
+    .filter((step) => typeof step.run === "string")
+    .map((step) => createHash("sha256").update(step.run as string).digest("hex"));
+  assert.deepEqual(hashes, [
+    "2e4ac1f0fe8d0296ca2f15bc46498e3ed0ad69f4ccdd314760b1ab6b00257572",
+    "f0b504c0a885bdd731907f11818bdae32948e8f336b9568334e69f0572815eaf",
+    "77487e02167e5c6147e5431c183abc823d241c51b891c4eba9afad934dc8b097",
+    "ae1914e2f036397428f8a38a37c09ac565a98edfb60cebd062c3d4c3b91802cb",
+    "7a2df45b461d8f4b8c12e1f58e4e5fcfc0800dfbaf48e550f5729e41ccef7307",
+    "31d0a006b0c9fab77850623ddc8378dd4e940b8ff3179ab049decdc90a2ff0a9",
+    "6bb325664bf2c015f82a2f548f2951489804ec51999be3a41b396c516d207260",
+  ], "iOS run step bytes must remain exact");
+}
+
+function assertExactIosPrebuildScripts(scripts: Record<string, unknown>): void {
+  for (const [name, command] of Object.entries(exactIosPrebuildScripts)) {
+    assert.equal(scripts[name], command, `${name} must remain the exact no-install prebuild command`);
+  }
+}
+
 function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios"): void {
   assertExactJobKeys(workflow, [jobName], jobName);
   const job = requiredJob(workflow, jobName);
@@ -346,6 +405,7 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
   const installIndex = stepIndex(steps, (step) => step.run === "npm ci --workspaces --include-workspace-root", `${jobName} npm install`);
   assert.ok(checkoutIndex < assertionIndex && assertionIndex < installIndex, `${jobName} must assert the checked-out SHA before install`);
   if (jobName === "ios") {
+    assertNoDirectPodInstalls(steps);
     assert.deepEqual(job.env, exactIosJobEnv, "iOS job environment must remain exactly pinned to Xcode 26.3");
     const preflightIndexes = steps.flatMap((step, index) => step.name === iosPreflightStepName ? [index] : []);
     assert.equal(preflightIndexes.length, 1, "iOS must contain exactly one pinned Xcode and Swift preflight");
@@ -400,7 +460,7 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
   const smokeIndex = jobName === "android"
     ? stepIndex(steps, (step) => step.uses === androidEmulatorAction, "android device smoke")
     : stepIndex(steps, (step) => step.name === "Serial production and E2E builds, install, and smoke", "ios device smoke");
-  assert.ok(collectorIndex > smokeIndex, `${jobName} evidence collector must follow the device smoke step`);
+  assert.equal(collectorIndex, smokeIndex + 1, `${jobName} evidence collector must immediately follow the device smoke step`);
   const uploadIndexes = steps.flatMap((step, index) => usesActionRepository(step, uploadArtifactRepository) ? [index] : []);
   assert.equal(uploadIndexes.length, 2, `${jobName} must contain exactly the approved primary and diagnostics artifact uploads`);
   for (const uploadIndex of uploadIndexes) {
@@ -437,6 +497,10 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
     diagnosticsUploadIndex > primaryUploadIndex,
     `${jobName} diagnostics upload must follow the primary evidence upload`,
   );
+  if (jobName === "ios") {
+    assertExactIosStepInventory(steps);
+    assertExactIosRunStepBytes(steps);
+  }
   if (jobName === "android") pinnedAndroidActionScript(workflow);
 }
 
@@ -618,6 +682,31 @@ const exactAndroidFailureDiagnosticPaths = [
   ".artifacts/launch/device/android-app.log",
 ] as const;
 const exactPinnedSimulatorOpenLine = 'open "$DEVELOPER_DIR/Applications/Simulator.app" --args -CurrentDeviceUDID "$simulator_udid"';
+const exactIosProductionPodGate = `RCT_USE_RN_DEP=1 RCT_USE_PREBUILT_RNCORE=1 node tools/ios-prebuilt-gate.mjs install-pods --ios-dir ios --log-dir .artifacts/launch/native/ios-pods/production --retained-dir "/tmp/fawn-ios-prebuilt-gate-${expectedShaInput}/production" --report .artifacts/launch/native/ios-pods/production/report.json --expected-sha "${expectedShaInput}" --flavor production`;
+const exactIosE2ePodGate = `RCT_USE_RN_DEP=1 RCT_USE_PREBUILT_RNCORE=1 node tools/ios-prebuilt-gate.mjs install-pods --ios-dir ios --log-dir .artifacts/launch/native/ios-pods/e2e --retained-dir "/tmp/fawn-ios-prebuilt-gate-${expectedShaInput}/e2e" --report .artifacts/launch/native/ios-pods/e2e/report.json --expected-sha "${expectedShaInput}" --flavor e2e`;
+const exactIosAppGate = `node tools/ios-prebuilt-gate.mjs verify-apps --debug-app "$app_path" --release-app "$release_app_path" --report .artifacts/launch/native/ios-apps/e2e/report.json --expected-sha "${expectedShaInput}" --flavor e2e`;
+const exactIosRpathCleanup = [
+  `/usr/bin/install_name_tool -delete_rpath "/Users/runner/work/react-native/react-native/packages/react-native/.build/output/spm/Debug/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/React.framework/React" >/dev/null 2>&1`,
+  `/usr/bin/install_name_tool -delete_rpath "/Users/runner/work/react-native/react-native/packages/react-native/third-party/.build/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ReactNativeDependencies.framework/ReactNativeDependencies" >/dev/null 2>&1`,
+  `/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-file-system/output/debug/frameworks/ExpoFileSystem/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoFileSystem.framework/ExpoFileSystem" >/dev/null 2>&1`,
+  `/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-font/output/debug/frameworks/ExpoFont/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoFont.framework/ExpoFont" >/dev/null 2>&1`,
+  `/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-modules-core/output/debug/frameworks/ExpoModulesCore/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesCore.framework/ExpoModulesCore" >/dev/null 2>&1`,
+  `/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-modules-core/output/debug/frameworks/ExpoModulesWorklets/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesWorklets.framework/ExpoModulesWorklets" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/React.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ReactNativeDependencies.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoFileSystem.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoFont.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoModulesCore.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --force --sign - "$app_path/Frameworks/ExpoModulesWorklets.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/React.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ReactNativeDependencies.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoFileSystem.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoFont.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoModulesCore.framework" >/dev/null 2>&1`,
+  `/usr/bin/codesign --verify --strict "$app_path/Frameworks/ExpoModulesWorklets.framework" >/dev/null 2>&1`,
+] as const;
+const exactIosPreinstallSha256 = "49a27c40a82467e248abf5192843af49d46bc2d6b4bddd5297a2d80db8431beb";
+const exactIosDownstreamSha256 = "c4060cc9aaab299ed0e0618ac6d6a3491901069d08776ae30f47a4cb5a6f860e";
 
 const exactIosOpenConfirmationFlow = `appId: com.luyao618.formobile
 ---
@@ -958,6 +1047,72 @@ function assertIosFailureDiagnosticsPolicy(script: string, workflow: Workflow): 
   assert.equal(upload.if, "always()", "iOS diagnostics upload must run after failure");
   assert.equal(upload.with?.path, ".artifacts/launch/**\n.artifacts/test-results/**\n");
   assert.equal(upload.with?.["include-hidden-files"], true, "iOS diagnostics upload must retain hidden Maestro files");
+}
+
+function assertIosPrebuiltGatePolicy(script: string): void {
+  const lines = script.split(/\r\n|\n|\r/);
+  assert.deepEqual(
+    lines.filter((line) => line.includes("ios-prebuilt-gate.mjs install-pods")),
+    [exactIosProductionPodGate, exactIosE2ePodGate],
+    "iOS production and final E2E pod installs must use the exact paired prebuilt gate",
+  );
+  assert.deepEqual(
+    lines.filter((line) => /(?:^|[^A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+\/)*pod[ \t]+install(?:[ \t]|[;&|)]|$)/.test(line)),
+    [],
+    "iOS must not bypass the prebuilt gate with a direct, path-qualified, or wrapped pod install",
+  );
+  assert.deepEqual(
+    lines.filter((line) => line.includes("ios-prebuilt-gate.mjs verify-apps")),
+    [exactIosAppGate],
+    "iOS must verify both built app bundles exactly once",
+  );
+  assert.deepEqual(
+    lines.filter((line) => line.includes("install_name_tool -delete_rpath") || line.includes("/usr/bin/codesign")),
+    exactIosRpathCleanup,
+    "iOS must normalize, re-sign, and strictly verify only the six exact Debug frameworks before closure verification",
+  );
+  const productionPrebuild = lines.indexOf("npm run prebuild:ios:production");
+  const productionGate = lines.indexOf(exactIosProductionPodGate);
+  const productionBuild = lines.findIndex((line) => line.includes("-derivedDataPath /tmp/g018-ios-production"));
+  const e2ePrebuild = lines.indexOf("npm run prebuild:ios:e2e");
+  const e2eGate = lines.indexOf(exactIosE2ePodGate);
+  const debugBuild = lines.findIndex((line) => line.includes("-derivedDataPath /tmp/g018-ios-e2e"));
+  const releaseBuild = lines.findIndex((line) => line.includes("-derivedDataPath /tmp/g031-ios-e2e-release"));
+  const appGate = lines.indexOf(exactIosAppGate);
+  const rpathCleanup = exactIosRpathCleanup.map((line) => lines.indexOf(line));
+  const normalizationOrdered = rpathCleanup.every((lineIndex, index) => index === 0 || rpathCleanup[index - 1] < lineIndex);
+  const install = lines.indexOf('xcrun simctl install "$simulator_udid" "$app_path"');
+  assert.ok(
+    productionPrebuild < productionGate && productionGate < productionBuild
+      && productionBuild < e2ePrebuild && e2ePrebuild < e2eGate
+      && e2eGate < debugBuild && debugBuild < releaseBuild
+      && releaseBuild < rpathCleanup[0] && normalizationOrdered
+      && rpathCleanup.at(-1)! < appGate && appGate < install,
+    "iOS must gate production pods, final E2E pods, and both built apps before simulator install",
+  );
+  assert.doesNotMatch(
+    lines.filter((line) => line.includes("ios-prebuilt-gate.mjs")).join("\n"),
+    /\|\|\s*true|continue-on-error/,
+    "iOS prebuilt gates must fail closed",
+  );
+  const gatedSection = lines.slice(productionPrebuild, install + 1).join("\n");
+  assert.doesNotMatch(
+    gatedSection,
+    /(?:^|\n)(?:if\s+false\b|false\s*&&|set\s+\+e\b|exit\s+0\b)|\|\|\s*true|continue-on-error/,
+    "iOS prebuilt gates must not be hidden in a dead branch or bypassed",
+  );
+  const downstream = script.slice(script.indexOf('xcrun simctl install "$simulator_udid" "$app_path"'));
+  const preinstall = script.slice(0, script.indexOf('xcrun simctl install "$simulator_udid" "$app_path"') + 'xcrun simctl install "$simulator_udid" "$app_path"'.length);
+  assert.equal(
+    createHash("sha256").update(preinstall).digest("hex"),
+    exactIosPreinstallSha256,
+    "iOS preinstall gate bytes must remain exact and active",
+  );
+  assert.equal(
+    createHash("sha256").update(downstream).digest("hex"),
+    exactIosDownstreamSha256,
+    "iOS install, launch, readiness, smoke, persistence, and profile bytes must remain exact",
+  );
 }
 
 function assertExactPinnedSimulatorOpen(script: string): void {
@@ -1668,6 +1823,7 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
   assertExactReadinessCommand(smokeRun, "iOS");
   assertExactIosUrlHandoff(smokeRun);
   assertIosFailureDiagnosticsPolicy(smokeRun, parsedWorkflow);
+  assertIosPrebuiltGatePolicy(smokeRun);
   assertExactPinnedSimulatorOpen(smokeRun);
   ordered(workflow,
     "simulator_udid=$(xcrun simctl list devices available -j",
@@ -1677,10 +1833,13 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
     "prebuild:ios:production",
     "cp ios/ForMobile/Info.plist .artifacts/native/ios/production/Info.plist",
     "--flavor production --input .artifacts/native/ios/production/Info.plist",
+    exactIosProductionPodGate,
     'destination "platform=iOS Simulator,id=$simulator_udid"',
     "prebuild:ios:e2e",
     "cp ios/ForMobile/Info.plist .artifacts/native/ios/e2e/Info.plist",
     "--flavor e2e --input .artifacts/native/ios/e2e/Info.plist",
+    exactIosE2ePodGate,
+    exactIosAppGate,
     'simctl install "$simulator_udid"',
     exactHeadlessMetroCommands.iOS,
     exactDevClientUrlAssignment,
@@ -1698,6 +1857,73 @@ test("iOS opens on the exact UDID, requires readiness, then records unchanged sm
   assert.doesNotMatch(workflow, /simctl boot[^\n]*\|\| true/);
   assert.doesNotMatch(workflow, /simctl launch/);
   assert.match(workflow, /\.artifacts\/launch\/\*\*/);
+});
+
+test("iOS prebuilt pod and app gates reject hostile workflow mutations", async () => {
+  const source = await readFile(".github/workflows/e2e-ios.yml", "utf8");
+  const workflow = parseWorkflow(source, ".github/workflows/e2e-ios.yml");
+  const steps = requiredSteps(requiredJob(workflow, "ios"), "ios");
+  const smoke = steps.find((step) => step.name === "Serial production and E2E builds, install, and smoke");
+  assert.ok(smoke && typeof smoke.run === "string");
+  const mutations = [
+    smoke.run.replace("RCT_USE_RN_DEP=1 ", ""),
+    smoke.run.replace(exactIosE2ePodGate, "(cd ios && pod install)"),
+    smoke.run.replace(exactIosE2ePodGate, "bundle exec /usr/local/bin/pod install"),
+    smoke.run.replace(exactIosE2ePodGate, "/usr/local/bin/pod " + "\\\n" + "  install"),
+    smoke.run.replace(exactIosE2ePodGate, "bash -lc 'pod install'"),
+    smoke.run.replace(exactIosE2ePodGate, `if false; then\n${exactIosE2ePodGate}\nfi`),
+    smoke.run.replace("npm run prebuild:ios:production", "if false; then\nnpm run prebuild:ios:production").replace('xcrun simctl install "$simulator_udid" "$app_path"', 'xcrun simctl install "$simulator_udid" "$app_path"\nfi'),
+    smoke.run.replace(`${exactIosProductionPodGate}\n`, `${exactIosE2ePodGate}\n`),
+    smoke.run.replace(`${exactIosAppGate}\nxcrun simctl install`, `xcrun simctl install\n${exactIosAppGate}`),
+    smoke.run.replace(exactIosAppGate, `${exactIosAppGate} || true`),
+    smoke.run.replace(`${exactIosRpathCleanup[0]}\n`, ""),
+    smoke.run.replace(`${exactIosRpathCleanup[0]}\n`, `${exactIosRpathCleanup[0]}\n${exactIosRpathCleanup[0]}\n`),
+    smoke.run.replace(`${exactIosRpathCleanup[2]}\n${exactIosRpathCleanup[3]}\n`, `${exactIosRpathCleanup[3]}\n${exactIosRpathCleanup[2]}\n`),
+    smoke.run.replace("/Users/alanhughes/Work/expo/packages/precompile/.build/expo-file-system/output/debug/frameworks/ExpoFileSystem/Build/Products/Debug-iphonesimulator/PackageFrameworks", "/Users/alanhughes/Work/expo/packages/precompile/.build/expo-file-system/output/release/frameworks/ExpoFileSystem/Build/Products/Release-iphonesimulator/PackageFrameworks"),
+    smoke.run.replace('"$app_path/Frameworks/ExpoFont.framework/ExpoFont"', '"$app_path/Frameworks/ExpoModulesJSI.framework/ExpoModulesJSI"'),
+    smoke.run.replace(exactIosRpathCleanup[4], '/usr/bin/install_name_tool -delete_rpath "/Users/alanhughes/Work/expo/packages/precompile/.build/*/output/debug/frameworks/*/Build/Products/Debug-iphonesimulator/PackageFrameworks" "$app_path/Frameworks/ExpoModulesCore.framework/ExpoModulesCore" >/dev/null 2>&1'),
+    smoke.run.replace(exactIosRpathCleanup[5], 'find "$app_path/Frameworks" -type f -perm +111 -exec /usr/bin/install_name_tool -delete_rpath "$producer_path" {} \\;'),
+    smoke.run.replace(exactIosRpathCleanup[6], `${exactIosRpathCleanup[6]} || true`),
+    smoke.run.replace(`${exactIosRpathCleanup[17]}\n${exactIosAppGate}`, `${exactIosAppGate}\n${exactIosRpathCleanup[17]}`),
+    smoke.run.replace(`${exactIosRpathCleanup[8]}\n`, ""),
+    smoke.run.replace(`${exactIosRpathCleanup[14]}\n`, ""),
+    smoke.run.replace(`${exactIosProductionPodGate}\n`, ""),
+    smoke.run.replace("maestro --device", "maestro  --device"),
+  ];
+  for (const mutation of mutations) {
+    assert.notEqual(mutation, smoke.run);
+    assert.throws(
+      () => assertIosPrebuiltGatePolicy(mutation),
+      /exact paired prebuilt gate|must not bypass|verify both built app bundles|normalize, re-sign, and strictly verify|must gate production pods|must fail closed|dead branch|bytes must remain exact|bytes must remain exact and active/,
+    );
+  }
+
+  for (const hostileRun of [
+    "env FOO=1 bundle exec /usr/local/bin/pod install",
+    "/usr/local/bin/pod " + "\\\n" + "  install",
+    'pod_command=pod\n"$pod_command" install',
+    "npm run ios",
+    "cp .artifacts/forged-report.json .artifacts/launch/native/ios-apps/e2e/report.json",
+  ]) {
+    const extraStep = structuredClone(workflow);
+    const extraSteps = requiredSteps(requiredJob(extraStep, "ios"), "ios");
+    const extraSmokeIndex = extraSteps.findIndex((step) => step.name === "Serial production and E2E builds, install, and smoke");
+    extraSteps.splice(extraSmokeIndex + 1, 0, { name: "Hostile post-smoke mutation", run: hostileRun });
+    assert.throws(
+      () => assertChildWorkflowPolicy(extraStep, "ios"),
+      /pod install|step inventory|immediately follow/,
+    );
+  }
+
+  const existingStepInjection = structuredClone(workflow);
+  const resolveConfig = requiredSteps(requiredJob(existingStepInjection, "ios"), "ios")
+    .find((step) => step.name === "Resolve config reports");
+  assert.ok(resolveConfig && typeof resolveConfig.run === "string");
+  resolveConfig.run += '\npod_command=pod\n"$pod_command" install\n';
+  assert.throws(
+    () => assertChildWorkflowPolicy(existingStepInjection, "ios"),
+    /run step bytes must remain exact/,
+  );
 });
 
 test("iOS confirmation is exact while readiness and smoke retain their required behavior", async () => {
@@ -2253,8 +2479,21 @@ printf '%s\n' group-teardown-pass
 test("native workflows enforce the parsed Intel runner, exact SHA boundaries, and frozen tool preflight", async () => {
   const workflows = await loadNativeWorkflows();
   assertNativeWorkflowPolicy(workflows);
+  const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+  assertExactIosPrebuildScripts(packageJson.scripts);
   const syntax = spawnSync("bash", ["-n"], { encoding: "utf8", input: exactIosPreflightScript });
   assert.equal(syntax.status, 0, syntax.stderr);
+});
+
+test("iOS no-install prebuild commands reject direct and indirect install drift", async () => {
+  const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+  for (const [name, hostile] of [
+    ["prebuild:ios:production", "EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=production expo prebuild --clean --platform ios"],
+    ["prebuild:ios:e2e", "EXPO_PUBLIC_FOR_MOBILE_BUILD_FLAVOR=e2e expo prebuild --clean --platform ios && npm run ios"],
+  ] as const) {
+    const scripts = { ...packageJson.scripts, [name]: hostile };
+    assert.throws(() => assertExactIosPrebuildScripts(scripts), /exact no-install prebuild command/);
+  }
 });
 
 test("parsed workflow policy rejects hostile structural counterexamples", async () => {
