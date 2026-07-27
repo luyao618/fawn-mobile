@@ -645,7 +645,7 @@ test("blocks an instant-domain save when the current-zone recheck becomes invali
   }
 });
 
-test("zone retry repeats only zone resolution and re-enters the requested state when valid", async () => {
+test("zone retry rejects a substituted list fact and keeps the blocked feeding list-load state", () => {
   const exactRows = Object.freeze([records.feeding]);
   const exactFact = Object.freeze({ domain: "feeding" as const, rows: exactRows, presentationZone: KATHMANDU });
   const listReadySource = Object.freeze({ tag: "list.ready.rows" as const, fact: exactFact });
@@ -674,251 +674,255 @@ test("zone retry repeats only zone resolution and re-enters the requested state 
     blockedState,
     trackerScreenState.listStartedAction(blockedState, substitutedNext),
   )).toBe(blockedState);
+});
 
-  for (const item of instantCases) {
-    for (const entry of ["list", "create", "get"] as const) {
-      const destinationList = deferred<readonly TrackerRecordByDomain[typeof item.domain][]>();
-      const destinationGet = deferred<TrackerRecordByDomain[typeof item.domain] | null>();
-      let destinationListCalls = 0;
-      const list = jest.fn((domain: TrackerDomain) => {
-        if (domain === "growth") return Promise.resolve([]);
-        if (entry === "list") return ++destinationListCalls === 1 ? Promise.resolve([]) : destinationList.promise;
-        return Promise.resolve(entry === "get" ? [item.record] : []);
-      });
-      const getById = jest.fn(() => destinationGet.promise);
-      const service = serviceMock({ list: list as ManualTrackerServicePort["list"], getById: getById as ManualTrackerServicePort["getById"] });
-      const resolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
-      const focus = recordFocusTargets();
-      const reducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
-      const view = renderTracker(service);
+test.each(instantCases)("zone retry repeats only zone resolution and re-enters the requested $domain list/create/get entry when valid", async (item) => {
+  for (const entry of ["list", "create", "get"] as const) {
+    const destinationList = deferred<readonly TrackerRecordByDomain[typeof item.domain][]>();
+    const destinationGet = deferred<TrackerRecordByDomain[typeof item.domain] | null>();
+    let destinationListCalls = 0;
+    const list = jest.fn((domain: TrackerDomain) => {
+      if (domain === "growth") return Promise.resolve([]);
+      if (entry === "list") return ++destinationListCalls === 1 ? Promise.resolve([]) : destinationList.promise;
+      return Promise.resolve(entry === "get" ? [item.record] : []);
+    });
+    const getById = jest.fn(() => destinationGet.promise);
+    const service = serviceMock({ list: list as ManualTrackerServicePort["list"], getById: getById as ManualTrackerServicePort["getById"] });
+    const resolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
+    const focus = recordFocusTargets();
+    const reducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
+    const view = renderTracker(service);
+    await screen.findByText("还没有生长记录");
+
+    if (entry === "list") {
+      fireEvent.press(screen.getByRole("tab", { name: item.label }));
+      await screen.findByText(`还没有${item.label}记录`);
+      fireEvent.press(screen.getByRole("tab", { name: "生长" }));
       await screen.findByText("还没有生长记录");
-
-      if (entry === "list") {
-        fireEvent.press(screen.getByRole("tab", { name: item.label }));
-        await screen.findByText(`还没有${item.label}记录`);
-        fireEvent.press(screen.getByRole("tab", { name: "生长" }));
-        await screen.findByText("还没有生长记录");
-        resolver.mockClear();
-        resolver.mockReturnValue(INVALID);
-        fireEvent.press(screen.getByRole("tab", { name: item.label }));
-      } else {
-        fireEvent.press(screen.getByRole("tab", { name: item.label }));
-        if (entry === "create") await screen.findByText(`还没有${item.label}记录`);
-        else await screen.findByRole("button", { name: new RegExp(`${item.label}记录，`) });
-        resolver.mockReturnValue(INVALID);
-        fireEvent.press(entry === "create"
-          ? screen.getByRole("button", { name: `新增${item.label}记录` })
-          : screen.getByRole("button", { name: new RegExp(`${item.label}记录，`) }));
-      }
-
-      const blocked = latestReducerState(reducer);
-      expect(blocked.tag).toBe("zone.blocked.entry");
-      if (blocked.tag !== "zone.blocked.entry") throw new Error("expected blocked entry");
-      expect(blocked.domain).toBe(item.domain);
-      expect(blocked.intent.kind).toBe(entry === "list" ? "list-load" : entry);
-      expect(blocked.intent.fact.domain).toBe(item.domain);
-      let frozenListIntentFact: ListFact<typeof item.domain> | undefined;
-      if (entry === "list") {
-        if (blocked.intent.kind !== "list-load") throw new Error("expected blocked list-load intent");
-        frozenListIntentFact = blocked.intent.fact;
-        expect(Object.isFrozen(frozenListIntentFact)).toBe(true);
-        expect(frozenListIntentFact.presentationZone).toBe("");
-        expect(frozenListIntentFact.presentationZone).not.toBe("UTC");
-      }
-      if (entry === "get" && blocked.intent.kind === "get") expect(blocked.intent.id).toBe(item.record.id);
-      expect(screen.getByText(INVALID_COPY).props).toMatchObject({ accessibilityRole: "alert", accessibilityLiveRegion: "assertive" });
-      expect(screen.getAllByRole("button").filter((button) => button.props.accessibilityState?.disabled !== true).map((button) => button.props.accessibilityLabel)).toEqual(["重新读取本机时区"]);
-      expect(focusedLabel(focus)).toBe("本机时区不可用");
-
-      const beforeRetry = serviceCounts(service);
-      const firstRetry = view.UNSAFE_getByType(PrimaryAction).props.onPress as () => void;
-      fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
-      expect(resolver).toHaveBeenCalledTimes(entry === "list" ? 2 : 3);
-      expect(latestReducerState(reducer)).toBe(blocked);
-      expectServiceDelta(service, beforeRetry, {});
-      expect(focusedLabel(focus)).toBe("重新读取本机时区");
-      const secondRetry = view.UNSAFE_getByType(PrimaryAction).props.onPress as () => void;
-
-      resolver.mockReturnValue({ status: "available", zone: entry === "list" ? "UTC" : KATHMANDU });
-      const beforeSuccess = serviceCounts(service);
-      const focusCountBeforeSuccess = focus.mock.calls.length;
-      fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
-      expect(resolver).toHaveBeenCalledTimes(entry === "list" ? 3 : 4);
-      if (entry === "list") {
-        const loading = latestReducerState(reducer);
-        expect(loading.tag).toBe("list.loading");
-        if (loading.tag !== "list.loading") throw new Error("expected ordinary list loading");
-        expect(loading.source).toBe("ordinary");
-        if (loading.source !== "ordinary") throw new Error("expected ordinary list loading");
-        expect(loading.prior).toBe(frozenListIntentFact);
-        expectServiceDelta(service, beforeSuccess, { list: 1 });
-        expect(list.mock.calls.at(-1)).toEqual([item.domain, 100]);
-        expect(screen.getByText(`正在读取${item.label}记录…`).props.accessibilityLiveRegion).toBe("polite");
-        expect(focus).toHaveBeenCalledTimes(focusCountBeforeSuccess);
-        if (item.domain === "diaper") {
-          await act(async () => destinationList.reject(new Error("offline")));
-          await screen.findByText(`暂时无法读取${item.label}记录。本机数据没有更改。`);
-        } else if (item.domain === "feeding") {
-          const resolvedRows = Object.freeze([item.record]);
-          await act(async () => destinationList.resolve(resolvedRows));
-          await screen.findByRole("button", { name: new RegExp(`${item.label}记录，`) });
-          const settled = latestReducerState(reducer);
-          expect(settled.tag).toBe("list.ready.rows");
-          if (settled.tag !== "list.ready.rows") throw new Error("expected settled feeding rows");
-          expect(settled.fact.presentationZone).toBe("UTC");
-          expect(settled.fact.rows).toBe(resolvedRows);
-        } else {
-          const resolvedEmptyRows: readonly TrackerRecordByDomain[typeof item.domain][] = Object.freeze([]);
-          await act(async () => destinationList.resolve(resolvedEmptyRows));
-          await screen.findByText(`还没有${item.label}记录`);
-          const settled = latestReducerState(reducer);
-          expect(settled.tag).toBe("list.ready.empty");
-          if (settled.tag !== "list.ready.empty") throw new Error("expected settled sleep empty list");
-          expect(settled.fact.presentationZone).toBe("UTC");
-          expect(settled.fact.rows).toBe(resolvedEmptyRows);
-        }
-        await waitFor(() => expect(focusedLabel(focus)).toBe(`${item.label}记录`));
-        expectServiceDelta(service, beforeSuccess, { list: 1 });
-      } else if (entry === "get") {
-        expectServiceDelta(service, beforeSuccess, { getById: 1 });
-        expect(getById.mock.calls.at(-1)).toEqual([item.domain, item.record.id]);
-        expect(screen.getByText(`正在读取这条${item.label}记录…`).props.accessibilityLiveRegion).toBe("polite");
-        expect(focus).toHaveBeenCalledTimes(focusCountBeforeSuccess);
-        if (item.domain === "sleep") {
-          await act(async () => destinationGet.reject(new Error("offline")));
-          await screen.findByText("暂时无法读取这条记录。本机数据没有更改。");
-        } else if (item.domain === "diaper") {
-          await act(async () => destinationGet.resolve(records.feeding));
-          await screen.findByText("暂时无法读取这条记录。本机数据没有更改。");
-        } else {
-          await act(async () => destinationGet.resolve(item.record));
-        }
-        await screen.findByRole("header", { name: `编辑${item.label}记录` });
-        await waitFor(() => expect(focusedLabel(focus)).toBe(`编辑${item.label}记录`));
-        expect(latestFocusSnapshot(focus)?.current).not.toBeNull();
-      } else {
-        expectServiceDelta(service, beforeSuccess, {});
-        await screen.findByRole("header", { name: `新增${item.label}记录` });
-        await waitFor(() => expect(focusedLabel(focus)).toBe(`新增${item.label}记录`));
-      }
-
-      const afterSuccess = latestReducerState(reducer);
-      const countsAfterSuccess = serviceCounts(service);
-      const resolverAfterSuccess = resolver.mock.calls.length;
-      const focusAfterSuccess = focus.mock.calls.length;
-      act(() => { firstRetry(); secondRetry(); });
-      expect(resolver).toHaveBeenCalledTimes(resolverAfterSuccess);
-      expect(serviceCounts(service)).toEqual(countsAfterSuccess);
-      expect(latestReducerState(reducer)).toBe(afterSuccess);
-      expect(focus).toHaveBeenCalledTimes(focusAfterSuccess);
-      view.unmount();
-      jest.restoreAllMocks();
-    }
-
-    for (const mode of ["create", "edit"] as const) {
-      const create = jest.fn(() => new Promise(() => undefined));
-      const update = jest.fn(() => new Promise(() => undefined));
-      const service = serviceMock({
-        list: jest.fn(async (domain: TrackerDomain) => domain === item.domain && mode === "edit" ? [item.record] : []) as ManualTrackerServicePort["list"],
-        getById: jest.fn(async () => item.record) as ManualTrackerServicePort["getById"],
-        create: create as ManualTrackerServicePort["create"],
-        update: update as ManualTrackerServicePort["update"],
-      });
-      const resolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
-      const focus = recordFocusTargets();
-      const reducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
-      const view = renderTracker(service);
-      await enterDomain(item.label);
-      fireEvent.press(mode === "create"
-        ? screen.getByRole("button", { name: `新增${item.label}记录` })
-        : screen.getByRole("button", { name: new RegExp(`${item.label}记录，`) }));
-      await screen.findByRole("header", { name: `${mode === "create" ? "新增" : "编辑"}${item.label}记录` });
-      item.fill();
-      const editable = latestReducerState(reducer);
-      expect(editable.tag).toBe(mode === "create" ? "create.editing" : "edit.editing");
-      if (editable.tag !== "create.editing" && editable.tag !== "edit.editing") throw new Error("expected editor");
-
+      resolver.mockClear();
       resolver.mockReturnValue(INVALID);
-      const beforeInvalidSave = serviceCounts(service);
-      fireEvent.press(screen.getByRole("button", { name: mode === "create" ? `保存${item.label}记录` : "保存修改" }));
-      const blocked = latestReducerState(reducer);
-      expect(blocked.tag).toBe("zone.blocked.save");
-      if (blocked.tag !== "zone.blocked.save") throw new Error("expected blocked save");
-      expect(blocked.source).toBe(editable);
-      expectSameEditorIdentities(editable.editor, blocked.source.editor);
-      expectServiceDelta(service, beforeInvalidSave, {});
-      expect(screen.getByText(INVALID_COPY).props.accessibilityLiveRegion).toBe("assertive");
-      expect(screen.getAllByRole("button").filter((button) => button.props.accessibilityState?.disabled !== true).map((button) => button.props.accessibilityLabel)).toEqual(["重新读取本机时区"]);
-      const firstRetry = view.UNSAFE_getByType(PrimaryAction).props.onPress as () => void;
-      fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
-      expect(latestReducerState(reducer)).toBe(blocked);
-      expect(focusedLabel(focus)).toBe("重新读取本机时区");
-      const secondRetry = view.UNSAFE_getByType(PrimaryAction).props.onPress as () => void;
-
-      resolver.mockReturnValue({ status: "available", zone: KATHMANDU });
-      const beforeValidRetry = serviceCounts(service);
-      fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
-      expectServiceDelta(service, beforeValidRetry, {});
-      const restored = latestReducerState(reducer);
-      expect(restored).toBe(editable);
-      if (restored.tag !== "create.editing" && restored.tag !== "edit.editing") throw new Error("expected restored editor");
-      expectSameEditorIdentities(editable.editor, restored.editor);
-      await waitFor(() => expect(focusedLabel(focus)).toBe(mode === "create" ? `保存${item.label}记录` : "保存修改"));
-      expect(create).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-
-      const beforeExplicitSave = serviceCounts(service);
-      const zoneBeforeExplicitSave = resolver.mock.calls.length;
-      fireEvent.press(screen.getByRole("button", { name: mode === "create" ? `保存${item.label}记录` : "保存修改" }));
-      expect(resolver.mock.calls.length).toBe(zoneBeforeExplicitSave + 1);
-      expectServiceDelta(service, beforeExplicitSave, mode === "create" ? { create: 1 } : { update: 1 });
-      if (mode === "create") expect(create.mock.calls).toEqual([[item.domain, { ...item.input, sourceMessageId: null }]]);
-      else expect(update.mock.calls).toEqual([[item.domain, item.record.id, item.input, item.record.updatedAt]]);
-      const afterSubmit = latestReducerState(reducer);
-      const countsAfterSubmit = serviceCounts(service);
-      const resolverAfterSubmit = resolver.mock.calls.length;
-      const focusAfterSubmit = focus.mock.calls.length;
-      act(() => { firstRetry(); secondRetry(); });
-      expect(resolver).toHaveBeenCalledTimes(resolverAfterSubmit);
-      expect(serviceCounts(service)).toEqual(countsAfterSubmit);
-      expect(latestReducerState(reducer)).toBe(afterSubmit);
-      expect(focus).toHaveBeenCalledTimes(focusAfterSubmit);
-      view.unmount();
-      jest.restoreAllMocks();
-
-      const changedService = serviceMock({
-        list: jest.fn(async (domain: TrackerDomain) => domain === item.domain && mode === "edit" ? [item.record] : []) as ManualTrackerServicePort["list"],
-        getById: jest.fn(async () => item.record) as ManualTrackerServicePort["getById"],
-      });
-      const changedResolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
-      const changedFocus = recordFocusTargets();
-      const changedReducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
-      const changedView = renderTracker(changedService);
-      await enterDomain(item.label);
-      fireEvent.press(mode === "create"
+      fireEvent.press(screen.getByRole("tab", { name: item.label }));
+    } else {
+      fireEvent.press(screen.getByRole("tab", { name: item.label }));
+      if (entry === "create") await screen.findByText(`还没有${item.label}记录`);
+      else await screen.findByRole("button", { name: new RegExp(`${item.label}记录，`) });
+      resolver.mockReturnValue(INVALID);
+      fireEvent.press(entry === "create"
         ? screen.getByRole("button", { name: `新增${item.label}记录` })
         : screen.getByRole("button", { name: new RegExp(`${item.label}记录，`) }));
-      await screen.findByRole("header", { name: `${mode === "create" ? "新增" : "编辑"}${item.label}记录` });
-      item.fill();
-      changedResolver.mockReturnValue(INVALID);
-      fireEvent.press(screen.getByRole("button", { name: mode === "create" ? `保存${item.label}记录` : "保存修改" }));
-      const changedBlocked = latestReducerState(changedReducer);
-      if (changedBlocked.tag !== "zone.blocked.save") throw new Error("expected changed blocked save");
-      const changedBefore = serviceCounts(changedService);
-      changedResolver.mockReturnValue({ status: "available", zone: "UTC" });
-      fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
-      const changedRestored = latestReducerState(changedReducer);
-      if (changedRestored.tag !== "create.editing" && changedRestored.tag !== "edit.editing") throw new Error("expected changed editor");
-      expectSameEditorIdentities(changedBlocked.source.editor, changedRestored.editor);
-      expect(screen.getByText(CHANGED_COPY).props).toMatchObject({ accessibilityRole: "alert", accessibilityLiveRegion: "assertive" });
-      expect(screen.getByLabelText(item.timeLabel)).toHaveProp("value", "08:10");
-      expectServiceDelta(changedService, changedBefore, {});
-      await waitFor(() => expect(focusedLabel(changedFocus)).toBe(mode === "create" ? `保存${item.label}记录` : "保存修改"));
-      changedView.unmount();
-      jest.restoreAllMocks();
     }
-  }
 
+    const blocked = latestReducerState(reducer);
+    expect(blocked.tag).toBe("zone.blocked.entry");
+    if (blocked.tag !== "zone.blocked.entry") throw new Error("expected blocked entry");
+    expect(blocked.domain).toBe(item.domain);
+    expect(blocked.intent.kind).toBe(entry === "list" ? "list-load" : entry);
+    expect(blocked.intent.fact.domain).toBe(item.domain);
+    let frozenListIntentFact: ListFact<typeof item.domain> | undefined;
+    if (entry === "list") {
+      if (blocked.intent.kind !== "list-load") throw new Error("expected blocked list-load intent");
+      frozenListIntentFact = blocked.intent.fact;
+      expect(Object.isFrozen(frozenListIntentFact)).toBe(true);
+      expect(frozenListIntentFact.presentationZone).toBe("");
+      expect(frozenListIntentFact.presentationZone).not.toBe("UTC");
+    }
+    if (entry === "get" && blocked.intent.kind === "get") expect(blocked.intent.id).toBe(item.record.id);
+    expect(screen.getByText(INVALID_COPY).props).toMatchObject({ accessibilityRole: "alert", accessibilityLiveRegion: "assertive" });
+    expect(screen.getAllByRole("button").filter((button) => button.props.accessibilityState?.disabled !== true).map((button) => button.props.accessibilityLabel)).toEqual(["重新读取本机时区"]);
+    expect(focusedLabel(focus)).toBe("本机时区不可用");
+
+    const beforeRetry = serviceCounts(service);
+    const firstRetry = view.UNSAFE_getByType(PrimaryAction).props.onPress as () => void;
+    fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
+    expect(resolver).toHaveBeenCalledTimes(entry === "list" ? 2 : 3);
+    expect(latestReducerState(reducer)).toBe(blocked);
+    expectServiceDelta(service, beforeRetry, {});
+    expect(focusedLabel(focus)).toBe("重新读取本机时区");
+    const secondRetry = view.UNSAFE_getByType(PrimaryAction).props.onPress as () => void;
+
+    resolver.mockReturnValue({ status: "available", zone: entry === "list" ? "UTC" : KATHMANDU });
+    const beforeSuccess = serviceCounts(service);
+    const focusCountBeforeSuccess = focus.mock.calls.length;
+    fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
+    expect(resolver).toHaveBeenCalledTimes(entry === "list" ? 3 : 4);
+    if (entry === "list") {
+      const loading = latestReducerState(reducer);
+      expect(loading.tag).toBe("list.loading");
+      if (loading.tag !== "list.loading") throw new Error("expected ordinary list loading");
+      expect(loading.source).toBe("ordinary");
+      if (loading.source !== "ordinary") throw new Error("expected ordinary list loading");
+      expect(loading.prior).toBe(frozenListIntentFact);
+      expectServiceDelta(service, beforeSuccess, { list: 1 });
+      expect(list.mock.calls.at(-1)).toEqual([item.domain, 100]);
+      expect(screen.getByText(`正在读取${item.label}记录…`).props.accessibilityLiveRegion).toBe("polite");
+      expect(focus).toHaveBeenCalledTimes(focusCountBeforeSuccess);
+      if (item.domain === "diaper") {
+        await act(async () => destinationList.reject(new Error("offline")));
+        await screen.findByText(`暂时无法读取${item.label}记录。本机数据没有更改。`);
+      } else if (item.domain === "feeding") {
+        const resolvedRows = Object.freeze([item.record]);
+        await act(async () => destinationList.resolve(resolvedRows));
+        await screen.findByRole("button", { name: new RegExp(`${item.label}记录，`) });
+        const settled = latestReducerState(reducer);
+        expect(settled.tag).toBe("list.ready.rows");
+        if (settled.tag !== "list.ready.rows") throw new Error("expected settled feeding rows");
+        expect(settled.fact.presentationZone).toBe("UTC");
+        expect(settled.fact.rows).toBe(resolvedRows);
+      } else {
+        const resolvedEmptyRows: readonly TrackerRecordByDomain[typeof item.domain][] = Object.freeze([]);
+        await act(async () => destinationList.resolve(resolvedEmptyRows));
+        await screen.findByText(`还没有${item.label}记录`);
+        const settled = latestReducerState(reducer);
+        expect(settled.tag).toBe("list.ready.empty");
+        if (settled.tag !== "list.ready.empty") throw new Error("expected settled sleep empty list");
+        expect(settled.fact.presentationZone).toBe("UTC");
+        expect(settled.fact.rows).toBe(resolvedEmptyRows);
+      }
+      await waitFor(() => expect(focusedLabel(focus)).toBe(`${item.label}记录`));
+      expectServiceDelta(service, beforeSuccess, { list: 1 });
+    } else if (entry === "get") {
+      expectServiceDelta(service, beforeSuccess, { getById: 1 });
+      expect(getById.mock.calls.at(-1)).toEqual([item.domain, item.record.id]);
+      expect(screen.getByText(`正在读取这条${item.label}记录…`).props.accessibilityLiveRegion).toBe("polite");
+      expect(focus).toHaveBeenCalledTimes(focusCountBeforeSuccess);
+      if (item.domain === "sleep") {
+        await act(async () => destinationGet.reject(new Error("offline")));
+        await screen.findByText("暂时无法读取这条记录。本机数据没有更改。");
+      } else if (item.domain === "diaper") {
+        await act(async () => destinationGet.resolve(records.feeding));
+        await screen.findByText("暂时无法读取这条记录。本机数据没有更改。");
+      } else {
+        await act(async () => destinationGet.resolve(item.record));
+      }
+      await screen.findByRole("header", { name: `编辑${item.label}记录` });
+      await waitFor(() => expect(focusedLabel(focus)).toBe(`编辑${item.label}记录`));
+      expect(latestFocusSnapshot(focus)?.current).not.toBeNull();
+    } else {
+      expectServiceDelta(service, beforeSuccess, {});
+      await screen.findByRole("header", { name: `新增${item.label}记录` });
+      await waitFor(() => expect(focusedLabel(focus)).toBe(`新增${item.label}记录`));
+    }
+
+    const afterSuccess = latestReducerState(reducer);
+    const countsAfterSuccess = serviceCounts(service);
+    const resolverAfterSuccess = resolver.mock.calls.length;
+    const focusAfterSuccess = focus.mock.calls.length;
+    act(() => { firstRetry(); secondRetry(); });
+    expect(resolver).toHaveBeenCalledTimes(resolverAfterSuccess);
+    expect(serviceCounts(service)).toEqual(countsAfterSuccess);
+    expect(latestReducerState(reducer)).toBe(afterSuccess);
+    expect(focus).toHaveBeenCalledTimes(focusAfterSuccess);
+    view.unmount();
+    jest.restoreAllMocks();
+  }
+});
+
+test.each(instantCases)("zone retry repeats only zone resolution and restores the $domain create/edit editor when valid", async (item) => {
+  for (const mode of ["create", "edit"] as const) {
+    const create = jest.fn(() => new Promise(() => undefined));
+    const update = jest.fn(() => new Promise(() => undefined));
+    const service = serviceMock({
+      list: jest.fn(async (domain: TrackerDomain) => domain === item.domain && mode === "edit" ? [item.record] : []) as ManualTrackerServicePort["list"],
+      getById: jest.fn(async () => item.record) as ManualTrackerServicePort["getById"],
+      create: create as ManualTrackerServicePort["create"],
+      update: update as ManualTrackerServicePort["update"],
+    });
+    const resolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
+    const focus = recordFocusTargets();
+    const reducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
+    const view = renderTracker(service);
+    await enterDomain(item.label);
+    fireEvent.press(mode === "create"
+      ? screen.getByRole("button", { name: `新增${item.label}记录` })
+      : screen.getByRole("button", { name: new RegExp(`${item.label}记录，`) }));
+    await screen.findByRole("header", { name: `${mode === "create" ? "新增" : "编辑"}${item.label}记录` });
+    item.fill();
+    const editable = latestReducerState(reducer);
+    expect(editable.tag).toBe(mode === "create" ? "create.editing" : "edit.editing");
+    if (editable.tag !== "create.editing" && editable.tag !== "edit.editing") throw new Error("expected editor");
+
+    resolver.mockReturnValue(INVALID);
+    const beforeInvalidSave = serviceCounts(service);
+    fireEvent.press(screen.getByRole("button", { name: mode === "create" ? `保存${item.label}记录` : "保存修改" }));
+    const blocked = latestReducerState(reducer);
+    expect(blocked.tag).toBe("zone.blocked.save");
+    if (blocked.tag !== "zone.blocked.save") throw new Error("expected blocked save");
+    expect(blocked.source).toBe(editable);
+    expectSameEditorIdentities(editable.editor, blocked.source.editor);
+    expectServiceDelta(service, beforeInvalidSave, {});
+    expect(screen.getByText(INVALID_COPY).props.accessibilityLiveRegion).toBe("assertive");
+    expect(screen.getAllByRole("button").filter((button) => button.props.accessibilityState?.disabled !== true).map((button) => button.props.accessibilityLabel)).toEqual(["重新读取本机时区"]);
+    const firstRetry = view.UNSAFE_getByType(PrimaryAction).props.onPress as () => void;
+    fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
+    expect(latestReducerState(reducer)).toBe(blocked);
+    expect(focusedLabel(focus)).toBe("重新读取本机时区");
+    const secondRetry = view.UNSAFE_getByType(PrimaryAction).props.onPress as () => void;
+
+    resolver.mockReturnValue({ status: "available", zone: KATHMANDU });
+    const beforeValidRetry = serviceCounts(service);
+    fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
+    expectServiceDelta(service, beforeValidRetry, {});
+    const restored = latestReducerState(reducer);
+    expect(restored).toBe(editable);
+    if (restored.tag !== "create.editing" && restored.tag !== "edit.editing") throw new Error("expected restored editor");
+    expectSameEditorIdentities(editable.editor, restored.editor);
+    await waitFor(() => expect(focusedLabel(focus)).toBe(mode === "create" ? `保存${item.label}记录` : "保存修改"));
+    expect(create).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+
+    const beforeExplicitSave = serviceCounts(service);
+    const zoneBeforeExplicitSave = resolver.mock.calls.length;
+    fireEvent.press(screen.getByRole("button", { name: mode === "create" ? `保存${item.label}记录` : "保存修改" }));
+    expect(resolver.mock.calls.length).toBe(zoneBeforeExplicitSave + 1);
+    expectServiceDelta(service, beforeExplicitSave, mode === "create" ? { create: 1 } : { update: 1 });
+    if (mode === "create") expect(create.mock.calls).toEqual([[item.domain, { ...item.input, sourceMessageId: null }]]);
+    else expect(update.mock.calls).toEqual([[item.domain, item.record.id, item.input, item.record.updatedAt]]);
+    const afterSubmit = latestReducerState(reducer);
+    const countsAfterSubmit = serviceCounts(service);
+    const resolverAfterSubmit = resolver.mock.calls.length;
+    const focusAfterSubmit = focus.mock.calls.length;
+    act(() => { firstRetry(); secondRetry(); });
+    expect(resolver).toHaveBeenCalledTimes(resolverAfterSubmit);
+    expect(serviceCounts(service)).toEqual(countsAfterSubmit);
+    expect(latestReducerState(reducer)).toBe(afterSubmit);
+    expect(focus).toHaveBeenCalledTimes(focusAfterSubmit);
+    view.unmount();
+    jest.restoreAllMocks();
+
+    const changedService = serviceMock({
+      list: jest.fn(async (domain: TrackerDomain) => domain === item.domain && mode === "edit" ? [item.record] : []) as ManualTrackerServicePort["list"],
+      getById: jest.fn(async () => item.record) as ManualTrackerServicePort["getById"],
+    });
+    const changedResolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
+    const changedFocus = recordFocusTargets();
+    const changedReducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
+    const changedView = renderTracker(changedService);
+    await enterDomain(item.label);
+    fireEvent.press(mode === "create"
+      ? screen.getByRole("button", { name: `新增${item.label}记录` })
+      : screen.getByRole("button", { name: new RegExp(`${item.label}记录，`) }));
+    await screen.findByRole("header", { name: `${mode === "create" ? "新增" : "编辑"}${item.label}记录` });
+    item.fill();
+    changedResolver.mockReturnValue(INVALID);
+    fireEvent.press(screen.getByRole("button", { name: mode === "create" ? `保存${item.label}记录` : "保存修改" }));
+    const changedBlocked = latestReducerState(changedReducer);
+    if (changedBlocked.tag !== "zone.blocked.save") throw new Error("expected changed blocked save");
+    const changedBefore = serviceCounts(changedService);
+    changedResolver.mockReturnValue({ status: "available", zone: "UTC" });
+    fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
+    const changedRestored = latestReducerState(changedReducer);
+    if (changedRestored.tag !== "create.editing" && changedRestored.tag !== "edit.editing") throw new Error("expected changed editor");
+    expectSameEditorIdentities(changedBlocked.source.editor, changedRestored.editor);
+    expect(screen.getByText(CHANGED_COPY).props).toMatchObject({ accessibilityRole: "alert", accessibilityLiveRegion: "assertive" });
+    expect(screen.getByLabelText(item.timeLabel)).toHaveProp("value", "08:10");
+    expectServiceDelta(changedService, changedBefore, {});
+    await waitFor(() => expect(focusedLabel(changedFocus)).toBe(mode === "create" ? `保存${item.label}记录` : "保存修改"));
+    changedView.unmount();
+    jest.restoreAllMocks();
+  }
+});
+
+test("zone retry repeats only zone resolution and restores the discarded feeding list when valid", async () => {
   const restoreList = deferred<readonly TrackerRecordByDomain["feeding"][]>();
   let feedingListCalls = 0;
   const restoreService = serviceMock({
@@ -969,98 +973,96 @@ test("zone retry repeats only zone resolution and re-enters the requested state 
   expect(latestReducerState(restoreReducer)).toBe(restoredState);
   expect(restoreFocus).toHaveBeenCalledTimes(restoredFocusCount);
   restoreView.unmount();
+});
 
-  for (const currentZone of [INVALID, { status: "available" as const, zone: "UTC" }] as const) {
-    jest.restoreAllMocks();
-    const missingGet = deferred<TrackerRecordByDomain["feeding"] | null>();
-    const fallbackList = deferred<readonly TrackerRecordByDomain["feeding"][]>();
-    let feedingLists = 0;
-    const service = serviceMock({
-      list: jest.fn((domain: TrackerDomain) => domain === "growth"
-        ? Promise.resolve([])
-        : ++feedingLists === 1 ? Promise.resolve([records.feeding]) : fallbackList.promise) as ManualTrackerServicePort["list"],
-      getById: jest.fn(() => missingGet.promise) as ManualTrackerServicePort["getById"],
-    });
-    const resolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
-    const reducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
-    const view = renderTracker(service);
-    await enterDomain("喂养");
-    fireEvent.press(screen.getByRole("button", { name: /喂养记录，/ }));
-    resolver.mockReturnValue(currentZone);
-    const beforeMissing = serviceCounts(service);
-    await act(async () => missingGet.resolve(null));
-    if (currentZone.status === "unavailable") {
-      const blocked = latestReducerState(reducer);
-      if (blocked.tag !== "zone.blocked.entry" || blocked.intent.kind !== "list-load") throw new Error("expected missing-record list block");
-      expect(blocked.intent.notice).toBe("这条记录已不存在，列表已重新读取。");
-      expectServiceDelta(service, beforeMissing, {});
-      expect(screen.getByText(INVALID_COPY)).toBeTruthy();
-      resolver.mockReturnValue({ status: "available", zone: KATHMANDU });
-      fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
-      expectServiceDelta(service, beforeMissing, { list: 1 });
-      const loading = latestReducerState(reducer);
-      if (loading.tag !== "list.loading" || loading.source !== "ordinary") throw new Error("expected retried missing-record reload");
-      expect(loading.prior.presentationZone).toBe(KATHMANDU);
-      await act(async () => fallbackList.resolve([]));
-      await screen.findByText("还没有喂养记录");
-    } else {
-      expectServiceDelta(service, beforeMissing, { list: 1 });
-      const loading = latestReducerState(reducer);
-      if (loading.tag !== "list.loading" || loading.source !== "ordinary") throw new Error("expected missing-record reload");
-      expect(loading.prior.presentationZone).toBe("UTC");
-      expect(loading.notice).toBe("这条记录已不存在，列表已重新读取。");
-      await act(async () => fallbackList.resolve([]));
-      await screen.findByText("还没有喂养记录");
-    }
-    view.unmount();
-  }
-
-  for (const destination of ["reload-list", "reload-record"] as const) {
-    jest.restoreAllMocks();
-    const service = serviceMock({
-      list: jest.fn(async (domain: TrackerDomain) => domain === "feeding" ? [records.feeding] : []) as ManualTrackerServicePort["list"],
-      getById: jest.fn(async () => records.feeding) as ManualTrackerServicePort["getById"],
-      update: jest.fn(async () => { throw new ManualTrackerConflictError("stale_write"); }) as ManualTrackerServicePort["update"],
-    });
-    const resolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
-    const reducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
-    const view = renderTracker(service);
-    await enterDomain("喂养");
-    fireEvent.press(screen.getByRole("button", { name: /喂养记录，/ }));
-    await screen.findByRole("header", { name: "编辑喂养记录" });
-    fireEvent.changeText(screen.getByLabelText("备注"), "dirty conflict");
-    fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
-    await screen.findByText("这条记录已在其他位置更新。为避免覆盖，请重新读取后再修改。");
-    const initiate = () => fireEvent.press(screen.getByRole("button", { name: destination === "reload-list" ? "返回列表" : "重新读取记录" }));
-    initiate();
-    await screen.findByRole("header", { name: "放弃未保存的更改？" });
-    const accept = screen.getByRole("button", { name: "放弃更改" });
-    const staleAccept = [accept.props.onPress, accept.parent?.props.onPress, accept.parent?.parent?.props.onPress]
-      .find((candidate): candidate is () => void => typeof candidate === "function");
-    if (staleAccept === undefined) throw new Error("expected conflict discard callback");
-    fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
-    const cancelled = latestReducerState(reducer);
-    const cancelledZoneReads = resolver.mock.calls.length;
-    act(() => staleAccept());
-    expect(latestReducerState(reducer)).toBe(cancelled);
-    expect(resolver).toHaveBeenCalledTimes(cancelledZoneReads);
-
-    initiate();
-    resolver.mockReturnValue(INVALID);
-    const beforeAccept = serviceCounts(service);
-    fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+test.each([INVALID, { status: "available" as const, zone: "UTC" }] as const)("zone retry reloads the feeding list after a missing record when the current zone is $status", async (currentZone) => {
+  const missingGet = deferred<TrackerRecordByDomain["feeding"] | null>();
+  const fallbackList = deferred<readonly TrackerRecordByDomain["feeding"][]>();
+  let feedingLists = 0;
+  const service = serviceMock({
+    list: jest.fn((domain: TrackerDomain) => domain === "growth"
+      ? Promise.resolve([])
+      : ++feedingLists === 1 ? Promise.resolve([records.feeding]) : fallbackList.promise) as ManualTrackerServicePort["list"],
+    getById: jest.fn(() => missingGet.promise) as ManualTrackerServicePort["getById"],
+  });
+  const resolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
+  const reducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
+  const view = renderTracker(service);
+  await enterDomain("喂养");
+  fireEvent.press(screen.getByRole("button", { name: /喂养记录，/ }));
+  resolver.mockReturnValue(currentZone);
+  const beforeMissing = serviceCounts(service);
+  await act(async () => missingGet.resolve(null));
+  if (currentZone.status === "unavailable") {
     const blocked = latestReducerState(reducer);
-    if (blocked.tag !== "zone.blocked.entry") throw new Error("expected conflict zone block");
-    expect(blocked.intent.kind).toBe(destination === "reload-list" ? "list-load" : "get");
-    expectServiceDelta(service, beforeAccept, {});
-    const blockedZoneReads = resolver.mock.calls.length;
-    act(() => staleAccept());
-    expect(latestReducerState(reducer)).toBe(blocked);
-    expect(resolver).toHaveBeenCalledTimes(blockedZoneReads);
+    if (blocked.tag !== "zone.blocked.entry" || blocked.intent.kind !== "list-load") throw new Error("expected missing-record list block");
+    expect(blocked.intent.notice).toBe("这条记录已不存在，列表已重新读取。");
+    expectServiceDelta(service, beforeMissing, {});
+    expect(screen.getByText(INVALID_COPY)).toBeTruthy();
     resolver.mockReturnValue({ status: "available", zone: KATHMANDU });
     fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
-    if (destination === "reload-list") expectServiceDelta(service, beforeAccept, { list: 1 });
-    else expectServiceDelta(service, beforeAccept, { getById: 1 });
-    view.unmount();
+    expectServiceDelta(service, beforeMissing, { list: 1 });
+    const loading = latestReducerState(reducer);
+    if (loading.tag !== "list.loading" || loading.source !== "ordinary") throw new Error("expected retried missing-record reload");
+    expect(loading.prior.presentationZone).toBe(KATHMANDU);
+    await act(async () => fallbackList.resolve([]));
+    await screen.findByText("还没有喂养记录");
+  } else {
+    expectServiceDelta(service, beforeMissing, { list: 1 });
+    const loading = latestReducerState(reducer);
+    if (loading.tag !== "list.loading" || loading.source !== "ordinary") throw new Error("expected missing-record reload");
+    expect(loading.prior.presentationZone).toBe("UTC");
+    expect(loading.notice).toBe("这条记录已不存在，列表已重新读取。");
+    await act(async () => fallbackList.resolve([]));
+    await screen.findByText("还没有喂养记录");
   }
+  view.unmount();
+});
+
+test.each(["reload-list", "reload-record"] as const)("zone retry repeats only zone resolution and re-enters the conflict %s destination when valid", async (destination) => {
+  const service = serviceMock({
+    list: jest.fn(async (domain: TrackerDomain) => domain === "feeding" ? [records.feeding] : []) as ManualTrackerServicePort["list"],
+    getById: jest.fn(async () => records.feeding) as ManualTrackerServicePort["getById"],
+    update: jest.fn(async () => { throw new ManualTrackerConflictError("stale_write"); }) as ManualTrackerServicePort["update"],
+  });
+  const resolver = jest.spyOn(trackerLocalTime, "captureDeviceTimeZone").mockReturnValue({ status: "available", zone: KATHMANDU });
+  const reducer = jest.spyOn(trackerScreenState, "trackerScreenReducer");
+  const view = renderTracker(service);
+  await enterDomain("喂养");
+  fireEvent.press(screen.getByRole("button", { name: /喂养记录，/ }));
+  await screen.findByRole("header", { name: "编辑喂养记录" });
+  fireEvent.changeText(screen.getByLabelText("备注"), "dirty conflict");
+  fireEvent.press(screen.getByRole("button", { name: "保存修改" }));
+  await screen.findByText("这条记录已在其他位置更新。为避免覆盖，请重新读取后再修改。");
+  const initiate = () => fireEvent.press(screen.getByRole("button", { name: destination === "reload-list" ? "返回列表" : "重新读取记录" }));
+  initiate();
+  await screen.findByRole("header", { name: "放弃未保存的更改？" });
+  const accept = screen.getByRole("button", { name: "放弃更改" });
+  const staleAccept = [accept.props.onPress, accept.parent?.props.onPress, accept.parent?.parent?.props.onPress]
+    .find((candidate): candidate is () => void => typeof candidate === "function");
+  if (staleAccept === undefined) throw new Error("expected conflict discard callback");
+  fireEvent.press(screen.getByRole("button", { name: "继续编辑" }));
+  const cancelled = latestReducerState(reducer);
+  const cancelledZoneReads = resolver.mock.calls.length;
+  act(() => staleAccept());
+  expect(latestReducerState(reducer)).toBe(cancelled);
+  expect(resolver).toHaveBeenCalledTimes(cancelledZoneReads);
+
+  initiate();
+  resolver.mockReturnValue(INVALID);
+  const beforeAccept = serviceCounts(service);
+  fireEvent.press(screen.getByRole("button", { name: "放弃更改" }));
+  const blocked = latestReducerState(reducer);
+  if (blocked.tag !== "zone.blocked.entry") throw new Error("expected conflict zone block");
+  expect(blocked.intent.kind).toBe(destination === "reload-list" ? "list-load" : "get");
+  expectServiceDelta(service, beforeAccept, {});
+  const blockedZoneReads = resolver.mock.calls.length;
+  act(() => staleAccept());
+  expect(latestReducerState(reducer)).toBe(blocked);
+  expect(resolver).toHaveBeenCalledTimes(blockedZoneReads);
+  resolver.mockReturnValue({ status: "available", zone: KATHMANDU });
+  fireEvent.press(screen.getByRole("button", { name: "重新读取本机时区" }));
+  if (destination === "reload-list") expectServiceDelta(service, beforeAccept, { list: 1 });
+  else expectServiceDelta(service, beforeAccept, { getById: 1 });
+  view.unmount();
 });
