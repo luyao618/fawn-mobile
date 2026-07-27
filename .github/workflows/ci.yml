@@ -24,6 +24,7 @@ jobs:
       - name: Preflight frozen native tooling
         run: |
           set -euo pipefail
+          test "$(npm --version)" = "10.9.3"
           host_os="$(uname -s)"
           host_arch="$(uname -m)"
           if [[ "$host_os" != "Darwin" || "$host_arch" != "x86_64" ]]; then

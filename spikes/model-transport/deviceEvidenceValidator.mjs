@@ -33,6 +33,7 @@ export const G017_SOURCE_PATHS = Object.freeze([
   "tests/unit/tooling/redaction.test.ts",
   "tests/unit/tooling/typecheck-fixture-lifecycle.test.ts",
   "tools/check-audit.mjs",
+  "tools/audit-execution.mjs",
   "tools/check-licenses.mjs",
   "tools/export-g017.mjs",
   "tools/redaction.d.mts",
