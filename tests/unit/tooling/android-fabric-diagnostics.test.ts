@@ -14,6 +14,16 @@ const BUILD_ID = "5326419ed5d724034268b85e3b74ee5d5fd66613";
 const OTHER_BUILD_ID = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c";
 const REMOTE_APK = "/data/app/~~aBcD==/com.luyao618.formobile-1/base.apk";
 const REMOTE_SPLIT_APK = "/data/app/~~aBcD==/com.luyao618.formobile-1/split_config.x86_64.apk";
+/**
+ * The one version the repo actually declares. It is read from the root package.json rather than
+ * restated here, so a test asserting the collector reads that declaration can never pass by
+ * agreeing with a duplicate constant this file kept in sync by hand.
+ */
+const REACT_NATIVE_VERSION: string = (() => {
+  const declared = JSON.parse(readFileSync(resolve("package.json"), "utf8")).dependencies?.["react-native"];
+  assert.equal(typeof declared, "string", "the root package.json must declare a react-native dependency version");
+  return declared;
+})();
 
 function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -87,6 +97,7 @@ type Harness = {
   installedApk: string;
   gradleCache: string;
   adb: string;
+  adbCallLog: string;
   tombstoneDir: string;
 };
 
@@ -154,6 +165,10 @@ function harness(options: {
   adbExitCode?: number;
   installedNoteCorruption?: NoteCorruption;
   aarNoteCorruption?: NoteCorruption;
+  reactNativeVersion?: string;
+  declaredReactNativeVersion?: string;
+  omitReactNativeDependency?: boolean;
+  omitPackageJson?: boolean;
 } = {}): Harness {
   const {
     tombstones = ["tombstone_00", "tombstone_00.pb", "tombstone_01", "tombstone_01.pb"],
@@ -172,6 +187,10 @@ function harness(options: {
     adbExitCode = 0,
     installedNoteCorruption,
     aarNoteCorruption,
+    reactNativeVersion = REACT_NATIVE_VERSION,
+    declaredReactNativeVersion = reactNativeVersion,
+    omitReactNativeDependency = false,
+    omitPackageJson = false,
   } = options;
 
   // realpath keeps the fixture root identical to the collector's own process.cwd(), so manifest
@@ -182,6 +201,16 @@ function harness(options: {
   const outputDir = join(root, ".artifacts/launch/fabric-diagnostics");
   mkdirSync(bin, { recursive: true });
   mkdirSync(tombstoneDir, { recursive: true });
+
+  // The collector resolves the react-native version from the repo it is run inside, so the fixture
+  // root declares it exactly the way the real root package.json does.
+  if (!omitPackageJson) {
+    writeFileSync(join(root, "package.json"), `${JSON.stringify({
+      name: "fabric-diagnostics-fixture",
+      private: true,
+      dependencies: omitReactNativeDependency ? {} : { "react-native": declaredReactNativeVersion },
+    }, null, 2)}\n`);
+  }
 
   for (const name of tombstones) {
     // A real android frame for a library loaded out of the APK carries an offset group and a
@@ -214,14 +243,14 @@ function harness(options: {
 
   // Gradle-cached react-android Debug AAR holding the unstripped library.
   const gradleCache = join(root, "gradle/react-android");
-  const aarDir = join(gradleCache, "0.86.0/8af60308e3dd4065fe58e0d724624439c16c031b");
+  const aarDir = join(gradleCache, `${reactNativeVersion}/8af60308e3dd4065fe58e0d724624439c16c031b`);
   mkdirSync(aarDir, { recursive: true });
   if (!omitAar) {
     const aarStage = join(root, "aar-stage");
     const prefab = "prefab/modules/reactnative/libs/android.x86_64";
     mkdirSync(join(aarStage, prefab), { recursive: true });
     writeElfWithBuildId(join(aarStage, prefab, "libreactnative.so"), aarBuildId, 512, aarNoteCorruption);
-    zip(aarStage, join(aarDir, "react-android-0.86.0-debug.aar"), "prefab");
+    zip(aarStage, join(aarDir, `react-android-${reactNativeVersion}-debug.aar`), "prefab");
   }
 
   const pmPathLines = [
@@ -230,12 +259,14 @@ function harness(options: {
   ];
 
   const adb = join(bin, "adb");
+  const adbCallLog = join(root, "adb-invocations.log");
   writeFileSync(adb, `#!/usr/bin/env bash
 set -uo pipefail
+printf '%s\\n' "$*" >> "${adbCallLog}"
 exit_code=${adbExitCode}
 if [ "$exit_code" -ne 0 ]; then exit "$exit_code"; fi
 serial="$2"
-if [ "$serial" != "${SERIAL}" ]; then echo "unexpected serial $serial" >&2; exit 64; fi
+if [[ ! "$serial" =~ ^emulator-[0-9]+$ ]]; then echo "unexpected serial $serial" >&2; exit 64; fi
 case "$3" in
   shell)
     case "$4 \${5:-}" in
@@ -282,7 +313,7 @@ esac
 `);
   chmodSync(adb, 0o755);
 
-  return { root, outputDir, hostApk, installedApk, gradleCache, adb, tombstoneDir };
+  return { root, outputDir, hostApk, installedApk, gradleCache, adb, adbCallLog, tombstoneDir };
 }
 
 function collect(fixture: Harness, extra: string[] = []) {
@@ -298,6 +329,15 @@ function collect(fixture: Harness, extra: string[] = []) {
     ...extra,
   ], { cwd: fixture.root, encoding: "utf8" });
   return result;
+}
+
+/** Every argv the fake adb was invoked with, so a refusal can be proven to have run none. */
+function adbInvocations(fixture: Harness): string[] {
+  try {
+    return readFileSync(fixture.adbCallLog, "utf8").split("\n").filter((line) => line.length > 0);
+  } catch {
+    return [];
+  }
 }
 
 function symbolPath(fixture: Harness): string {
@@ -400,7 +440,11 @@ test("collector recovers the Build-ID-matched unstripped RN 0.86 Debug library f
   const recovered = manifestOf(fixture).sections.unstrippedReactNative;
 
   assert.equal(recovered.status, "collected");
-  assert.equal(recovered.aarPath, "react-android-0.86.0-debug.aar", "the manifest must not publish absolute host cache paths");
+  assert.equal(
+    recovered.aarPath,
+    `react-android-${REACT_NATIVE_VERSION}-debug.aar`,
+    "the manifest must not publish absolute host cache paths",
+  );
   assert.equal(recovered.memberPath, "prefab/modules/reactnative/libs/android.x86_64/libreactnative.so");
   assert.equal(recovered.buildId, BUILD_ID);
   assert.equal(recovered.buildIdMatchesPackaged, true);
@@ -1156,7 +1200,11 @@ test("collector fails safely and publishes no relative cache guess when HOME is 
   const recovered = manifest.sections.unstrippedReactNative;
   assertNoRetainedSymbols(fixture, recovered);
   assert.match(recovered.reason, /neither --gradle-cache nor HOME was set/i);
-  assert.match(recovered.reason, /react-android-0\.86\.0-debug\.aar/, "the reason must still name the artifact it wanted");
+  assert.match(
+    recovered.reason,
+    new RegExp(`react-android-${REACT_NATIVE_VERSION.replace(/\./g, "\\.")}-debug\\.aar`),
+    "the reason must still name the artifact it wanted",
+  );
 
   // The tombstones and APKs do not depend on HOME, so their evidence must survive intact.
   assert.equal(manifest.sections.tombstones.status, "collected");
@@ -1191,4 +1239,194 @@ test("collector marks tombstones as raw synthetic dumps and claims no content re
   assert.match(manifest.publicArtifactRisk, /uploaded as a CI artifact/i, "the residual public-artifact risk must be stated");
   assert.match(manifest.publicArtifactRisk, /Nothing here is redacted for content/i);
   assert.match(manifest.publicArtifactRisk, /real user data/i);
+});
+
+test("collector resolves the AAR version from the declared react-native dependency, not a duplicated constant", (context) => {
+  // A repo declaring a different react-native version must drive both the AAR lookup and the
+  // published provenance. A collector carrying its own constant would look for the wrong artifact.
+  const fixture = harness({ reactNativeVersion: "0.87.3" });
+  context.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  assert.equal(collect(fixture).status, 0);
+  const manifest = manifestOf(fixture);
+  const recovered = manifest.sections.unstrippedReactNative;
+
+  assert.equal(manifest.reactNativeVersion, "0.87.3", "the manifest must publish the version the repo declares");
+  assert.equal(recovered.status, "collected", "the AAR for the declared version must be the one that is found");
+  assert.equal(recovered.aarPath, "react-android-0.87.3-debug.aar");
+  assert.equal(recovered.buildId, BUILD_ID);
+  assert.equal(recovered.buildIdMatchesPackaged, true);
+});
+
+test("collector declares no duplicated react-native version constant of its own", () => {
+  const source = readFileSync(COLLECTOR, "utf8");
+
+  assert.doesNotMatch(
+    source,
+    /const\s+REACT_NATIVE_VERSION\s*=\s*["'][^"']+["']/,
+    "the collector must not restate the react-native version it can read from the declared dependency",
+  );
+  assert.doesNotMatch(
+    source,
+    /\b0\.8[0-9]+\.[0-9]+\b/,
+    "no hardcoded react-native version may survive in the collector",
+  );
+  assert.match(source, /"react-native"/, "the collector must resolve the version from the declared dependency");
+});
+
+test("collector reports an undeclared react-native dependency as unavailable provenance", (context) => {
+  const missing = harness({ omitReactNativeDependency: true });
+  context.after(() => rmSync(missing.root, { recursive: true, force: true }));
+
+  assert.equal(collect(missing).status, 0, "an undeclared dependency must never throw out of cleanup");
+  const missingManifest = manifestOf(missing);
+  assert.equal(missingManifest.reactNativeVersion, null, "an unresolvable version must be an explicit null");
+  assert.match(missingManifest.reactNativeVersionReason, /react-native/i);
+  assertNoRetainedSymbols(missing, missingManifest.sections.unstrippedReactNative);
+  assert.match(missingManifest.sections.unstrippedReactNative.reason, /react-native/i);
+
+  // The rest of the retention does not depend on the version, so its evidence must survive intact.
+  assert.equal(missingManifest.status, "complete");
+  assert.equal(missingManifest.sections.tombstones.status, "collected");
+  assert.equal(missingManifest.sections.installedApk.status, "collected");
+
+  // An absent package.json is the same failure with a different cause, and must degrade identically.
+  const absent = harness({ omitPackageJson: true });
+  context.after(() => rmSync(absent.root, { recursive: true, force: true }));
+  assert.equal(collect(absent).status, 0, "an unreadable package.json must never throw out of cleanup");
+  const absentManifest = manifestOf(absent);
+  assert.equal(absentManifest.reactNativeVersion, null);
+  assert.ok(
+    typeof absentManifest.reactNativeVersionReason === "string" && absentManifest.reactNativeVersionReason.length > 0,
+    "an unreadable package.json must carry a precise reason",
+  );
+  assertNoRetainedSymbols(absent, absentManifest.sections.unstrippedReactNative);
+});
+
+test("collector rejects a malformed declared react-native version instead of searching for it", (context) => {
+  // A range or tag is not an exact cached-artifact coordinate; resolving one would search a
+  // directory that cannot exist and report an untrue "no cached AAR" reason.
+  for (const declared of ["^0.86.0", "0.86", "latest", ""]) {
+    const fixture = harness({ declaredReactNativeVersion: declared });
+    context.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+    assert.equal(collect(fixture).status, 0, `declared version ${JSON.stringify(declared)} must never throw`);
+    const manifest = manifestOf(fixture);
+    assert.equal(manifest.reactNativeVersion, null, `${JSON.stringify(declared)} is not an exact version`);
+    assert.ok(
+      typeof manifest.reactNativeVersionReason === "string" && manifest.reactNativeVersionReason.length > 0,
+      `${JSON.stringify(declared)} must carry a precise reason`,
+    );
+    assertNoRetainedSymbols(fixture, manifest.sections.unstrippedReactNative);
+  }
+});
+
+test("collector refuses a non-emulator serial before creating output or invoking adb", (context) => {
+  // A serial that is not an emulator port is the one input that could point this collector at a
+  // real device holding real user data, so it must be refused before any retention I/O begins.
+  const rejected = [
+    "1234567890abcdef",
+    "192.168.1.5:5555",
+    "emulator-",
+    "emulator-abcd",
+    "emulator-5554x",
+    " emulator-5554",
+    "emulator-5554 ",
+    "emulator-5554\n",
+    "Emulator-5554",
+    "",
+  ];
+
+  for (const serial of rejected) {
+    const fixture = harness();
+    context.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+    const result = collect(fixture, ["--serial", serial]);
+
+    assert.equal(result.status, 0, `serial ${JSON.stringify(serial)} must stay diagnostics-only and exit zero`);
+    assert.equal(result.stdout, "", "the collector must keep the failure-cleanup stdout stream clean");
+    assert.deepEqual(
+      adbInvocations(fixture),
+      [],
+      `serial ${JSON.stringify(serial)} must be refused before any adb invocation`,
+    );
+    assert.throws(
+      () => statSync(fixture.outputDir),
+      `serial ${JSON.stringify(serial)} must be refused before the output directory is created`,
+    );
+    assert.match(result.stderr, /serial/i, "the refusal must name the offending input on stderr");
+    assert.ok(!result.stderr.includes(fixture.root), "the refusal must not disclose the absolute host root");
+  }
+});
+
+test("collector accepts a well-formed emulator serial and still retains full evidence", (context) => {
+  for (const serial of ["emulator-5554", "emulator-5556", "emulator-65534"]) {
+    const fixture = harness();
+    context.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+    // The fake adb asserts the serial it is handed, so accepting a serial it does not expect would
+    // surface as a failed collection rather than a silent pass.
+    const result = collect(fixture, ["--serial", serial]);
+    assert.equal(result.status, 0, `serial ${serial} must be accepted`);
+
+    const manifest = manifestOf(fixture);
+    assert.equal(manifest.serial, serial, "an accepted serial must be published as evidence");
+    assert.equal(manifest.status, "complete");
+    assert.ok(adbInvocations(fixture).length > 0, `serial ${serial} must reach adb collection`);
+  }
+});
+
+test("collectFabricDiagnostics itself refuses a non-emulator serial, not only the CLI wrapper", async (context) => {
+  // The CLI is not the only caller: `collectFabricDiagnostics` is exported, so a guard living in
+  // `main` would leave every direct importer free to point this collector at a real device. The
+  // refusal has to belong to the exported boundary, before mkdir and before any adb invocation.
+  const { collectFabricDiagnostics } = await import(COLLECTOR);
+
+  for (const serial of ["1234567890abcdef", "192.168.1.5:5555", "emulator-abcd", "", undefined]) {
+    const fixture = harness();
+    context.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+    await assert.rejects(
+      async () => collectFabricDiagnostics({
+        root: fixture.root,
+        serial,
+        packageName: PACKAGE,
+        expectedSha: EXPECTED_SHA,
+        outputDir: fixture.outputDir,
+        hostApk: fixture.hostApk,
+        gradleCache: fixture.gradleCache,
+        adbPath: fixture.adb,
+      }),
+      /serial/i,
+      `a direct call with serial ${JSON.stringify(serial ?? null)} must be refused by the collector itself`,
+    );
+
+    assert.deepEqual(
+      adbInvocations(fixture),
+      [],
+      `a direct call with serial ${JSON.stringify(serial ?? null)} must invoke no adb`,
+    );
+    assert.throws(
+      () => statSync(fixture.outputDir),
+      `a direct call with serial ${JSON.stringify(serial ?? null)} must create no output directory`,
+    );
+  }
+
+  // The same direct call succeeds for an emulator serial, so the refusal is the serial's doing and
+  // not a direct-call path that never worked.
+  const accepted = harness();
+  context.after(() => rmSync(accepted.root, { recursive: true, force: true }));
+  const manifest = await collectFabricDiagnostics({
+    root: accepted.root,
+    serial: SERIAL,
+    packageName: PACKAGE,
+    expectedSha: EXPECTED_SHA,
+    outputDir: accepted.outputDir,
+    hostApk: accepted.hostApk,
+    gradleCache: accepted.gradleCache,
+    adbPath: accepted.adb,
+  });
+  assert.equal(manifest.status, "complete", "a direct call with an emulator serial must still collect");
+  assert.equal(manifest.serial, SERIAL);
+  assert.ok(adbInvocations(accepted).length > 0, "an accepted direct call must reach adb collection");
 });

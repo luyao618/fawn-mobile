@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 const SCHEMA_VERSION = 1;
 const REPORT_TYPE = "android-fabric-diagnostic-retention";
 const DEVICE_TOMBSTONE_DIRECTORY = "/data/tombstones";
-const REACT_NATIVE_VERSION = "0.86.0";
 const AAR_MEMBER = "prefab/modules/reactnative/libs/android.x86_64/libreactnative.so";
 const PACKAGED_MEMBERS = ["lib/x86_64/libreactnative.so", "lib/x86_64/librnscreens.so"];
 const REACT_NATIVE_MEMBER = PACKAGED_MEMBERS[0];
@@ -35,6 +34,19 @@ const GNU_BUILD_ID_NOTE_TYPE = 3;
 const SHT_NOTE = 7;
 const SHA1_PATTERN = /^[0-9a-f]{40}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+/**
+ * The cached AAR is addressed by an exact version directory, so only an exact `major.minor.patch`
+ * declaration is resolvable. A range or tag would send the lookup at a directory that cannot exist
+ * and make it report an untrue "no cached AAR" instead of the unresolvable declaration it really is.
+ */
+const EXACT_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
+/**
+ * An emulator serial is `emulator-<port>` and nothing else. This collector pulls the full installed
+ * application image and the device's raw, unredacted tombstones into a published CI artifact, so a
+ * serial naming anything but a disposable emulator — a USB device id, a network `host:port` target —
+ * must be refused before any of that is collected, not explained afterwards.
+ */
+const EMULATOR_SERIAL_PATTERN = /^emulator-[0-9]+$/;
 /**
  * Matches the `libreactnative.so ... (BuildId: <hex>)` frame annotation android emits into text
  * tombstones. Real frames interpose an `(offset 0x…)` group and a demangled symbol group — itself
@@ -226,6 +238,36 @@ function bindCheckedOutSha(root, expectedShaOption) {
     };
   }
   return { ...binding, status: "verified", matchesExpectedSha: true };
+}
+
+/**
+ * Resolves the react-native version from the one place the repo declares it. The cached AAR the
+ * symbols come from and the version this manifest publishes as provenance must both describe the
+ * revision that was actually built; a constant restated here would keep claiming the old version
+ * after an upgrade and quietly authorize symbols against a library the build never produced.
+ *
+ * Only an exact version is admissible: a range or tag cannot address a cached artifact directory.
+ * Every failure is a recorded reason, never a throw — the collector is evidence, not a gate.
+ */
+function readDeclaredReactNativeVersion(root) {
+  let declared;
+  try {
+    const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    declared = manifest?.dependencies?.["react-native"];
+  } catch (error) {
+    return { version: null, reason: `The declared react-native version could not be read: ${describeError(error)}` };
+  }
+  if (typeof declared !== "string" || declared.length === 0) {
+    return { version: null, reason: "The root package.json declares no react-native dependency, so no AAR version is resolvable." };
+  }
+  if (!EXACT_VERSION_PATTERN.test(declared)) {
+    return {
+      version: null,
+      reason: `The declared react-native dependency ${JSON.stringify(declared)} is not an exact version, so it cannot `
+        + "address a cached react-android artifact.",
+    };
+  }
+  return { version: declared };
 }
 
 function collectTombstones(context) {
@@ -492,7 +534,7 @@ function collectUnstrippedReactNative(context, installedApkSection, tombstonesSe
   let aarPath;
   let buffer;
   try {
-    aarPath = findCachedDebugAar(context.gradleCache);
+    aarPath = findCachedDebugAar(context.gradleCache, context.reactNativeVersion);
     buffer = extractMember(aarPath, AAR_MEMBER);
   } catch (error) {
     return { ...evidence, status: "unavailable", reason: describeError(error) };
@@ -541,16 +583,19 @@ function collectUnstrippedReactNative(context, installedApkSection, tombstonesSe
   return { ...recovered, status: "collected", localPath: relative(root, localPath) };
 }
 
-/** Locates the exact cached RN Debug AAR by walking only the pinned react-android version directory. */
-function findCachedDebugAar(gradleCache) {
-  const expectedName = `react-android-${REACT_NATIVE_VERSION}-debug.aar`;
+/** Locates the exact cached RN Debug AAR by walking only the declared react-android version directory. */
+function findCachedDebugAar(gradleCache, reactNativeVersion) {
+  if (reactNativeVersion.version === null) {
+    throw new Error(`${reactNativeVersion.reason} No cached react-android Debug AAR can be located without it.`);
+  }
+  const expectedName = `react-android-${reactNativeVersion.version}-debug.aar`;
   if (typeof gradleCache !== "string" || gradleCache.length === 0) {
     throw new Error(
       `No Gradle react-android module cache could be located: neither --gradle-cache nor HOME was set, so ${expectedName} `
       + "was never searched for.",
     );
   }
-  const versionDir = join(resolve(gradleCache), REACT_NATIVE_VERSION);
+  const versionDir = join(resolve(gradleCache), reactNativeVersion.version);
   const matches = readdirSync(versionDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => join(versionDir, entry.name, expectedName))
@@ -582,10 +627,23 @@ const PENDING_SECTION = Object.freeze({ status: "pending", reason: "This section
 const SECTION_NAMES = ["tombstones", "installedApk", "hostApk", "packagedLibraries", "unstrippedReactNative", "devClientBundle"];
 
 export function collectFabricDiagnostics(context) {
+  // The serial decides which device gets its full application image and raw tombstones pulled into a
+  // published artifact, so it is checked before the output directory exists and before adb is ever
+  // spawned. This belongs to the exported boundary rather than the CLI: every caller, not just
+  // `main`, has to be held to it. Anything but an emulator port is refused outright rather than
+  // recorded — publishing a manifest for a device this collector must not touch would itself be the
+  // disclosure.
+  if (typeof context.serial !== "string" || !EMULATOR_SERIAL_PATTERN.test(context.serial)) {
+    throw new Error(
+      `Refusing to collect from serial ${JSON.stringify(context.serial ?? null)}: only an emulator-<port> serial is `
+      + "supported, and this collector retains unredacted device evidence into a published CI artifact.",
+    );
+  }
   mkdirSync(context.outputDir, { recursive: true });
   const manifestPath = join(context.outputDir, "manifest.json");
 
   const shaBinding = bindCheckedOutSha(context.root, context.expectedSha);
+  const reactNativeVersion = readDeclaredReactNativeVersion(context.root);
   const manifest = {
     schemaVersion: SCHEMA_VERSION,
     type: REPORT_TYPE,
@@ -596,9 +654,10 @@ export function collectFabricDiagnostics(context) {
     shaBinding,
     serial: context.serial,
     package: context.packageName,
-    reactNativeVersion: REACT_NATIVE_VERSION,
+    reactNativeVersion: reactNativeVersion.version,
     sections: Object.fromEntries(SECTION_NAMES.map((name) => [name, PENDING_SECTION])),
   };
+  if (reactNativeVersion.reason !== undefined) manifest.reactNativeVersionReason = reactNativeVersion.reason;
 
   // Best-effort: a manifest that cannot be written must not abort the retention it describes.
   const publish = () => {
@@ -620,7 +679,11 @@ export function collectFabricDiagnostics(context) {
   const installedApk = record("installedApk", () => collectInstalledApk(context, hostApk));
   const tombstones = record("tombstones", () => collectTombstones(context));
   record("packagedLibraries", () => collectPackagedLibraries(context));
-  record("unstrippedReactNative", () => collectUnstrippedReactNative(context, installedApk, tombstones));
+  record("unstrippedReactNative", () => collectUnstrippedReactNative(
+    { ...context, reactNativeVersion },
+    installedApk,
+    tombstones,
+  ));
   manifest.sections.devClientBundle = { status: "unavailable", reason: DEV_CLIENT_BUNDLE_REASON, prefetched: false };
 
   manifest.status = "complete";
@@ -639,6 +702,8 @@ function main(args) {
   const home = process.env.HOME;
   const gradleCache = options["--gradle-cache"]
     ?? (typeof home === "string" && home.length > 0 ? join(home, GRADLE_REACT_ANDROID_CACHE) : null);
+  // The serial is validated by `collectFabricDiagnostics` itself, so a refusal arrives here as a
+  // throw and leaves through the same catch that keeps every other failure diagnostics-only.
   collectFabricDiagnostics({
     root,
     serial: options["--serial"],
