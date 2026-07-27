@@ -93,7 +93,7 @@ const exactChildPrimaryUploadPaths = {
   ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/ios-profile-restart.json\n.artifacts/persistence/ios/*.json\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "52236399b43c99f85a9820351612e0228b835ad8f67c15eee23e9025b803fcb9";
+const exactAndroidRunnerSha256 = "fc6b35d3c5ed18eeafa8793f7d89d184f81e54cb45197043958fd23614e57dd5";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -492,6 +492,8 @@ function assertChildWorkflowPolicy(workflow: Workflow, jobName: "android" | "ios
     path: ".artifacts/launch/**\n.artifacts/test-results/**\n",
     "include-hidden-files": true,
     "if-no-files-found": "ignore",
+    // Android alone bounds its failure-diagnostic retention; iOS must not silently acquire one.
+    ...(jobName === "android" ? { "retention-days": 14 } : {}),
   }, `${jobName} diagnostics upload inputs must remain exact`);
   assert.ok(
     diagnosticsUploadIndex > primaryUploadIndex,
@@ -658,6 +660,7 @@ const exactAndroidFailureLastAnrCommand = '    adb -s "$emulator_serial" shell d
 const exactAndroidFailureRootCommand = '    adb -s "$emulator_serial" root';
 const exactAndroidFailureWaitForDeviceCommand = '    timeout 30s adb -s "$emulator_serial" wait-for-device';
 const exactAndroidFailureAnrFilesCommand = "    adb -s \"$emulator_serial\" shell 'ls -la /data/anr; cat /data/anr/*' > .artifacts/launch/device/android-anr-files.txt 2>&1";
+const exactAndroidFabricDiagnosticsCommand = '    timeout 300s node tools/android-fabric-diagnostics.mjs --serial "$emulator_serial" --package com.luyao618.formobile --expected-sha "${EXPECTED_SHA:-}" --output-dir .artifacts/launch/fabric-diagnostics > .artifacts/launch/fabric-diagnostics.log 2>&1';
 const exactAndroidFailurePidCommand = String.raw`    app_pid=$(adb -s "$emulator_serial" shell pidof -s com.luyao618.formobile 2>/dev/null | tr -d "\r")`;
 const exactAndroidFailureLogCommand = '      adb -s "$emulator_serial" logcat -d --pid="$app_pid" > .artifacts/launch/device/android-app.log 2>&1';
 const exactAndroidFallbackLogCommand = "      adb -s \"$emulator_serial\" logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V '*:S' > .artifacts/launch/device/android-app.log 2>&1";
@@ -680,6 +683,7 @@ const exactAndroidFailureDiagnosticPaths = [
   ".artifacts/launch/device/android-lastanr.txt",
   ".artifacts/launch/device/android-anr-files.txt",
   ".artifacts/launch/device/android-app.log",
+  ".artifacts/launch/fabric-diagnostics.log",
 ] as const;
 const exactPinnedSimulatorOpenLine = 'open "$DEVELOPER_DIR/Applications/Simulator.app" --args -CurrentDeviceUDID "$simulator_udid"';
 const exactIosProductionPodGate = `RCT_USE_RN_DEP=1 RCT_USE_PREBUILT_RNCORE=1 node tools/ios-prebuilt-gate.mjs install-pods --ios-dir ios --log-dir .artifacts/launch/native/ios-pods/production --retained-dir "/tmp/fawn-ios-prebuilt-gate-${expectedShaInput}/production" --report .artifacts/launch/native/ios-pods/production/report.json --expected-sha "${expectedShaInput}" --flavor production`;
@@ -946,6 +950,7 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
     "    else",
     exactAndroidFallbackLogCommand,
     "    fi",
+    exactAndroidFabricDiagnosticsCommand,
     "  fi",
     '  if [ -n "$metro_pid" ]; then',
     '    kill -- "-$metro_pid" 2>/dev/null',
@@ -970,6 +975,12 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
   assert.equal(upload.if, "always()", "Android diagnostics upload must run after failure");
   assert.equal(upload.with?.path, ".artifacts/launch/**\n.artifacts/test-results/**\n");
   assert.equal(upload.with?.["include-hidden-files"], true, "Android diagnostics upload must retain hidden Maestro files");
+  assert.equal(upload.with?.["retention-days"], 14, "Android diagnostics upload must retain failure evidence for exactly 14 days");
+  const otherRetentionDays = requiredSteps(job, "android")
+    .filter((step) => step.with?.name !== `android-e2e-diagnostics-${expectedShaInput}`)
+    .map((step) => step.with?.["retention-days"])
+    .filter((value) => value !== undefined);
+  assert.deepEqual(otherRetentionDays, [], "retention-days must be scoped to the Android diagnostics upload alone");
 }
 
 function assertExactIosUrlHandoff(script: string): void {

@@ -25,6 +25,7 @@ cleanup() {
     else
       adb -s "$emulator_serial" logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V '*:S' > .artifacts/launch/device/android-app.log 2>&1
     fi
+    timeout 300s node tools/android-fabric-diagnostics.mjs --serial "$emulator_serial" --package com.luyao618.formobile --expected-sha "${EXPECTED_SHA:-}" --output-dir .artifacts/launch/fabric-diagnostics > .artifacts/launch/fabric-diagnostics.log 2>&1
   fi
   if [ -n "$metro_pid" ]; then
     kill -- "-$metro_pid" 2>/dev/null
