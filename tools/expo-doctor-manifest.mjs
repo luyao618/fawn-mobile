@@ -2,6 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 
 const EXPECTED_PACKAGE_NAME = "@fawn-mobile/slice0-device-proof";
 const EXPECTED_EXPO_VERSION = "57.0.4";
+const EXPECTED_REACT_NATIVE_VERSION = "0.86.0";
 const EXPECTED_INSTALL_EXCLUSIONS = ["typescript"];
 
 function isRecord(value) {
@@ -17,6 +18,9 @@ export function prepareExpoDoctorManifest(manifest) {
   if (manifest.name !== EXPECTED_PACKAGE_NAME) fail(`package name must be ${EXPECTED_PACKAGE_NAME}`);
   if (!isRecord(manifest.dependencies) || manifest.dependencies.expo !== EXPECTED_EXPO_VERSION) {
     fail(`dependencies.expo must be exactly ${EXPECTED_EXPO_VERSION}`);
+  }
+  if (manifest.dependencies["react-native"] !== EXPECTED_REACT_NATIVE_VERSION) {
+    fail(`dependencies.react-native must be exactly ${EXPECTED_REACT_NATIVE_VERSION}`);
   }
   if (!isRecord(manifest.expo) || !isRecord(manifest.expo.install)) {
     fail("expo.install must contain an object");
@@ -35,7 +39,7 @@ export function prepareExpoDoctorManifest(manifest) {
       ...manifest.expo,
       install: {
         ...manifest.expo.install,
-        exclude: [...exclusions, "expo"],
+        exclude: [...exclusions, "expo", "react-native"],
       },
     },
   };
