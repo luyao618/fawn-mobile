@@ -16,7 +16,7 @@ async function sourceManifest() {
   return JSON.parse(await readFile(sourceManifestPath, "utf8"));
 }
 
-test("isolated Expo Doctor manifest excludes Expo without mutating its input", async () => {
+test("isolated Expo Doctor manifest excludes Expo and React Native without mutating its input", async () => {
   const manifest = await sourceManifest();
   const original = structuredClone(manifest);
 
@@ -24,7 +24,7 @@ test("isolated Expo Doctor manifest excludes Expo without mutating its input", a
 
   assert.deepEqual(manifest, original);
   assert.notEqual(prepared, manifest);
-  assert.deepEqual(prepared.expo.install.exclude, ["typescript", "expo"]);
+  assert.deepEqual(prepared.expo.install.exclude, ["typescript", "expo", "react-native"]);
   assert.deepEqual(manifest.expo.install.exclude, ["typescript"]);
 });
 
@@ -36,6 +36,7 @@ test("isolated Expo Doctor manifest fails closed for malformed or unexpected sou
     {},
     { ...valid, name: "@fawn-mobile/unexpected" },
     { ...valid, dependencies: { ...valid.dependencies, expo: "57.0.6" } },
+    { ...valid, dependencies: { ...valid.dependencies, "react-native": "0.86.2" } },
     { ...valid, dependencies: null },
     { ...valid, expo: null },
     { ...valid, expo: { install: null } },
@@ -64,7 +65,7 @@ test("temporary rewrite preserves source manifest bytes and the official G017 fi
   await rewriteExpoDoctorManifest(temporaryManifestPath);
 
   const rewritten = JSON.parse(await readFile(temporaryManifestPath, "utf8"));
-  assert.deepEqual(rewritten.expo.install.exclude, ["typescript", "expo"]);
+  assert.deepEqual(rewritten.expo.install.exclude, ["typescript", "expo", "react-native"]);
   assert.deepEqual(await readFile(sourceManifestPath), sourceBytesBefore);
   assert.equal(await computeG017SourceFingerprint(), fingerprintBefore);
 });
