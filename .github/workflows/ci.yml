@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   static:
+    timeout-minutes: 90
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683

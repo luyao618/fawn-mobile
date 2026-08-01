@@ -28,6 +28,7 @@ const APP_ID = "com.fawnmobile.g016backupcrypto";
 const FMBK_SHA256 = "231f64bf4045b430ca0de6c18b215f9a4414293683021528c411ae85d0010231";
 const EXECUTING_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const MAX_TOOL_BUFFER = 512 * 1024 * 1024;
+export const MAX_TOOL_DURATION_MS = 120_000;
 const MAX_PROOF_OBSERVATION_LAG_MS = 60_000;
 const TRUST_BOUNDARY = "local-consistency-and-tamper-detection-not-hardware-attestation";
 const PINNED_FILE_IDENTITY = Symbol("g016-pinned-file-identity");
@@ -651,18 +652,50 @@ function validateResolution(text, platform, failures) {
   else validateIosResolution(text, failures);
 }
 
-function runTool(command, args, options = {}) {
-  const result = spawnSync(command, args, {
+function runToolWithDuration(command, args, options, durationMs) {
+  const copiedArgs = [...args];
+  const result = spawnSync(command, copiedArgs, {
     cwd: options.cwd,
     encoding: options.binary ? null : "utf8",
     input: options.input,
     maxBuffer: MAX_TOOL_BUFFER,
+    timeout: durationMs,
+    killSignal: "SIGKILL",
   });
   return {
     ok: result.status === 0 && !result.error,
     stdout: result.stdout ?? (options.binary ? Buffer.alloc(0) : ""),
     stderr: result.stderr ?? (options.binary ? Buffer.alloc(0) : ""),
+    command,
+    args: copiedArgs,
+    exitCode: result.status,
+    errorCode: result.error?.code ?? null,
+    signal: result.signal ?? null,
+    durationMs,
   };
+}
+
+function runTool(command, args, options = {}) {
+  return runToolWithDuration(command, args, options, MAX_TOOL_DURATION_MS);
+}
+
+export function runToolForTest(command, args, durationMs) {
+  if (!Number.isSafeInteger(durationMs) || durationMs <= 0) throw new Error("test tool duration must be a positive safe integer");
+  return runToolWithDuration(command, args, {}, durationMs);
+}
+
+function toolFailure(message, result) {
+  if (result.ok) return message;
+  return `${message} [command=${JSON.stringify(result.command)} args=${JSON.stringify(result.args)} exitCode=${result.exitCode ?? "none"} errorCode=${result.errorCode ?? "none"} signal=${result.signal ?? "none"} durationMs=${result.durationMs}]`;
+}
+
+function recordToolResult(failures, result, message) {
+  push(failures, result.ok, toolFailure(message, result));
+  return result.ok;
+}
+
+export function recordToolResultForTest(failures, result, message) {
+  return recordToolResult(failures, result, message);
 }
 
 async function latestNdkTool(name) {
@@ -713,7 +746,7 @@ function safeZipMembers(text, label, failures) {
 
 function extractZipMember(artifactPath, member, label, failures) {
   const result = runTool("/usr/bin/unzip", ["-p", artifactPath, member], { binary: true });
-  push(failures, result.ok, `${label} could not be extracted with unzip`);
+  recordToolResult(failures, result, `${label} could not be extracted with unzip`);
   return result.ok ? result.stdout : null;
 }
 
@@ -734,14 +767,13 @@ async function inspectElf(path, member, bytes, failures) {
   if (!readelf || !nm) return null;
   const dynamic = runTool(readelf, ["-d", path]);
   const symbols = runTool(nm, ["-D", "-C", "--defined-only", path]);
-  push(failures, dynamic.ok, `Android native member ${member} has unreadable dynamic entries`);
-  push(failures, symbols.ok, `Android native member ${member} has unreadable dynamic symbols`);
-  if (!dynamic.ok || !symbols.ok) return null;
+  recordToolResult(failures, dynamic, `Android native member ${member} has unreadable dynamic entries`);
+  recordToolResult(failures, symbols, `Android native member ${member} has unreadable dynamic symbols`);
   return {
     member,
     sha256: hash(bytes),
-    needed: [...dynamic.stdout.matchAll(/\(NEEDED\).*\[([^\]]+)\]/g)].map((match) => match[1]),
-    definedSymbols: symbols.stdout,
+    needed: dynamic.ok ? [...dynamic.stdout.matchAll(/\(NEEDED\).*\[([^\]]+)\]/g)].map((match) => match[1]) : null,
+    definedSymbols: symbols.ok ? symbols.stdout : null,
   };
 }
 
@@ -803,9 +835,11 @@ async function validateMachOWithAppleTools(bytes, label, expectedFileType, failu
   try {
     await writeFile(path, bytes, { mode: 0o700 });
     const lipo = runTool("/usr/bin/lipo", ["-archs", path]);
-    push(failures, lipo.ok && lipo.stdout.trim() === "arm64", `${label} is not exactly arm64 according to lipo`);
+    recordToolResult(failures, lipo, `${label} could not be inspected with lipo`);
+    if (lipo.ok) push(failures, lipo.stdout.trim() === "arm64", `${label} is not exactly arm64 according to lipo`);
     const otool = runTool("/usr/bin/otool", ["-hv", path]);
-    push(failures, otool.ok && otool.stdout.includes("ARM64") && otool.stdout.includes(expectedFileType), `${label} is not a valid ${expectedFileType} Mach-O according to otool`);
+    recordToolResult(failures, otool, `${label} could not be inspected with otool`);
+    if (otool.ok) push(failures, otool.stdout.includes("ARM64") && otool.stdout.includes(expectedFileType), `${label} is not a valid ${expectedFileType} Mach-O according to otool`);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -819,22 +853,29 @@ async function inspectAndroidArtifact(artifact, build, sourceFingerprint, resolu
     push(failures, aapt !== null && apksigner !== null, "Android aapt/apksigner is unavailable; APK validation fails closed");
     if (!aapt || !apksigner) return null;
     const signature = runTool(apksigner, ["verify", "--verbose", "--print-certs", artifactPath]);
-    push(failures, signature.ok && /Verified using v[123] scheme \(APK Signature Scheme v[123]\): true/.test(signature.stdout), "Android final APK signature verification failed");
-    push(failures, /Signer(?: #1)?: certificate SHA-256 digest: [0-9a-f]{64}/i.test(signature.stdout), "Android APK signer certificate digest is missing");
+    recordToolResult(failures, signature, "Android final APK signature verification failed");
+    if (signature.ok) {
+      push(failures, /Verified using v[123] scheme \(APK Signature Scheme v[123]\): true/.test(signature.stdout), "Android final APK signature verification failed");
+      push(failures, /Signer(?: #1)?: certificate SHA-256 digest: [0-9a-f]{64}/i.test(signature.stdout), "Android APK signer certificate digest is missing");
+    }
     const badging = runTool(aapt, ["dump", "badging", artifactPath]);
-    push(failures, badging.ok, "Android artifact is not a structurally valid APK according to aapt");
-    push(failures, badging.stdout.includes(`package: name='${APP_ID}'`), "Android APK manifest application ID mismatch");
-    push(failures, badging.stdout.includes("native-code: 'arm64-v8a'") && !/native-code:[^\n]*(x86|armeabi-v7a)/.test(badging.stdout), "Android APK native architecture is not exactly arm64-v8a");
-    push(failures, !badging.stdout.includes("application-debuggable"), "Android APK manifest is debuggable, not Release");
+    recordToolResult(failures, badging, "Android artifact is not a structurally valid APK according to aapt");
+    if (badging.ok) {
+      push(failures, badging.stdout.includes(`package: name='${APP_ID}'`), "Android APK manifest application ID mismatch");
+      push(failures, badging.stdout.includes("native-code: 'arm64-v8a'") && !/native-code:[^\n]*(x86|armeabi-v7a)/.test(badging.stdout), "Android APK native architecture is not exactly arm64-v8a");
+      push(failures, !badging.stdout.includes("application-debuggable"), "Android APK manifest is debuggable, not Release");
+    }
     const analyzer = runTool(apkanalyzer, ["manifest", "application-id", artifactPath]);
-    push(failures, analyzer.ok && analyzer.stdout.trim() === APP_ID, "Android APK application ID was not confirmed by apkanalyzer");
+    recordToolResult(failures, analyzer, "Android APK application ID could not be inspected with apkanalyzer");
+    if (analyzer.ok) push(failures, analyzer.stdout.trim() === APP_ID, "Android APK application ID was not confirmed by apkanalyzer");
 
     const listing = runTool("/usr/bin/unzip", ["-Z1", artifactPath]);
-    push(failures, listing.ok, "Android artifact is not readable by unzip");
+    recordToolResult(failures, listing, "Android artifact is not readable by unzip");
     if (!listing.ok) return null;
     const members = safeZipMembers(listing.stdout, "Android APK", failures);
     const details = runTool("/usr/bin/zipinfo", ["-l", artifactPath]);
-    push(failures, details.ok && !details.stdout.split(/\r?\n/).some((line) => /^l/.test(line)), "Android APK contains a symlink member");
+    recordToolResult(failures, details, "Android APK members could not be inspected with zipinfo");
+    if (details.ok) push(failures, !details.stdout.split(/\r?\n/).some((line) => /^l/.test(line)), "Android APK contains a symlink member");
     const bundle = extractZipMember(artifactPath, PLATFORM_CONTRACT.android.bundleMember, "Android JS bundle", failures);
     if (bundle) {
       push(failures, bundle.includes(Buffer.from(sourceFingerprint)) && bundle.includes(Buffer.from(resolutionSha256)), "Android JS bundle does not embed source and resolution digests");
@@ -869,14 +910,17 @@ async function inspectAndroidArtifact(artifact, build, sourceFingerprint, resolu
       "libhermesvm.so": { "Hermes identity": /HermesRuntime|_sh_init/i },
     };
     for (const [name, contracts] of Object.entries(symbolContracts)) {
+      if (!inspections[name] || inspections[name].definedSymbols === null) continue;
       for (const [identity, pattern] of Object.entries(contracts)) {
-        push(failures, pattern.test(inspections[name]?.definedSymbols ?? ""), `Android ${name} lacks linked ${identity} implementation symbols`);
+        push(failures, pattern.test(inspections[name].definedSymbols), `Android ${name} lacks linked ${identity} implementation symbols`);
       }
     }
-    const appSymbols = inspections["libappmodules.so"]?.definedSymbols ?? "";
-    push(failures, /QuickBase64(?:Impl|Spec)/.test(appSymbols), "Android appmodules lacks linked QuickBase64 symbols");
-    push(failures, /QuickCrypto_(?:ModuleProvider|registerComponentDescriptorsFromCodegen)/.test(appSymbols), "Android appmodules lacks QuickCrypto autolink symbols");
-    push(failures, /NitroModules(?:Spec)?_(?:ModuleProvider|registerComponentDescriptorsFromCodegen)/.test(appSymbols), "Android appmodules lacks NitroModules autolink symbols");
+    const appSymbols = inspections["libappmodules.so"]?.definedSymbols;
+    if (appSymbols !== undefined && appSymbols !== null) {
+      push(failures, /QuickBase64(?:Impl|Spec)/.test(appSymbols), "Android appmodules lacks linked QuickBase64 symbols");
+      push(failures, /QuickCrypto_(?:ModuleProvider|registerComponentDescriptorsFromCodegen)/.test(appSymbols), "Android appmodules lacks QuickCrypto autolink symbols");
+      push(failures, /NitroModules(?:Spec)?_(?:ModuleProvider|registerComponentDescriptorsFromCodegen)/.test(appSymbols), "Android appmodules lacks NitroModules autolink symbols");
+    }
     const packagedNames = new Set(elfNames);
     const systemLibraries = new Set([
       "libaaudio.so", "libamidi.so", "libandroid.so", "libbinder_ndk.so", "libc.so", "libcamera2ndk.so",
@@ -885,13 +929,17 @@ async function inspectAndroidArtifact(artifact, build, sourceFingerprint, resolu
       "libvulkan.so", "libz.so",
     ]);
     for (const inspection of Object.values(inspections).filter(Boolean)) {
+      if (inspection.needed === null) continue;
       for (const needed of inspection.needed) push(failures, packagedNames.has(needed) || systemLibraries.has(needed), `Android native dependency closure is missing ${needed} required by ${inspection.member}`);
     }
-    const quickNeeded = new Set(inspections["libQuickCrypto.so"]?.needed ?? []);
-    for (const needed of ["libNitroModules.so", "libcrypto.so", "libssl.so"]) push(failures, quickNeeded.has(needed), `Android QuickCrypto does not dynamically depend on ${needed}`);
+    const quickCryptoInspection = inspections["libQuickCrypto.so"];
+    if (quickCryptoInspection?.needed !== null && quickCryptoInspection?.needed !== undefined) {
+      const quickNeeded = new Set(quickCryptoInspection.needed);
+      for (const needed of ["libNitroModules.so", "libcrypto.so", "libssl.so"]) push(failures, quickNeeded.has(needed), `Android QuickCrypto does not dynamically depend on ${needed}`);
+    }
     return {
       target: build.target,
-      nativeMembers: Object.fromEntries(Object.values(inspections).filter(Boolean).map((entry) => [entry.member, entry.sha256])),
+      nativeMembers: Object.fromEntries(Object.values(inspections).filter((entry) => entry && entry.needed !== null && entry.definedSymbols !== null).map((entry) => [entry.member, entry.sha256])),
       packagedMembers: {
         "base.apk": artifact.sha256,
         ...(bundle ? { [PLATFORM_CONTRACT.android.bundleMember]: hash(bundle) } : {}),
@@ -906,33 +954,41 @@ async function inspectAndroidArtifact(artifact, build, sourceFingerprint, resolu
 async function inspectIosArtifact(artifact, build, sourceFingerprint, resolutionSha256, failures) {
   return withCapturedArtifact(artifact.bytes, ".zip", async (artifactPath) => {
     const listing = runTool("/usr/bin/unzip", ["-Z1", artifactPath]);
-    push(failures, listing.ok, "iOS artifact is not a structurally valid ZIP according to unzip");
+    recordToolResult(failures, listing, "iOS artifact is not a structurally valid ZIP according to unzip");
     if (!listing.ok) return null;
     const members = safeZipMembers(listing.stdout, "iOS app ZIP", failures);
     const details = runTool("/usr/bin/zipinfo", ["-l", artifactPath]);
-    push(failures, details.ok && !details.stdout.split(/\r?\n/).some((line) => /^l/.test(line)), "iOS app ZIP contains a symlink member");
+    recordToolResult(failures, details, "iOS app ZIP members could not be inspected with zipinfo");
+    if (details.ok) push(failures, !details.stdout.split(/\r?\n/).some((line) => /^l/.test(line)), "iOS app ZIP contains a symlink member");
     const plistMembers = members.filter((member) => /^Payload\/[A-Za-z0-9_.-]+\.app\/Info\.plist$/.test(member));
     push(failures, plistMembers.length === 1, "iOS app ZIP must contain exactly one Payload/*.app/Info.plist");
     if (plistMembers.length !== 1) return null;
     const appRoot = dirname(plistMembers[0]);
     const extractionRoot = join(dirname(artifactPath), "unpacked");
     const extracted = runTool("/usr/bin/unzip", ["-qq", artifactPath, "-d", extractionRoot]);
-    push(failures, extracted.ok, "iOS app ZIP could not be safely extracted");
+    recordToolResult(failures, extracted, "iOS app ZIP could not be safely extracted");
     if (!extracted.ok) return null;
     const appPath = join(extractionRoot, appRoot);
     const signature = runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath]);
-    push(failures, signature.ok, "iOS final app signature verification failed");
+    recordToolResult(failures, signature, "iOS final app signature verification failed");
     const signatureInfo = runTool("/usr/bin/codesign", ["-d", "--verbose=4", appPath]);
-    const signatureText = `${signatureInfo.stdout}\n${signatureInfo.stderr}`;
-    push(failures, signatureInfo.ok && (/Signature=adhoc/.test(signatureText) || /^Authority=/m.test(signatureText)), "iOS app is neither ad-hoc nor identity signed");
+    recordToolResult(failures, signatureInfo, "iOS app signing identity could not be inspected with codesign");
+    if (signatureInfo.ok) {
+      const signatureText = `${signatureInfo.stdout}\n${signatureInfo.stderr}`;
+      push(failures, /Signature=adhoc/.test(signatureText) || /^Authority=/m.test(signatureText), "iOS app is neither ad-hoc nor identity signed");
+    }
     const plistBytes = await readFile(join(appPath, "Info.plist"));
     if (!plistBytes) return null;
     const plistLint = runTool("/usr/bin/plutil", ["-lint", "-"], { input: plistBytes });
-    push(failures, plistLint.ok, "iOS Info.plist is structurally invalid according to plutil");
+    recordToolResult(failures, plistLint, "iOS Info.plist is structurally invalid according to plutil");
+    if (!plistLint.ok) return null;
     const appId = runTool("/usr/bin/plutil", ["-extract", "CFBundleIdentifier", "raw", "-o", "-", "-"], { input: plistBytes });
     const executableName = runTool("/usr/bin/plutil", ["-extract", "CFBundleExecutable", "raw", "-o", "-", "-"], { input: plistBytes });
-    push(failures, appId.ok && appId.stdout.trim() === APP_ID, "iOS Info.plist bundle identifier mismatch");
-    push(failures, executableName.ok && /^[A-Za-z0-9_.-]+$/.test(executableName.stdout.trim()), "iOS Info.plist executable identity is invalid");
+    recordToolResult(failures, appId, "iOS Info.plist bundle identifier could not be extracted with plutil");
+    if (appId.ok) push(failures, appId.stdout.trim() === APP_ID, "iOS Info.plist bundle identifier mismatch");
+    recordToolResult(failures, executableName, "iOS Info.plist executable identity could not be extracted with plutil");
+    if (executableName.ok) push(failures, /^[A-Za-z0-9_.-]+$/.test(executableName.stdout.trim()), "iOS Info.plist executable identity is invalid");
+    if (!executableName.ok) return null;
     const executableMember = `${appRoot}/${executableName.stdout.trim()}`;
     push(failures, members.includes(executableMember), "iOS app ZIP omits its declared executable");
     const executable = await readFile(join(extractionRoot, executableMember));
@@ -947,22 +1003,24 @@ async function inspectIosArtifact(artifact, build, sourceFingerprint, resolution
 
     const executablePath = join(extractionRoot, executableMember);
     const symbols = runTool("/usr/bin/nm", ["-arch", "arm64", "-C", "-U", executablePath]);
-    push(failures, symbols.ok, "iOS executable symbols could not be inspected");
+    recordToolResult(failures, symbols, "iOS executable symbols could not be inspected");
     const implementationSymbols = {
       "QuickCrypto scrypt": /margelo::nitro::crypto::HybridScrypt::deriveKey\(/,
       "QuickCrypto AES-GCM": /margelo::nitro::crypto::HybridCipher::setAAD\(/,
       "Nitro installation": /margelo::nitro::install\(facebook::jsi::Runtime&/,
       "QuickBase64 implementation": /facebook::react::QuickBase64Impl::base64(?:From|To)ArrayBuffer\(/,
     };
-    for (const [name, pattern] of Object.entries(implementationSymbols)) {
-      push(failures, pattern.test(symbols.stdout), `iOS executable lacks linked ${name} implementation symbols`);
+    if (symbols.ok) {
+      for (const [name, pattern] of Object.entries(implementationSymbols)) {
+        push(failures, pattern.test(symbols.stdout), `iOS executable lacks linked ${name} implementation symbols`);
+      }
     }
     const loads = runTool("/usr/bin/otool", ["-arch", "arm64", "-L", executablePath]);
-    push(failures, loads.ok, "iOS executable load commands could not be inspected");
+    recordToolResult(failures, loads, "iOS executable load commands could not be inspected");
     const nativeMembers = {};
     for (const framework of ["OpenSSL", "hermesvm"]) {
       const loadPath = `@rpath/${framework}.framework/${framework}`;
-      push(failures, loads.stdout.includes(loadPath), `iOS executable lacks LC_LOAD_DYLIB for ${framework}`);
+      if (loads.ok) push(failures, loads.stdout.includes(loadPath), `iOS executable lacks LC_LOAD_DYLIB for ${framework}`);
       const member = `${appRoot}/Frameworks/${framework}.framework/${framework}`;
       push(failures, members.includes(member), `iOS signed app omits loaded ${framework} framework member`);
       if (!members.includes(member)) continue;
@@ -971,7 +1029,8 @@ async function inspectIosArtifact(artifact, build, sourceFingerprint, resolution
       await validateMachOWithAppleTools(frameworkBytes, `iOS ${framework} framework`, "DYLIB", failures);
       push(failures, machOPlatform(frameworkBytes) === target, `iOS ${framework} framework has a detached build platform`);
       const identity = runTool("/usr/bin/otool", ["-arch", "arm64", "-D", frameworkPath]);
-      push(failures, identity.ok && identity.stdout.includes(loadPath), `iOS ${framework} framework identity does not match its load command`);
+      recordToolResult(failures, identity, `iOS ${framework} framework identity could not be inspected with otool`);
+      if (identity.ok) push(failures, identity.stdout.includes(loadPath), `iOS ${framework} framework identity does not match its load command`);
       nativeMembers[member] = hash(frameworkBytes);
     }
     return {

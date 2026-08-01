@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   cpSync,
   existsSync,
   linkSync,
@@ -28,6 +29,9 @@ import {
 } from "../../../spikes/backup-crypto/compactProof.ts";
 import {
   G016_SOURCE_PATHS,
+  MAX_TOOL_DURATION_MS,
+  recordToolResultForTest,
+  runToolForTest,
   snapshotG016FileForTest,
   validateG016ResolutionForTest,
   validateG016FinalEvidence,
@@ -37,6 +41,74 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
 const validatorPath = resolve(repoRoot, "spikes/backup-crypto/deviceEvidenceValidator.mjs");
 const appId = "com.fawnmobile.g016backupcrypto";
+
+test("G016 tool timeout kills and reaps the direct child with attributed diagnostics", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "g016-tool-timeout-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const pidPath = join(directory, "pid");
+  const durationMs = 500;
+  const args = [
+    "-e",
+    [
+      'const { writeFileSync } = require("node:fs");',
+      `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+      'process.stdout.write("timeout " + "stdout");',
+      'process.stderr.write("timeout " + "stderr");',
+      'process.on("SIGTERM", () => {});',
+      "setInterval(() => {}, 1_000);",
+    ].join(""),
+  ];
+  const startedAt = Date.now();
+  const result = runToolForTest(process.execPath, args, durationMs);
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.ok, false);
+  assert.equal(result.command, process.execPath);
+  assert.deepEqual(result.args, args);
+  assert.notEqual(result.args, args);
+  assert.equal(result.exitCode, null);
+  assert.equal(result.errorCode, "ETIMEDOUT");
+  assert.equal(result.signal, "SIGKILL");
+  assert.equal(result.durationMs, durationMs);
+  assert.ok(typeof result.stdout === "string");
+  assert.ok(typeof result.stderr === "string");
+  assert.match(result.stdout, /timeout stdout/);
+  assert.match(result.stderr, /timeout stderr/);
+  assert.ok(elapsedMs >= durationMs / 2 && elapsedMs < 5_000, `timeout elapsed ${elapsedMs}ms`);
+
+  const failures: string[] = [];
+  if (recordToolResultForTest(failures, result, "hostile child timed out")) {
+    failures.push("downstream semantic claim derived from unavailable output");
+  }
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /hostile child timed out.*command=.*args=.*exitCode=none errorCode=ETIMEDOUT signal=SIGKILL durationMs=500/);
+  assert.doesNotMatch(failures[0], /timeout stdout|timeout stderr|downstream semantic claim/);
+
+  const pid = Number(readFileSync(pidPath, "utf8"));
+  assert.throws(() => process.kill(pid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH");
+});
+
+test("G016 tool failures retain ordinary exit-code attribution", () => {
+  const durationMs = 500;
+  const result = runToolForTest(process.execPath, ["-e", "process.exit(7)"], durationMs);
+  assert.equal(result.ok, false);
+  assert.equal(result.exitCode, 7);
+  assert.equal(result.errorCode, null);
+  assert.equal(result.signal, null);
+  assert.equal(result.durationMs, durationMs);
+
+  const failures: string[] = [];
+  recordToolResultForTest(failures, result, "child exited unsuccessfully");
+  assert.match(failures[0], /child exited unsuccessfully.*exitCode=7 errorCode=none signal=none durationMs=500/);
+});
+
+test("G016 production tool duration and normal validator arities remain stable", () => {
+  assert.equal(MAX_TOOL_DURATION_MS, 120_000);
+  assert.equal(runToolForTest.length, 3);
+  assert.equal(snapshotG016FileForTest.length, 3);
+  assert.equal(validateG016ResolutionForTest.length, 2);
+  assert.equal(validateG016FinalEvidence.length, 1);
+});
 
 function digest(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
@@ -102,9 +174,22 @@ function sourceManifest(): string {
   return G016_SOURCE_PATHS.map((path) => `${digest(readFileSync(resolve(repoRoot, path)))}  ${path}\n`).join("");
 }
 
+function runFixtureProcess(
+  command: string,
+  args: string[],
+  options: { cwd?: string; maxBuffer?: number } = {},
+) {
+  return spawnSync(command, args, { ...options, encoding: "utf8", timeout: MAX_TOOL_DURATION_MS, killSignal: "SIGKILL" });
+}
+
+function fixtureResultDiagnostic(result: ReturnType<typeof runFixtureProcess>): string {
+  const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code ?? "none";
+  return `errorCode=${errorCode} signal=${result.signal ?? "none"}\n${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+}
+
 function run(command: string, args: string[], cwd?: string): void {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  assert.equal(result.status, 0, `${command} ${args.join(" ")}\n${result.stdout}\n${result.stderr}`);
+  const result = runFixtureProcess(command, args, { cwd, maxBuffer: 64 * 1024 * 1024 });
+  assert.equal(result.status, 0, `${command} ${args.join(" ")}\n${fixtureResultDiagnostic(result)}`);
 }
 
 function androidTool(name: string): string {
@@ -113,6 +198,115 @@ function androidTool(name: string): string {
   assert.ok(versions.length > 0);
   return join(sdk, "build-tools", versions[0], name);
 }
+
+function posixShellLiteral(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function delegatedToolScript(realTool: string): string {
+  return `#!/bin/sh\nexec ${posixShellLiteral(realTool)} "$@"\n`;
+}
+
+function failedToolScript(stdout: string, stderr: string): string {
+  return `#!/bin/sh\nprintf '%s' ${posixShellLiteral(stdout)}\nprintf '%s\\n' ${posixShellLiteral(stderr)} >&2\nexit 73\n`;
+}
+
+async function withFailedAndroidTool<T>(
+  failedTool: "aapt" | "llvm-readelf" | "llvm-nm",
+  callback: () => Promise<T>,
+): Promise<T> {
+  const realSdk = process.env.ANDROID_HOME ?? process.env.ANDROID_SDK_ROOT ?? join(homedir(), "Library/Android/sdk");
+  const ndkVersions = readdirSync(join(realSdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+  assert.ok(ndkVersions.length > 0);
+  const ndkBin = join(realSdk, "ndk", ndkVersions[0], "toolchains/llvm/prebuilt/darwin-x86_64/bin");
+  const previousAndroidHome = process.env.ANDROID_HOME;
+  const previousAndroidSdkRoot = process.env.ANDROID_SDK_ROOT;
+  const syntheticSdk = mkdtempSync(join(tmpdir(), `g016-failed-${failedTool}-`));
+  try {
+    const destinations = {
+      aapt: join(syntheticSdk, "build-tools/1/aapt"),
+      apksigner: join(syntheticSdk, "build-tools/1/apksigner"),
+      apkanalyzer: join(syntheticSdk, "cmdline-tools/latest/bin/apkanalyzer"),
+      "llvm-readelf": join(syntheticSdk, "ndk/1/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readelf"),
+      "llvm-nm": join(syntheticSdk, "ndk/1/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-nm"),
+    };
+    const realTools = {
+      aapt: androidTool("aapt"),
+      apksigner: androidTool("apksigner"),
+      apkanalyzer: join(realSdk, "cmdline-tools/latest/bin/apkanalyzer"),
+      "llvm-readelf": join(ndkBin, "llvm-readelf"),
+      "llvm-nm": join(ndkBin, "llvm-nm"),
+    };
+    const failedStdout = {
+      aapt: "package: name='com.invalid'\nnative-code: 'x86'\napplication-debuggable\n",
+      "llvm-readelf": " 0x0000000000000001 (NEEDED) Shared library: [libg016-unavailable.so]\n",
+      "llvm-nm": "0000000000000000 T unavailable_tool_output\n",
+    };
+    for (const [name, destination] of Object.entries(destinations)) {
+      mkdirSync(dirname(destination), { recursive: true });
+      const script = name === failedTool
+        ? failedToolScript(failedStdout[failedTool], `synthetic ${failedTool} failure`)
+        : delegatedToolScript(realTools[name as keyof typeof realTools]);
+      writeFileSync(destination, script);
+      chmodSync(destination, 0o755);
+    }
+
+    process.env.ANDROID_HOME = syntheticSdk;
+    process.env.ANDROID_SDK_ROOT = syntheticSdk;
+    return await callback();
+  } finally {
+    if (previousAndroidHome === undefined) delete process.env.ANDROID_HOME;
+    else process.env.ANDROID_HOME = previousAndroidHome;
+    if (previousAndroidSdkRoot === undefined) delete process.env.ANDROID_SDK_ROOT;
+    else process.env.ANDROID_SDK_ROOT = previousAndroidSdkRoot;
+    rmSync(syntheticSdk, { recursive: true, force: true });
+  }
+}
+
+test("G016 delegated tool wrappers preserve hostile literal paths and arguments", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "g016-delegated-tool-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const realTool = join(directory, "real tool's $(touch G016_PATH_EXPANDED) `touch G016_BACKTICK_EXPANDED` $HOME-style");
+  const wrapper = join(directory, "delegate-wrapper");
+  const failedWrapper = join(directory, "failed-wrapper");
+  const args = [
+    "plain",
+    "space arg",
+    "single'quote",
+    "$(touch G016_ARG_EXPANDED)",
+    "`touch G016_ARG_BACKTICK_EXPANDED`",
+    "$HOME-style",
+  ];
+  writeFileSync(realTool, "#!/bin/sh\nprintf '%s\\n' \"$#\"\nprintf '<%s>\\n' \"$@\"\n");
+  chmodSync(realTool, 0o755);
+  writeFileSync(wrapper, delegatedToolScript(realTool));
+  chmodSync(wrapper, 0o755);
+  const controlledStdout = "stdout ' $(touch G016_STDOUT_EXPANDED) `touch G016_STDOUT_BACKTICK_EXPANDED` $HOME-style";
+  const controlledStderr = "stderr ' $(touch G016_STDERR_EXPANDED) `touch G016_STDERR_BACKTICK_EXPANDED` $HOME-style";
+  writeFileSync(failedWrapper, failedToolScript(controlledStdout, controlledStderr));
+  chmodSync(failedWrapper, 0o755);
+
+  const result = runFixtureProcess(wrapper, args, { cwd: directory });
+  const diagnostic = fixtureResultDiagnostic(result);
+  assert.equal(result.status, 0, diagnostic);
+  assert.equal(result.stdout, `${args.length}\n${args.map((arg) => `<${arg}>\n`).join("")}`, diagnostic);
+  assert.equal(result.stderr, "", diagnostic);
+  const failedResult = runFixtureProcess(failedWrapper, [], { cwd: directory });
+  const failedDiagnostic = fixtureResultDiagnostic(failedResult);
+  assert.equal(failedResult.status, 73, failedDiagnostic);
+  assert.equal(failedResult.stdout, controlledStdout, failedDiagnostic);
+  assert.equal(failedResult.stderr, `${controlledStderr}\n`, failedDiagnostic);
+  for (const marker of [
+    "G016_PATH_EXPANDED",
+    "G016_BACKTICK_EXPANDED",
+    "G016_ARG_EXPANDED",
+    "G016_ARG_BACKTICK_EXPANDED",
+    "G016_STDOUT_EXPANDED",
+    "G016_STDOUT_BACKTICK_EXPANDED",
+    "G016_STDERR_EXPANDED",
+    "G016_STDERR_BACKTICK_EXPANDED",
+  ]) assert.equal(existsSync(join(directory, marker)), false, marker);
+});
 
 function androidJar(): string {
   const sdk = process.env.ANDROID_HOME ?? process.env.ANDROID_SDK_ROOT ?? join(homedir(), "Library/Android/sdk");
@@ -157,10 +351,11 @@ function androidNativeFixtures() {
       'extern "C" int QuickCrypto_native(void) { margelo::nitro::crypto::HybridScrypt scrypt; margelo::nitro::crypto::HybridCipher cipher; return scrypt.deriveKey(1) + cipher.setAAD(1) + NitroModules_install() + (OpenSSL_version(0) != nullptr) + (SSL_new() != nullptr); }',
       "",
     ].join("\n"), ["NitroModules", "crypto", "ssl"], { cpp: true, soname: "libQuickCrypto.so" });
-    const undefinedSymbols = spawnSync(join(sdk, "ndk", ndk, "toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-nm"), ["-D", "-C", join(directory, "libQuickCrypto-undefined.so")], { encoding: "utf8" });
-    assert.equal(undefinedSymbols.status, 0, undefinedSymbols.stderr);
-    assert.match(undefinedSymbols.stdout, /^\s*U margelo::nitro::crypto::HybridScrypt::deriveKey\(/m);
-    assert.match(undefinedSymbols.stdout, /^\s*U margelo::nitro::crypto::HybridCipher::setAAD\(/m);
+    const undefinedSymbols = runFixtureProcess(join(sdk, "ndk", ndk, "toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-nm"), ["-D", "-C", join(directory, "libQuickCrypto-undefined.so")]);
+    const undefinedSymbolsDiagnostic = fixtureResultDiagnostic(undefinedSymbols);
+    assert.equal(undefinedSymbols.status, 0, undefinedSymbolsDiagnostic);
+    assert.match(undefinedSymbols.stdout, /^\s*U margelo::nitro::crypto::HybridScrypt::deriveKey\(/m, undefinedSymbolsDiagnostic);
+    assert.match(undefinedSymbols.stdout, /^\s*U margelo::nitro::crypto::HybridCipher::setAAD\(/m, undefinedSymbolsDiagnostic);
     fixtures["libQuickCrypto.so"] = compile("libQuickCrypto.so", [
       'extern "C" int NitroModules_install(void);', 'extern "C" const char* OpenSSL_version(int);', 'extern "C" void* SSL_new(void);',
       "namespace margelo::nitro::crypto {",
@@ -499,14 +694,15 @@ function replaceIosExecutableWithUndefinedImplementations(app: string): void {
     "-F", join(app, "Frameworks"), "-framework", "OpenSSL", "-framework", "hermesvm", "-Wl,-rpath,@executable_path/Frameworks",
     "-Wl,-undefined,dynamic_lookup", "-o", join(app, "G016"),
   ]);
-  const symbols = spawnSync("/usr/bin/nm", ["-arch", "arm64", "-C", join(app, "G016")], { encoding: "utf8" });
-  assert.equal(symbols.status, 0, symbols.stderr);
+  const symbols = runFixtureProcess("/usr/bin/nm", ["-arch", "arm64", "-C", join(app, "G016")]);
+  const symbolsDiagnostic = fixtureResultDiagnostic(symbols);
+  assert.equal(symbols.status, 0, symbolsDiagnostic);
   for (const pattern of [
     /^\s*U margelo::nitro::crypto::HybridScrypt::deriveKey\(/m,
     /^\s*U margelo::nitro::crypto::HybridCipher::setAAD\(/m,
     /^\s*U margelo::nitro::install\(facebook::jsi::Runtime&/m,
     /^\s*U facebook::react::QuickBase64Impl::base64FromArrayBuffer\(/m,
-  ]) assert.match(symbols.stdout, pattern);
+  ]) assert.match(symbols.stdout, pattern, symbolsDiagnostic);
 }
 
 function addAndroidElf(root: string, evidence: any, name: string, bytes: Buffer): void {
@@ -780,6 +976,40 @@ test("G016 requires defined Android and iOS implementation symbols, not names or
   assert.doesNotMatch(iosFailures, /signature verification failed|LC_LOAD_DYLIB|signed app omits loaded|framework identity|detached build platform/);
 });
 
+test("G016 failed aapt output is not parsed into manifest claims", async (t) => {
+  const fixture = makeFinalEvidence(t);
+  const result = await withFailedAndroidTool("aapt", () => validateG016FinalEvidence(fixture.evidence));
+  const failures = result.failures.join("; ");
+
+  assert.match(failures, /Android artifact is not a structurally valid APK according to aapt \[command=.*aapt.*exitCode=73 errorCode=none signal=none durationMs=120000\]/);
+  assert.doesNotMatch(failures, /Android APK manifest application ID mismatch|Android APK native architecture is not exactly arm64-v8a|Android APK manifest is debuggable/);
+});
+
+test("G016 readelf failure retains nm-derived symbol findings without dynamic claims", async (t) => {
+  const fixture = makeFinalEvidence(t);
+  const evidence = structuredClone(fixture.evidence);
+  addAndroidElf(fixture.evidenceRoot, evidence, "libQuickCrypto.so", androidNameOnlyQuickCrypto());
+  const result = await withFailedAndroidTool("llvm-readelf", () => validateG016FinalEvidence(evidence));
+  const failures = result.failures.join("; ");
+
+  assert.match(failures, /Android native member lib\/arm64-v8a\/libQuickCrypto\.so has unreadable dynamic entries \[command=.*llvm-readelf.*exitCode=73 errorCode=none signal=none durationMs=120000\]/);
+  assert.match(failures, /libQuickCrypto\.so lacks linked QuickCrypto scrypt implementation symbols/);
+  assert.match(failures, /libQuickCrypto\.so lacks linked QuickCrypto AES-GCM implementation symbols/);
+  assert.doesNotMatch(failures, /Android QuickCrypto does not dynamically depend|Android native dependency closure is missing/);
+});
+
+test("G016 nm failure retains readelf-derived closure findings without symbol claims", async (t) => {
+  const fixture = makeFinalEvidence(t);
+  const evidence = structuredClone(fixture.evidence);
+  addAndroidElf(fixture.evidenceRoot, evidence, "libg016-extra.so", androidUnclosedFixture());
+  const result = await withFailedAndroidTool("llvm-nm", () => validateG016FinalEvidence(evidence));
+  const failures = result.failures.join("; ");
+
+  assert.match(failures, /Android native member lib\/arm64-v8a\/libg016-extra\.so has unreadable dynamic symbols \[command=.*llvm-nm.*exitCode=73 errorCode=none signal=none durationMs=120000\]/);
+  assert.match(failures, /closure is missing libg016-missing\.so required by lib\/arm64-v8a\/libg016-extra\.so/);
+  assert.doesNotMatch(failures, /Android (?:lib[^ ]+\.so|appmodules) lacks linked/);
+});
+
 test("G016 rejects forged executing roots and aggregate contradictions", async (t) => {
   const { evidence, evidenceRoot } = makeFinalEvidence(t);
   const clone = join(evidenceRoot, "clone");
@@ -822,11 +1052,12 @@ test("G016 rejects renamed text artifacts, unlinked signed apps, and non-authent
       offset = bytes.indexOf(original, offset + original.length);
     }
     writeFileSync(executable, bytes);
-    const symbols = spawnSync("/usr/bin/nm", ["-arch", "arm64", "-C", executable], { encoding: "utf8" });
-    assert.equal(symbols.status, 0, symbols.stderr);
-    assert.match(symbols.stdout, /QuickCrypto_dummy/);
-    assert.match(symbols.stdout, /NitroModules_dummy/);
-    assert.match(symbols.stdout, /QuickBase64_dummy/);
+    const symbols = runFixtureProcess("/usr/bin/nm", ["-arch", "arm64", "-C", executable]);
+    const symbolsDiagnostic = fixtureResultDiagnostic(symbols);
+    assert.equal(symbols.status, 0, symbolsDiagnostic);
+    assert.match(symbols.stdout, /QuickCrypto_dummy/, symbolsDiagnostic);
+    assert.match(symbols.stdout, /NitroModules_dummy/, symbolsDiagnostic);
+    assert.match(symbols.stdout, /QuickBase64_dummy/, symbolsDiagnostic);
   }, true);
   assert.match((await validateG016FinalEvidence(unlinked)).failures.join("; "), /QuickBase64 implementation/);
 
@@ -1119,16 +1350,29 @@ test("G016 timing fails closed and aggregate CLI owns the sole final PASS", asyn
   const { evidenceRoot, evidence } = makeFinalEvidence(t);
   const inputPath = join(evidenceRoot, "aggregate-evidence.json");
   writeFileSync(inputPath, JSON.stringify(evidence));
-  const pass = spawnSync(process.execPath, [validatorPath, inputPath], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  assert.equal(pass.status, 0, pass.stdout + pass.stderr);
-  assert.equal(pass.stdout.match(/"status":"PASS"/g)?.length, 1);
-  const fail = spawnSync(process.execPath, [validatorPath], { encoding: "utf8" });
-  assert.equal(fail.status, 1);
-  assert.match(fail.stdout, /"status":"FAIL"/);
+  const pass = runFixtureProcess(process.execPath, [validatorPath, inputPath], { maxBuffer: 64 * 1024 * 1024 });
+  const passDiagnostic = fixtureResultDiagnostic(pass);
+  assert.equal(pass.status, 0, passDiagnostic);
+  assert.equal(pass.stdout.match(/"status":"PASS"/g)?.length, 1, passDiagnostic);
+  const fail = runFixtureProcess(process.execPath, [validatorPath]);
+  const failDiagnostic = fixtureResultDiagnostic(fail);
+  assert.equal(fail.status, 1, failDiagnostic);
+  assert.match(fail.stdout, /"status":"FAIL"/, failDiagnostic);
 });
 
 test("G016 source boundary remains exactly 49 unique existing paths", () => {
   assert.equal(G016_SOURCE_PATHS.length, 49);
   assert.equal(new Set(G016_SOURCE_PATHS).size, 49);
   for (const path of G016_SOURCE_PATHS) assert.doesNotThrow(() => readFileSync(resolve(repoRoot, path)), path);
+});
+
+test("G016 production and test fixture keep their sole spawnSync boundaries bounded", () => {
+  const validatorSource = readFileSync(validatorPath, "utf8");
+  assert.equal(validatorSource.match(/spawnSync\(/g)?.length, 1);
+  assert.match(validatorSource, /spawnSync\(command, copiedArgs,[\s\S]*timeout: durationMs,[\s\S]*killSignal: "SIGKILL"/);
+  assert.match(validatorSource, /function runTool\(command, args, options = \{\}\) \{\s*return runToolWithDuration\(command, args, options, MAX_TOOL_DURATION_MS\);\s*\}/);
+
+  const fixtureSource = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  assert.equal(fixtureSource.match(/spawnSync\(/g)?.length, 1);
+  assert.match(fixtureSource, /function runFixtureProcess[\s\S]*timeout: MAX_TOOL_DURATION_MS, killSignal: "SIGKILL"/);
 });
