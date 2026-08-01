@@ -12,6 +12,7 @@ export const APPROVED_EXPO_INSTALL_EXCLUSIONS = Object.freeze([
   "expo",
   "expo-dev-client",
   "jest-expo",
+  "react-native",
 ]);
 
 export const APPROVED_APP_DEPENDENCIES = Object.freeze({
@@ -34,7 +35,7 @@ export const APPROVED_APP_DEPENDENCIES = Object.freeze({
     "@types/node": "24.3.0",
     "@types/react": "19.2.14",
     eslint: "9.39.5",
-    "eslint-config-expo": "57.0.0",
+    "eslint-config-expo": "57.0.1",
     "expo-doctor": "1.20.0",
     jest: "29.7.0",
     "jest-expo": "57.0.1",

@@ -18,7 +18,7 @@
     {"name":"@types/node","version":"24.3.0","kind":"development","integrity":"sha512-aPTXCrfwnDLj4VvXrm+UUCQjNEvJgNA8s5F1cvwQU+3KNltTOkBm1j30uNLyqqPNe7gE3KFzImYoZEfLhp4Yow=="},
     {"name":"@types/react","version":"19.2.14","kind":"development","integrity":"sha512-ilcTH/UniCkMdtexkoCN0bI7pMcJDvmQFPvuPvmEaYA/NSfFTAgdUSLAoVjaRJm7+6PvcM+q1zYOwS4wTYMF9w=="},
     {"name":"eslint","version":"9.39.5","kind":"development","integrity":"sha512-DgZS62aPLXKlnxILS/AYCoRvHaZeXceIzlXPkkGGzJWSow1aEk0lbTlxUSlyjC8jcaKxAdOnTDz+o1JFSBsyjw=="},
-    {"name":"eslint-config-expo","version":"57.0.0","kind":"development","integrity":"sha512-T7OTN9xrSZYjLw4qTkL1Mn2WfAUVmMGY38+OYAcraI1uiTFVH6jfkSkv84WLTqnneblLcb6AsMDV+SHcUj3hGw=="},
+    {"name":"eslint-config-expo","version":"57.0.1","kind":"development","integrity":"sha512-OsLAReXOF3uXBwyxxw4f55sORYC+lOH4pSaGdU9MnYhRpjqPziK2uCnRxjLTGKeAKER7GSX5Wz9kNMGJT1MZEw=="},
     {"name":"expo-doctor","version":"1.20.0","kind":"development","integrity":"sha512-YL0uGQGZ65tWOCOiDH6BFzBkx/9N46MyBUdRfa4t6iuG4tbLg/phRrhmuaNm99QJVMqYtt3ksRbFCzuYOuX20Q=="},
     {"name":"jest","version":"29.7.0","kind":"development","integrity":"sha512-NIy3oAFp9shda19hy4HK0HRTWKtPJmGdnvywu01nOqNC2vZg+Z+fvJDxpMQA88eb2I9EcafcdjYgsDthnYTvGw=="},
     {"name":"jest-expo","version":"57.0.1","kind":"development","integrity":"sha512-7Kj8X08M6dpRvg0Noz91iiPdCgN1Z/V8VgCdWu+HBZoYfvc75uw50HleiVcjiXomW2gz8wZ1G0SgBYlGzwhzRg=="},
