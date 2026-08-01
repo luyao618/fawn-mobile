@@ -32,24 +32,28 @@ test("app dependency policy pins the independently approved names, versions, and
   assert.equal(APPROVED_APP_LICENSES.expo, "MIT");
   assert.equal(APPROVED_APP_LICENSES["expo-sqlite"], "MIT");
   assert.equal(APPROVED_APP_DEPENDENCIES.runtime["expo-secure-store"], "57.0.1");
+  assert.equal(APPROVED_APP_DEPENDENCIES.development["eslint-config-expo"], "57.0.1");
   assert.equal(APPROVED_APP_LICENSES["expo-secure-store"], "MIT");
   assert.equal(APPROVED_APP_LICENSES.typescript, "Apache-2.0");
 });
 
 test("Expo install exclusions reject omission, extras, reordering, and drift while keeping native modules checked", async () => {
   const [basePackageJson, packageLock, artifact, inventory] = await fixtures();
-  assert.deepEqual(APPROVED_EXPO_INSTALL_EXCLUSIONS, ["expo", "expo-dev-client", "jest-expo"]);
+  assert.deepEqual(APPROVED_EXPO_INSTALL_EXCLUSIONS, ["expo", "expo-dev-client", "jest-expo", "react-native"]);
   assert.deepEqual(basePackageJson.expo.install.exclude, APPROVED_EXPO_INSTALL_EXCLUSIONS);
   assert.equal(APPROVED_EXPO_INSTALL_EXCLUSIONS.includes("expo-secure-store"), false);
   assert.equal(APPROVED_EXPO_INSTALL_EXCLUSIONS.includes("expo-sqlite"), false);
+  assert.equal(APPROVED_EXPO_INSTALL_EXCLUSIONS.includes("eslint-config-expo"), false);
+  assert.equal(basePackageJson.dependencies["react-native"], "0.86.0");
+  assert.deepEqual(APPROVED_EXPO_INSTALL_EXCLUSIONS.slice(3), ["react-native"]);
 
   const mutations = [
     (manifest: any) => { delete manifest.expo.install.exclude; },
-    (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client"]; },
-    (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo", "expo-secure-store"]; },
-    (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo", "expo-sqlite"]; },
-    (manifest: any) => { manifest.expo.install.exclude = ["jest-expo", "expo-dev-client", "expo"]; },
-    (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo@57.0.1"]; },
+    (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo"]; },
+    (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo", "react-native", "expo-secure-store"]; },
+    (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo", "react-native", "expo-sqlite"]; },
+    (manifest: any) => { manifest.expo.install.exclude = ["react-native", "jest-expo", "expo-dev-client", "expo"]; },
+    (manifest: any) => { manifest.expo.install.exclude = ["expo", "expo-dev-client", "jest-expo", "react-native@0.86.0"]; },
   ];
   for (const mutate of mutations) {
     const packageJson = clone(basePackageJson);
