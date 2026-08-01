@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -93,7 +94,7 @@ const exactChildPrimaryUploadPaths = {
   ios: ".artifacts/ios-e2e.json\n.artifacts/config/ios-*.json\n.artifacts/schemes/ios-*.json\n.artifacts/native/ios/**\n.artifacts/launch/ios-dev-client.log\n.artifacts/test-results/ios-maestro.log\n.artifacts/ios-persistence.json\n.artifacts/ios-profile-restart.json\n.artifacts/persistence/ios/*.json\n",
 } as const;
 const forbiddenStaticUploadPath = /knowledge\/sources|knowledge\/generated|\.xlsx|fawn-slice0-who-reference\.csv|who-growth-reference\.csv/i;
-const exactAndroidRunnerSha256 = "52236399b43c99f85a9820351612e0228b835ad8f67c15eee23e9025b803fcb9";
+const exactAndroidRunnerSha256 = "5d6407581916af1aef66e37c57c80fe2658b5570da315c9f9542009c05ba9290";
 const exactNdkSelector = 'const ndk = readdirSync(join(sdk, "ndk")).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];';
 
 const exactPreflightNodeProgram = `const { accessSync, constants, readdirSync } = require("node:fs");
@@ -622,6 +623,97 @@ const exactAndroidPackageServiceCall = "wait_for_package_service";
 const exactAndroidPackageServiceRetryCall = "    wait_for_package_service";
 const exactAndroidInstallCall = "install_apk";
 const exactAndroidTransientInstallClassifier = `  if grep -Eq -e "^(cmd: )?Can't find service: package$" -e '^(cmd: )?Failure calling service package: Broken pipe( \\([0-9]+\\))?$' <<< "\${install_output//$'\\r'/}"; then`;
+const exactAndroidSystemReadinessCall = "wait_for_android_system_ui";
+const exactAndroidSystemReadinessBlock = String.raw`android_system_readiness_log=.artifacts/launch/android-system-readiness.log
+wait_for_android_system_ui() {
+  : > "$android_system_readiness_log"
+  probe_complete_pattern=$'^classification=(active-system-anr|healthy-launcher|transient-unhealthy-hierarchy)\npipeline-status=([0-9]{1,3}),([0-9]{1,3})$'
+  probe_status_only_pattern='^pipeline-status=([0-9]{1,3}),([0-9]{1,3})$'
+  for attempt in $(seq 1 12); do
+    probe_envelope=$(
+      set +e
+      timeout --kill-after=1s 5s adb -s "$emulator_serial" exec-out uiautomator dump /dev/tty 2>&1 |
+        python3 -c '
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+MAX_HIERARCHY_BYTES = 1024 * 1024
+KNOWN_TRAILERS = {
+    "UI hierchary dumped to: /dev/tty",
+    "UI hierarchy dumped to: /dev/tty",
+}
+
+payload = sys.stdin.buffer.read(MAX_HIERARCHY_BYTES + 1)
+if len(payload) > MAX_HIERARCHY_BYTES:
+    while sys.stdin.buffer.read(64 * 1024):
+        pass
+    raise ValueError("hierarchy payload too large")
+if re.search(br"<!\s*(?:DOCTYPE|ENTITY)\b", payload, re.IGNORECASE):
+    raise ValueError("XML declarations are not allowed")
+text = payload.decode("utf-8")
+document = text.lstrip().rstrip()
+for trailer in KNOWN_TRAILERS:
+    if document.endswith(trailer):
+        document = document[:-len(trailer)]
+        if document != document.rstrip():
+            raise ValueError("hierarchy trailer must be adjacent")
+        break
+root = ET.fromstring(document)
+if root.tag != "hierarchy":
+    raise ValueError("unexpected hierarchy root")
+resource_ids = {element.get("resource-id") for element in root.iter()}
+if resource_ids & {"android:id/aerr_close", "android:id/aerr_wait"}:
+    classification = "active-system-anr"
+elif len(root) == 1 and root[0].get("package") == "com.android.launcher3":
+    classification = "healthy-launcher"
+else:
+    classification = "transient-unhealthy-hierarchy"
+print(f"classification={classification}")
+' 2>/dev/null
+      probe_pipeline_status=("${"${"}PIPESTATUS[@]}")
+      printf 'pipeline-status=%s,%s\n' "${"${"}probe_pipeline_status[0]}" "${"${"}probe_pipeline_status[1]}"
+    )
+    hierarchy_classification=
+    probe_timeout_status=
+    probe_parser_status=
+    if [[ "$probe_envelope" =~ $probe_complete_pattern ]]; then
+      hierarchy_classification="${"${"}BASH_REMATCH[1]}"
+      probe_timeout_status="${"${"}BASH_REMATCH[2]}"
+      probe_parser_status="${"${"}BASH_REMATCH[3]}"
+    elif [[ "$probe_envelope" =~ $probe_status_only_pattern ]]; then
+      probe_timeout_status="${"${"}BASH_REMATCH[1]}"
+      probe_parser_status="${"${"}BASH_REMATCH[2]}"
+    fi
+    if [ -z "$probe_timeout_status" ] || [ -z "$probe_parser_status" ]; then
+      printf 'attempt=%s/12 result=transient-unhealthy-hierarchy\n' "$attempt" | tee -a "$android_system_readiness_log"
+    elif [ "$probe_timeout_status" -ne 0 ]; then
+      printf 'attempt=%s/12 result=transient-unreadable exit=%s\n' "$attempt" "$probe_timeout_status" | tee -a "$android_system_readiness_log"
+    elif [ "$probe_parser_status" -ne 0 ]; then
+      printf 'attempt=%s/12 result=transient-unhealthy-hierarchy\n' "$attempt" | tee -a "$android_system_readiness_log"
+    else
+      case "$hierarchy_classification" in
+        active-system-anr)
+          printf 'attempt=%s/12 result=active-system-anr\n' "$attempt" | tee -a "$android_system_readiness_log"
+          return 1
+          ;;
+        healthy-launcher)
+          printf 'attempt=%s/12 result=healthy-launcher\n' "$attempt" | tee -a "$android_system_readiness_log"
+          return 0
+          ;;
+        *)
+          printf 'attempt=%s/12 result=transient-unhealthy-hierarchy\n' "$attempt" | tee -a "$android_system_readiness_log"
+          ;;
+      esac
+    fi
+    if [ "$attempt" -lt 12 ]; then
+      sleep 2
+    fi
+  done
+  printf 'result=exhausted probes=12\n' | tee -a "$android_system_readiness_log"
+  return 1
+}
+`;
 const exactIosFailureScreenshotCommand = '    xcrun simctl io "$simulator_udid" screenshot .artifacts/launch/simulator/ios-failure.png';
 const exactIosFailureLogCommand = `    xcrun simctl spawn "$simulator_udid" log show --style compact --last 15m --predicate 'process == "ForMobile" OR process == "SpringBoard"' > .artifacts/launch/simulator/ios-simulator-app.log 2>&1`;
 const iosOpenConfirmationFlow = "e2e/maestro/ios-open-confirmation.yaml";
@@ -835,6 +927,39 @@ function assertExactAndroidUrlHandoff(script: string): void {
   );
 }
 
+function assertAndroidSystemReadinessPolicy(script: string): void {
+  assert.equal(
+    script.split(exactAndroidSystemReadinessBlock).length - 1,
+    1,
+    "Android system readiness must retain the exact bounded read-only implementation once",
+  );
+  const lines = script.split(/\r\n|\n|\r/);
+  assert.deepEqual(
+    lines.filter((line) => line === exactAndroidSystemReadinessCall),
+    [exactAndroidSystemReadinessCall],
+    "Android system readiness must execute exactly once",
+  );
+  const finalMetroProbeIndex = lines.indexOf(exactMetroStatusLines[1]);
+  const readinessIndex = lines.indexOf(exactAndroidSystemReadinessCall);
+  const urlIndex = lines.indexOf(exactDevClientUrlAssignment);
+  const launchIndex = lines.indexOf(exactAndroidOpenUrlCommand);
+  assert.ok(
+    finalMetroProbeIndex < readinessIndex && readinessIndex < urlIndex && urlIndex < launchIndex,
+    "Android system readiness must run after final Metro success and before URL assignment and app launch",
+  );
+  const executable = script
+    .split(/\r\n|\n|\r/)
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n")
+    .replace(/\\\n\s*/g, "")
+    .replace(/''|""/g, "");
+  assert.doesNotMatch(
+    executable,
+    /\bforce-stop\b|\bshell\s+input\s+(?:tap|keyevent)\b|\bshell\s+am\s+kill\b|\bshell\s+pm\s+clear\b|\blogcat\s+(?:-c|--clear)\b|\bshell\s+(?:am\s+start|monkey)\b[^\n]*com\.android\.launcher3/,
+    "Android system readiness must never mutate, dismiss, clear, kill, or restart guest system UI",
+  );
+}
+
 function assertExactAndroidInstallPolicy(script: string): void {
   const installLines = script.split(/\r\n|\n|\r/).filter((line) => !/^\s*#/.test(line) && /\badb\b.*\binstall\b/.test(line));
   assert.deepEqual(
@@ -844,7 +969,7 @@ function assertExactAndroidInstallPolicy(script: string): void {
   );
   assert.match(script, /printf '%s\\n' "\$install_output"/);
   assert.deepEqual(
-    script.split(/\r\n|\n|\r/).filter((line) => line.includes("grep -Eq")),
+    script.split(/\r\n|\n|\r/).filter((line) => line.includes("grep -Eq") && line.includes("install_output")),
     [exactAndroidTransientInstallClassifier],
     "Android retry classification must remain pipeline-free, CR-tolerant, and match only exact transport-failure lines",
   );
@@ -908,12 +1033,12 @@ function assertAndroidDiagnosticsPolicy(script: string, workflow: Workflow): voi
   );
   assert.deepEqual(
     lines.filter((line) => line.includes("sleep ")),
-    [exactAndroidPackageServiceLines[0], exactMetroStatusLines[0]],
-    "Android runner must retain only the two existing bounded service sleeps",
+    [exactAndroidPackageServiceLines[0], "      sleep 2", exactMetroStatusLines[0]],
+    "Android runner must retain only the exact bounded system, package-service, and Metro sleeps",
   );
   assert.doesNotMatch(
     script,
-    /\bforce-stop\b|(?:^|\s)input\s+(?:tap|keyevent)(?:\s|$)|android:id\/aerr_(?:close|wait)|Quickstep isn't responding/m,
+    /\bforce-stop\b|(?:^|\s)input\s+(?:tap|keyevent)(?:\s|$)|Quickstep isn't responding/m,
     "Android runner must not dismiss ANR dialogs or force-stop the launcher",
   );
   const cleanupStart = lines.indexOf("cleanup() {");
@@ -1143,6 +1268,7 @@ test("pinned Android action receives exactly one Bash command and the runner is 
   assertMetroProcessGroupPolicy(runner, "Android");
   assertExactReadinessCommand(runner, "Android");
   assertExactAndroidUrlHandoff(runner);
+  assertAndroidSystemReadinessPolicy(runner);
   assertExactAndroidPackageServicePolicy(runner);
   assertExactAndroidInstallPolicy(runner);
   assertAndroidDiagnosticsPolicy(runner, parsedWorkflow);
@@ -1164,6 +1290,8 @@ test("pinned Android action receives exactly one Bash command and the runner is 
     `    ${exactAndroidInstallCall}`,
     'adb -s "$emulator_serial" reverse tcp:8081 tcp:8081',
     exactHeadlessMetroCommands.Android,
+    exactMetroStatusLines[1],
+    exactAndroidSystemReadinessCall,
     exactDevClientUrlAssignment,
     exactAndroidOpenUrlCommand,
     exactReadinessCommands.Android,
@@ -1185,6 +1313,52 @@ test("Android deep-link handoff rejects waiting, textual status gates, and hosti
   for (const mutatedRunner of hostileMutations) {
     assert.notEqual(mutatedRunner, runner, "hostile Android launch fixture must change the runner");
     assert.throws(() => assertExactAndroidUrlHandoff(mutatedRunner));
+  }
+});
+
+test("Android system readiness policy rejects destructive, fail-open, reordered, and duplicated mutations", async () => {
+  const [runner, workflowSource] = await Promise.all([
+    readFile("scripts/e2e/run-android-emulator.sh", "utf8"),
+    readFile(".github/workflows/e2e-android.yml", "utf8"),
+  ]);
+  const workflow = parseWorkflow(workflowSource, ".github/workflows/e2e-android.yml");
+  const insertion = `${exactAndroidSystemReadinessCall}\n`;
+  const launch = `${exactAndroidOpenUrlCommand}\n`;
+  const hostileMutations = [
+    ["removed gate", runner.replace(insertion, "")],
+    ["duplicated gate", runner.replace(insertion, `${insertion}${insertion}`)],
+    ["fail-open gate", runner.replace(insertion, `${exactAndroidSystemReadinessCall} || true\n`)],
+    ["backgrounded gate", runner.replace(insertion, `${exactAndroidSystemReadinessCall} &\n`)],
+    ["post-launch gate", runner.replace(`${insertion}${exactDevClientUrlAssignment}`, exactDevClientUrlAssignment).replace(launch, `${launch}${insertion}`)],
+    ["unbounded probes", runner.replace("for attempt in $(seq 1 12); do", "for attempt in $(seq 1 120); do")],
+    ["unbounded dump", runner.replace("timeout --kill-after=1s 5s adb", "adb")],
+    ["removed hard kill escalation", runner.replace("timeout --kill-after=1s 5s adb", "timeout 5s adb")],
+    ["changed wait", runner.replace("      sleep 2", "      sleep 20")],
+    ["status capture delay", runner.replace('      probe_pipeline_status=("${PIPESTATUS[@]}")', '      printf "delayed\\n" >/dev/null\n      probe_pipeline_status=("${PIPESTATUS[@]}")')],
+    ["status bypass", runner.replace('elif [ "$probe_timeout_status" -ne 0 ]; then', "elif false; then")],
+    ["parser fail-open", runner.replace('elif [ "$probe_parser_status" -ne 0 ]; then', "elif false; then")],
+    ["fail-open active ANR", runner.replace("          return 1\n          ;;", "          return 0\n          ;;")],
+    ["tap dismissal", runner.replace(insertion, `adb -s "$emulator_serial" shell input tap 100 100\n${insertion}`)],
+    ["keyevent dismissal", runner.replace(insertion, `adb -s "$emulator_serial" shell input keyevent ENTER\n${insertion}`)],
+    ["launcher force-stop", runner.replace(insertion, `adb -s "$emulator_serial" shell am force-stop com.android.launcher3\n${insertion}`)],
+    ["launcher am kill", runner.replace(insertion, `adb -s "$emulator_serial" shell am kill com.android.launcher3\n${insertion}`)],
+    ["launcher pm clear", runner.replace(insertion, `adb -s "$emulator_serial" shell pm clear com.android.launcher3\n${insertion}`)],
+    ["launcher restart", runner.replace(insertion, `adb -s "$emulator_serial" shell am start -n com.android.launcher3/.Launcher\n${insertion}`)],
+    ["log clearing", runner.replace(insertion, `adb -s "$emulator_serial" logcat -c\n${insertion}`)],
+    ["app launch retry", runner.replace(launch, `${launch}${launch}`)],
+    ["Maestro flow change", runner.replace(readinessFlow, "e2e/maestro/hostile-readiness.yaml")],
+    ["Maestro timeout change", runner.replace(exactReadinessCommands.Android, `MAESTRO_DRIVER_STARTUP_TIMEOUT=120000 ${exactReadinessCommands.Android}`)],
+    ["Maestro fail-open", runner.replace(exactReadinessCommands.Android, `${exactReadinessCommands.Android} || true`)],
+    ["app crash evidence weakening", runner.replace(exactAndroidFallbackLogCommand, `${exactAndroidFallbackLogCommand} || true`)],
+  ] as const;
+  for (const [label, mutatedRunner] of hostileMutations) {
+    assert.notEqual(mutatedRunner, runner, `${label} fixture must change the runner`);
+    assert.throws(() => {
+      assertAndroidSystemReadinessPolicy(mutatedRunner);
+      assertExactAndroidUrlHandoff(mutatedRunner);
+      assertExactReadinessCommand(mutatedRunner, "Android");
+      assertAndroidDiagnosticsPolicy(mutatedRunner, workflow);
+    }, label);
   }
 });
 
@@ -1239,12 +1413,14 @@ async function runAndroidTransientInstallHarness(firstFailure: string, secondFai
   const installCount = join(root, "install-count");
   const firstInstallOutput = join(root, "first-install-output.log");
   const downstreamLog = join(root, "downstream.log");
+  const timeoutLog = join(root, "timeout.log");
   const bashEnv = join(root, "bash-env");
   await mkdir(fakeBin);
   await writeFile(adbLog, "");
   await writeFile(installCount, "0\n");
   await writeFile(firstInstallOutput, `${firstFailure}\n`);
   await writeFile(downstreamLog, "");
+  await writeFile(timeoutLog, "");
   await writeFile(bashEnv, `mapfile() {
   test "$1" = "-t"
   local array_name="$2"
@@ -1275,12 +1451,19 @@ elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "am" ] && 
 elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "screencap" ]; then
   printf 'png-sentinel'
 elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "uiautomator" ]; then
-  printf 'hierarchy-sentinel'
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hierarchy rotation="0"><node package="com.android.launcher3" /></hierarchy>UI hierchary dumped to: /dev/tty'
 elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "pidof" ]; then
   :
 elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "logcat" ]; then
   printf 'logcat-sentinel'
 fi
+`);
+  await writeFile(join(fakeBin, "timeout"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$ANDROID_TIMEOUT_LOG"
+if [ "\${1:-}" = "--kill-after=1s" ]; then shift; fi
+shift
+"$@"
 `);
   await writeFile(join(fakeBin, "curl"), "#!/usr/bin/env bash\nexit 0\n");
   for (const command of ["npx", "maestro"]) {
@@ -1291,6 +1474,7 @@ exit 97
   }
   await Promise.all([
     chmod(join(fakeBin, "adb"), 0o755),
+    chmod(join(fakeBin, "timeout"), 0o755),
     chmod(join(fakeBin, "curl"), 0o755),
     chmod(join(fakeBin, "npx"), 0o755),
     chmod(join(fakeBin, "maestro"), 0o755),
@@ -1304,13 +1488,493 @@ exit 97
       ANDROID_FIRST_INSTALL_OUTPUT: firstInstallOutput,
       ANDROID_INSTALL_COUNT: installCount,
       ANDROID_DOWNSTREAM_LOG: downstreamLog,
+      ANDROID_TIMEOUT_LOG: timeoutLog,
       BASH_ENV: bashEnv,
       PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
     },
     maxBuffer: 4 * 1024 * 1024,
   });
-  return { root, adbLog, downstreamLog, result };
+  return { root, adbLog, downstreamLog, timeoutLog, result };
 }
+
+async function assertExactAndroidTransientReadinessTimeout(timeoutLog: string) {
+  const hardTimeoutCalls = (await readFile(timeoutLog, "utf8"))
+    .trim()
+    .split("\n")
+    .filter((call) => call.startsWith("--kill-after="));
+  assert.deepEqual(
+    hardTimeoutCalls,
+    ["--kill-after=1s 5s adb -s emulator-5554 exec-out uiautomator dump /dev/tty"],
+    "transient-install success must use the harness-owned exact hard-timeout command once",
+  );
+}
+
+type AndroidHierarchyProbe = {
+  output: string | Uint8Array;
+  status?: number;
+};
+
+const androidHierarchyMaxBytes = 1024 * 1024;
+const misspelledHierarchyTrailer = "UI hierchary dumped to: /dev/tty";
+const correctedHierarchyTrailer = "UI hierarchy dumped to: /dev/tty";
+const healthyLauncherXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hierarchy rotation="0"><node package="com.android.launcher3" resource-id="" /></hierarchy>';
+const healthyLauncherHierarchy = `${healthyLauncherXml}${misspelledHierarchyTrailer}`;
+const launcherWithWidgetDescendantHierarchy = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hierarchy rotation="0"><node package="com.android.launcher3"><node package="com.google.android.googlequicksearchbox" /></node></hierarchy>${misspelledHierarchyTrailer}`;
+const mixedRootLauncherDescendantHierarchy = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hierarchy rotation="0"><node package="com.android.systemui"><node package="com.android.launcher3" /></node></hierarchy>${misspelledHierarchyTrailer}`;
+const noFocusHierarchy = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hierarchy rotation="0"><node package="com.android.systemui" resource-id="android:id/statusBarBackground" /></hierarchy>${misspelledHierarchyTrailer}`;
+const markerShapedMalformedHierarchy = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hierarchy rotation="0"><node package="com.android.launcher3" resource-id="android:id/aerr_close" /><node resource-id="android:id/aerr_wait" /></hierarchy><hierarchy></hierarchy>${misspelledHierarchyTrailer}`;
+const partialAnrHierarchy = '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hierarchy rotation="0"><node package="com.android.launcher3" resource-id="android:id/aerr_close"';
+const retainedApi35LauncherAnrHierarchy = `<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0"><node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[28,671][1052,1185]"><node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,713][1010,1143]"><node index="0" text="" resource-id="android:id/content" class="android.widget.FrameLayout" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,713][1010,1143]"><node index="0" text="" resource-id="android:id/parentPanel" class="android.widget.LinearLayout" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,713][1010,1143]"><node index="0" text="" resource-id="android:id/topPanel" class="android.widget.LinearLayout" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,713][1010,831]"><node index="0" text="" resource-id="android:id/title_template" class="android.widget.LinearLayout" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,713][1010,831]"><node index="0" text="Quickstep isn't responding" resource-id="android:id/alertTitle" class="android.widget.TextView" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[133,760][947,831]" /></node></node><node index="1" text="" resource-id="android:id/customPanel" class="android.widget.FrameLayout" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,831][1010,1143]"><node index="0" text="" resource-id="android:id/custom" class="android.widget.FrameLayout" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,831][1010,1143]"><node index="0" text="" resource-id="" class="android.widget.LinearLayout" package="android" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,831][1010,1143]"><node index="0" text="Close app" resource-id="android:id/aerr_close" class="android.widget.Button" package="android" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,870][1010,996]" /><node index="1" text="Wait" resource-id="android:id/aerr_wait" class="android.widget.Button" package="android" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,996][1010,1122]" /></node></node></node></node></node></node></node></hierarchy>UI hierchary dumped to: /dev/tty
+`;
+const nulNormalizedLauncherHierarchy = Buffer.concat([
+  Buffer.from('<?xml version="1.0"?><hierarchy><node package="com.android.launcher'),
+  Buffer.from([0]),
+  Buffer.from(`3" /></hierarchy>${misspelledHierarchyTrailer}`),
+]);
+const oversizedNulNormalizedLauncherHierarchy = Buffer.concat([
+  Buffer.from('<?xml version="1.0"?><hierarchy><node package="com.android.launcher'),
+  Buffer.alloc(androidHierarchyMaxBytes + 1),
+  Buffer.from(`3" /></hierarchy>${misspelledHierarchyTrailer}`),
+]);
+const activeLauncherAnrHierarchies = [
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hierarchy rotation="0"><node package="android" resource-id="android:id/aerr_close" /><node package="com.android.launcher3" /></hierarchy>${misspelledHierarchyTrailer}`,
+  retainedApi35LauncherAnrHierarchy,
+];
+
+async function runAndroidSystemReadinessHarness(options: {
+  probes: AndroidHierarchyProbe[];
+  firstMaestroStatus?: number;
+  appPid?: string;
+  parserFailure?: boolean;
+  parserSpoof?: boolean;
+}) {
+  const root = await mkdtemp(join(tmpdir(), "g044-android-system-readiness-"));
+  const fakeBin = join(root, "bin");
+  const eventLog = join(root, "events.log");
+  const probeCount = join(root, "probe-count");
+  const probeManifest = join(root, "probe-manifest");
+  const maestroCount = join(root, "maestro-count");
+  const bashEnv = join(root, "bash-env");
+  await mkdir(fakeBin);
+  await writeFile(eventLog, "");
+  await writeFile(probeCount, "0\n");
+  await writeFile(maestroCount, "0\n");
+  const manifestLines: string[] = [];
+  for (const [index, probe] of options.probes.entries()) {
+    const path = join(root, `probe-${index + 1}.xml`);
+    await writeFile(path, probe.output);
+    manifestLines.push(`${probe.status ?? 0}\t${path}`);
+  }
+  await writeFile(probeManifest, `${manifestLines.join("\n")}\n`);
+  await writeFile(bashEnv, `mapfile() {
+  test "$1" = "-t"
+  local array_name="$2"
+  local values=()
+  local line
+  while IFS= read -r line; do values[\${#values[@]}]="$line"; done
+  eval "$array_name=(\\"\${values[@]}\\")"
+}
+`);
+  await writeFile(join(fakeBin, "adb"), `#!/usr/bin/env bash
+set -euo pipefail
+printf 'adb %s\\n' "$*" >> "$ANDROID_EVENT_LOG"
+if [ "\${1:-}" = "devices" ]; then
+  printf 'List of devices attached\\nemulator-5554\\tdevice\\n'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "install" ]; then
+  printf 'Success\\n'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "service" ]; then
+  printf '%s\\r\\n' 'Service package: found'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "uiautomator" ]; then
+  count=$(cat "$ANDROID_PROBE_COUNT")
+  count=$((count + 1))
+  printf '%s\\n' "$count" > "$ANDROID_PROBE_COUNT"
+  index="$count"
+  if [ "$index" -gt "$ANDROID_PROBE_TOTAL" ]; then index="$ANDROID_PROBE_TOTAL"; fi
+  probe=$(sed -n "\${index}p" "$ANDROID_PROBE_MANIFEST")
+  IFS=$'\\t' read -r probe_status probe_path <<< "$probe"
+  cat "$probe_path"
+  exit "$probe_status"
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "am" ] && [ "\${5:-}" = "start" ]; then
+  printf 'Status: ok\\n'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "exec-out" ] && [ "\${4:-}" = "screencap" ]; then
+  printf 'png-sentinel'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "dumpsys" ]; then
+  printf 'historical lastanr: com.android.launcher3\\n'
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "shell" ] && [ "\${4:-}" = "pidof" ]; then
+  if [ -n "$ANDROID_APP_PID" ]; then printf '%s\\r\\n' "$ANDROID_APP_PID"; fi
+elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "logcat" ]; then
+  printf 'logcat-sentinel\\n'
+fi
+`);
+  await writeFile(join(fakeBin, "timeout"), `#!/usr/bin/env bash
+set -euo pipefail
+printf 'timeout %s\\n' "$*" >> "$ANDROID_EVENT_LOG"
+if [ "\${1:-}" = "--kill-after=1s" ]; then shift; fi
+shift
+"$@"
+`);
+  await writeFile(join(fakeBin, "sleep"), `#!/usr/bin/env bash
+printf 'sleep %s\\n' "$*" >> "$ANDROID_EVENT_LOG"
+`);
+  await writeFile(join(fakeBin, "curl"), `#!/usr/bin/env bash
+printf 'curl %s\\n' "$*" >> "$ANDROID_EVENT_LOG"
+exit 0
+`);
+  await writeFile(join(fakeBin, "npx"), `#!/usr/bin/env bash
+printf 'npx %s\\n' "$*" >> "$ANDROID_EVENT_LOG"
+exit 0
+`);
+  await writeFile(join(fakeBin, "maestro"), `#!/usr/bin/env bash
+set -euo pipefail
+printf 'maestro %s\\n' "$*" >> "$ANDROID_EVENT_LOG"
+count=$(cat "$ANDROID_MAESTRO_COUNT")
+count=$((count + 1))
+printf '%s\\n' "$count" > "$ANDROID_MAESTRO_COUNT"
+if [ "$count" -eq 1 ]; then exit "$ANDROID_FIRST_MAESTRO_STATUS"; fi
+exit 0
+`);
+  const fakeCommands = ["adb", "timeout", "sleep", "curl", "npx", "maestro"];
+  if (options.parserFailure === true) {
+    await writeFile(join(fakeBin, "python3"), `#!/usr/bin/env bash
+cat >/dev/null
+printf 'python3 parser-failure\\n' >> "$ANDROID_EVENT_LOG"
+exit 91
+`);
+    fakeCommands.push("python3");
+  } else if (options.parserSpoof === true) {
+    await writeFile(join(fakeBin, "python3"), `#!/usr/bin/env bash
+cat >/dev/null
+printf 'classification=healthy-launcher\\npipeline-status=0,0\\n'
+exit 0
+`);
+    fakeCommands.push("python3");
+  }
+  await Promise.all(fakeCommands.map((command) => chmod(join(fakeBin, command), 0o755)));
+  const result = spawnSync("bash", [resolve("scripts/e2e/run-android-emulator.sh")], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ANDROID_APP_PID: options.appPid ?? "",
+      ANDROID_EVENT_LOG: eventLog,
+      ANDROID_FIRST_MAESTRO_STATUS: String(options.firstMaestroStatus ?? 0),
+      ANDROID_MAESTRO_COUNT: maestroCount,
+      ANDROID_PROBE_COUNT: probeCount,
+      ANDROID_PROBE_MANIFEST: probeManifest,
+      ANDROID_PROBE_TOTAL: String(options.probes.length),
+      BASH_ENV: bashEnv,
+      EXPECTED_SHA: "",
+      PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+    },
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return {
+    root,
+    result,
+    events: (await readFile(eventLog, "utf8")).trim().split("\n").filter(Boolean),
+    readinessLog: join(root, ".artifacts/launch/android-system-readiness.log"),
+  };
+}
+
+test("Android system readiness accepts one healthy current Launcher hierarchy and ignores historical lastanr", async () => {
+  const harness = await runAndroidSystemReadinessHarness({ probes: [{ output: healthyLauncherHierarchy }] });
+  try {
+    assert.equal(harness.result.status, 0, harness.result.stderr);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 1);
+    assert.equal(harness.events.filter((event) => event.includes(" shell am start ")).length, 1);
+    assert.equal(harness.events.filter((event) => event.startsWith("maestro ")).length, 2);
+    assert.equal(harness.events.some((event) => event.includes("dumpsys activity lastanr")), false);
+    const finalMetroIndex = harness.events.lastIndexOf("curl --silent --fail http://127.0.0.1:8081/status");
+    const systemProbeIndex = harness.events.findIndex((event) => event.startsWith("timeout --kill-after=1s 5s adb "));
+    const launchIndex = harness.events.findIndex((event) => event.includes(" shell am start "));
+    const readinessIndex = harness.events.findIndex((event) => event.includes("android-readiness e2e/maestro/shell-readiness.yaml"));
+    const smokeIndex = harness.events.findIndex((event) => event.includes("android-smoke e2e/maestro/shell-smoke.yaml"));
+    assert.ok(finalMetroIndex < systemProbeIndex && systemProbeIndex < launchIndex && launchIndex < readinessIndex && readinessIndex < smokeIndex);
+    assert.equal(await readFile(harness.readinessLog, "utf8"), "attempt=1/12 result=healthy-launcher\n");
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness uses hard timeout escalation and accepts Launcher-owned roots with widget descendants", async () => {
+  const harness = await runAndroidSystemReadinessHarness({ probes: [{ output: launcherWithWidgetDescendantHierarchy }] });
+  try {
+    assert.equal(harness.result.status, 0, harness.result.stderr);
+    assert.deepEqual(
+      harness.events.filter((event) => event.startsWith("timeout ")),
+      ["timeout --kill-after=1s 5s adb -s emulator-5554 exec-out uiautomator dump /dev/tty"],
+    );
+    assert.equal(await readFile(harness.readinessLog, "utf8"), "attempt=1/12 result=healthy-launcher\n");
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness rejects descendant-only Launcher ownership before recovering", async () => {
+  const harness = await runAndroidSystemReadinessHarness({
+    probes: [{ output: mixedRootLauncherDescendantHierarchy }, { output: healthyLauncherHierarchy }],
+  });
+  try {
+    assert.equal(harness.result.status, 0, harness.result.stderr);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout ")).length, 2);
+    assert.equal(
+      await readFile(harness.readinessLog, "utf8"),
+      "attempt=1/12 result=transient-unhealthy-hierarchy\nattempt=2/12 result=healthy-launcher\n",
+    );
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness streams raw NUL bytes into the parser before normalization and byte bounds", async () => {
+  for (const [label, output] of [
+    ["embedded NUL", nulNormalizedLauncherHierarchy],
+    ["over-limit NUL padding", oversizedNulNormalizedLauncherHierarchy],
+  ] as const) {
+    const harness = await runAndroidSystemReadinessHarness({
+      probes: [{ output }, { output: healthyLauncherHierarchy }],
+    });
+    try {
+      assert.equal(harness.result.status, 0, `${label}: ${harness.result.stderr}`);
+      assert.equal(harness.events.filter((event) => event.startsWith("timeout ")).length, 2, label);
+      assert.equal(
+        await readFile(harness.readinessLog, "utf8"),
+        "attempt=1/12 result=transient-unhealthy-hierarchy\nattempt=2/12 result=healthy-launcher\n",
+        label,
+      );
+    } finally {
+      await rm(harness.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Android system readiness rejects noncanonical parser output instead of trusting spoofed pipeline framing", async () => {
+  const harness = await runAndroidSystemReadinessHarness({
+    probes: [{ output: healthyLauncherHierarchy }],
+    parserSpoof: true,
+  });
+  try {
+    assert.notEqual(harness.result.status, 0);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 12);
+    assert.equal(harness.events.some((event) => event.includes(" shell am start ")), false);
+    const statuses = (await readFile(harness.readinessLog, "utf8")).trim().split("\n");
+    assert.ok(statuses.slice(0, 12).every((status, index) => status === `attempt=${index + 1}/12 result=transient-unhealthy-hierarchy`));
+    assert.equal(statuses.at(12), "result=exhausted probes=12");
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness accepts only the known misspelled and corrected hierarchy trailers", async () => {
+  for (const trailer of [misspelledHierarchyTrailer, correctedHierarchyTrailer]) {
+    const harness = await runAndroidSystemReadinessHarness({
+      probes: [{ output: ` \n${healthyLauncherXml}${trailer}\n` }],
+    });
+    try {
+      assert.equal(harness.result.status, 0, `${trailer}: ${harness.result.stderr}`);
+      assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 1);
+      assert.equal(await readFile(harness.readinessLog, "utf8"), "attempt=1/12 result=healthy-launcher\n");
+    } finally {
+      await rm(harness.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Android system readiness accepts an empty trailer with cross-version XML framing semantics", async () => {
+  const harness = await runAndroidSystemReadinessHarness({
+    probes: [{ output: `\n \t${healthyLauncherXml}\r\n` }],
+  });
+  try {
+    assert.equal(harness.result.status, 0, harness.result.stderr);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 1);
+    assert.equal(await readFile(harness.readinessLog, "utf8"), "attempt=1/12 result=healthy-launcher\n");
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness rejects hostile hierarchy framing before recovering", async () => {
+  const hostileHierarchies = [
+    ["unknown trailer", `${healthyLauncherXml}UI hierarchy dumped to: /data/local/tmp/window.xml`],
+    ["non-exact separated trailer", `${healthyLauncherXml}\n${misspelledHierarchyTrailer}`],
+    ["additional XML document", `${healthyLauncherXml}<hierarchy rotation="0"><node package="com.android.launcher3" /></hierarchy>${misspelledHierarchyTrailer}`],
+    ["non-whitespace prefix", `uiautomator output\n${healthyLauncherHierarchy}`],
+    ["DOCTYPE declaration", `<?xml version="1.0"?><!DOCTYPE hierarchy><hierarchy><node package="com.android.launcher3" /></hierarchy>${misspelledHierarchyTrailer}`],
+    ["ENTITY declaration", `<?xml version="1.0"?><!DOCTYPE hierarchy [<!ENTITY launcher "com.android.launcher3">]><hierarchy><node package="&launcher;" /></hierarchy>${misspelledHierarchyTrailer}`],
+    ["non-UTF8 payload", new Uint8Array([0xff, 0xfe, 0x3c, 0x68, 0x69, 0x65, 0x72, 0x61, 0x72, 0x63, 0x68, 0x79, 0x2f, 0x3e])],
+    ["oversized payload", `<?xml version="1.0"?><hierarchy><node package="com.android.launcher3" text="${"x".repeat(androidHierarchyMaxBytes)}" /></hierarchy>${misspelledHierarchyTrailer}`],
+    ["wrong root", `<?xml version="1.0"?><window><node package="com.android.launcher3" /></window>${misspelledHierarchyTrailer}`],
+    ["truncated document", `${partialAnrHierarchy}${misspelledHierarchyTrailer}`],
+  ] as const;
+  for (const [label, hostileHierarchy] of hostileHierarchies) {
+    const harness = await runAndroidSystemReadinessHarness({
+      probes: [{ output: hostileHierarchy }, { output: healthyLauncherHierarchy }],
+    });
+    try {
+      assert.equal(harness.result.status, 0, `${label}: ${harness.result.stderr}`);
+      assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 2, label);
+      assert.deepEqual(harness.events.filter((event) => event === "sleep 2"), ["sleep 2"], label);
+      assert.equal(
+        await readFile(harness.readinessLog, "utf8"),
+        "attempt=1/12 result=transient-unhealthy-hierarchy\nattempt=2/12 result=healthy-launcher\n",
+        label,
+      );
+    } finally {
+      await rm(harness.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Android system readiness waits only between transient probes and then launches once", async () => {
+  const harness = await runAndroidSystemReadinessHarness({
+    probes: [{ output: noFocusHierarchy }, { output: "uiautomator unavailable", status: 1 }, { output: healthyLauncherHierarchy }],
+  });
+  try {
+    assert.equal(harness.result.status, 0, harness.result.stderr);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 3);
+    assert.deepEqual(harness.events.filter((event) => event.startsWith("sleep ")), ["sleep 2", "sleep 2"]);
+    assert.equal(harness.events.filter((event) => event.includes(" shell am start ")).length, 1);
+    assert.equal(
+      await readFile(harness.readinessLog, "utf8"),
+      "attempt=1/12 result=transient-unhealthy-hierarchy\nattempt=2/12 result=transient-unreadable exit=1\nattempt=3/12 result=healthy-launcher\n",
+    );
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness fails immediately on a current ANR, including the retained API35 misspelled-trailer artifact", async () => {
+  assert.equal(Buffer.byteLength(retainedApi35LauncherAnrHierarchy), 4169);
+  assert.equal(createHash("sha256").update(retainedApi35LauncherAnrHierarchy).digest("hex"), "9ce0c04d2eee8b746db317a3b6139ff3f78043438de569e088246e11b88256a1");
+  for (const hierarchy of activeLauncherAnrHierarchies) {
+    const harness = await runAndroidSystemReadinessHarness({ probes: [{ output: hierarchy }] });
+    try {
+      assert.notEqual(harness.result.status, 0);
+      assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 1);
+      assert.equal(harness.events.some((event) => event.includes(" shell am start ")), false);
+      assert.equal(harness.events.some((event) => event.startsWith("maestro ")), false);
+      assert.equal(await readFile(harness.readinessLog, "utf8"), "attempt=1/12 result=active-system-anr\n");
+    } finally {
+      await rm(harness.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Android system readiness rejects marker-shaped malformed status-0 hierarchy output", async () => {
+  for (const marker of ['<?xml version=', "<hierarchy", "</hierarchy>", 'package="com.android.launcher3"', 'resource-id="android:id/aerr_close"', 'resource-id="android:id/aerr_wait"']) {
+    assert.ok(markerShapedMalformedHierarchy.includes(marker), `hostile fixture must retain prior marker ${marker}`);
+  }
+  const harness = await runAndroidSystemReadinessHarness({ probes: [{ output: markerShapedMalformedHierarchy }] });
+  try {
+    assert.notEqual(harness.result.status, 0);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 12);
+    assert.equal(harness.events.filter((event) => event === "sleep 2").length, 11);
+    assert.equal(harness.events.some((event) => event.includes(" shell am start ")), false);
+    assert.equal(harness.events.some((event) => event.startsWith("maestro ")), false);
+    const statuses = (await readFile(harness.readinessLog, "utf8")).trim().split("\n");
+    assert.equal(statuses.length, 13);
+    assert.ok(statuses.slice(0, 12).every((status, index) => status === `attempt=${index + 1}/12 result=transient-unhealthy-hierarchy`));
+    assert.equal(statuses.at(12), "result=exhausted probes=12");
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness classifies nonzero partial ANR output as unreadable before recovering", async () => {
+  const harness = await runAndroidSystemReadinessHarness({
+    probes: [{ output: partialAnrHierarchy, status: 124 }, { output: healthyLauncherHierarchy }],
+  });
+  try {
+    assert.equal(harness.result.status, 0, harness.result.stderr);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 2);
+    assert.deepEqual(harness.events.filter((event) => event === "sleep 2"), ["sleep 2"]);
+    assert.equal(harness.events.filter((event) => event.includes(" shell am start ")).length, 1);
+    assert.equal(
+      await readFile(harness.readinessLog, "utf8"),
+      "attempt=1/12 result=transient-unreadable exit=124\nattempt=2/12 result=healthy-launcher\n",
+    );
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness fails closed within the same bounds when the XML parser fails", async () => {
+  const harness = await runAndroidSystemReadinessHarness({
+    probes: [{ output: healthyLauncherHierarchy }],
+    parserFailure: true,
+  });
+  try {
+    assert.notEqual(harness.result.status, 0);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 12);
+    assert.equal(harness.events.filter((event) => event === "python3 parser-failure").length, 12);
+    assert.equal(harness.events.filter((event) => event === "sleep 2").length, 11);
+    assert.equal(harness.events.some((event) => event.includes(" shell am start ")), false);
+    assert.equal(harness.events.some((event) => event.startsWith("maestro ")), false);
+    const statuses = (await readFile(harness.readinessLog, "utf8")).trim().split("\n");
+    assert.ok(statuses.slice(0, 12).every((status, index) => status === `attempt=${index + 1}/12 result=transient-unhealthy-hierarchy`));
+    assert.equal(statuses.at(12), "result=exhausted probes=12");
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness recovers from malformed status-0 XML to a complete healthy hierarchy", async () => {
+  const harness = await runAndroidSystemReadinessHarness({
+    probes: [{ output: markerShapedMalformedHierarchy }, { output: healthyLauncherHierarchy }],
+  });
+  try {
+    assert.equal(harness.result.status, 0, harness.result.stderr);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 2);
+    assert.deepEqual(harness.events.filter((event) => event === "sleep 2"), ["sleep 2"]);
+    assert.equal(harness.events.filter((event) => event.includes(" shell am start ")).length, 1);
+    assert.equal(
+      await readFile(harness.readinessLog, "utf8"),
+      "attempt=1/12 result=transient-unhealthy-hierarchy\nattempt=2/12 result=healthy-launcher\n",
+    );
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android system readiness exhausts exactly twelve unreadable current hierarchies and fails closed", async () => {
+  const harness = await runAndroidSystemReadinessHarness({ probes: Array.from({ length: 12 }, () => ({ output: "uiautomator unavailable", status: 1 })) });
+  try {
+    assert.notEqual(harness.result.status, 0);
+    assert.equal(harness.events.filter((event) => event.startsWith("timeout --kill-after=1s 5s adb ")).length, 12);
+    assert.equal(harness.events.filter((event) => event === "sleep 2").length, 11);
+    assert.equal(harness.events.some((event) => event.includes(" shell am start ")), false);
+    assert.equal(harness.events.some((event) => event.startsWith("maestro ")), false);
+    const statuses = (await readFile(harness.readinessLog, "utf8")).trim().split("\n");
+    assert.equal(statuses.length, 13);
+    assert.equal(statuses.at(0), "attempt=1/12 result=transient-unreadable exit=1");
+    assert.equal(statuses.at(11), "attempt=12/12 result=transient-unreadable exit=1");
+    assert.equal(statuses.at(12), "result=exhausted probes=12");
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Android downstream failures preserve status and both PID-scoped and fallback crash diagnostics", async () => {
+  for (const appPid of ["4242", ""]) {
+    const harness = await runAndroidSystemReadinessHarness({
+      probes: [{ output: healthyLauncherHierarchy }],
+      firstMaestroStatus: 73,
+      appPid,
+    });
+    try {
+      assert.equal(harness.result.status, 73, `PID ${appPid || "absent"} must preserve Maestro status`);
+      assert.equal(harness.events.filter((event) => event.includes(" shell am start ")).length, 1);
+      assert.equal(harness.events.filter((event) => event.startsWith("maestro ")).length, 1);
+      if (appPid) {
+        assert.ok(harness.events.some((event) => event.includes("logcat -d --pid=4242")));
+      } else {
+        assert.ok(harness.events.some((event) => event.includes("logcat -d -s AndroidRuntime:E ActivityManager:I ReactNativeJS:V Expo:V *:S")));
+      }
+    } finally {
+      await rm(harness.root, { recursive: true, force: true });
+    }
+  }
+});
 
 test("Android am start timeout text remains nonblocking until bounded Maestro readiness", async () => {
   const harness = await runAndroidTransientInstallHarness("Failure calling service package: Broken pipe (32)");
@@ -1323,6 +1987,7 @@ test("Android am start timeout text remains nonblocking until bounded Maestro re
       '-s emulator-5554 shell am start -a android.intent.action.VIEW -d formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081 -p com.luyao618.formobile',
     );
     assert.match(await readFile(harness.downstreamLog, "utf8"), /maestro --device emulator-5554 test --debug-output .*android-readiness/);
+    await assertExactAndroidTransientReadinessTimeout(harness.timeoutLog);
   } finally {
     await rm(harness.root, { recursive: true, force: true });
   }
@@ -1338,6 +2003,7 @@ test("Android retries one broken package transport install after renewed readine
     assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 2);
     assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 reverse tcp:8081 tcp:8081").length, 1);
     assert.match(await readFile(harness.downstreamLog, "utf8"), /maestro --device emulator-5554 test --debug-output .*android-readiness/);
+    await assertExactAndroidTransientReadinessTimeout(harness.timeoutLog);
   } finally {
     await rm(harness.root, { recursive: true, force: true });
   }
@@ -1354,6 +2020,7 @@ test("Android retries both exact package transport lines with the adb cmd prefix
       const adbCalls = (await readFile(harness.adbLog, "utf8")).trim().split("\n");
       assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 2);
       assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 reverse tcp:8081 tcp:8081").length, 1);
+      await assertExactAndroidTransientReadinessTimeout(harness.timeoutLog);
     } finally {
       await rm(harness.root, { recursive: true, force: true });
     }
@@ -1372,6 +2039,7 @@ test("Android retries an exact transport line followed by a large benign diagnos
     assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 2);
     assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 reverse tcp:8081 tcp:8081").length, 1);
     assert.match(await readFile(harness.downstreamLog, "utf8"), /maestro --device emulator-5554 test --debug-output .*android-readiness/);
+    await assertExactAndroidTransientReadinessTimeout(harness.timeoutLog);
   } finally {
     await rm(harness.root, { recursive: true, force: true });
   }
@@ -2197,7 +2865,7 @@ test("headless Metro, readiness, and iOS confirmation policies reject hostile co
     assert.notEqual(mutatedScript, androidRunner);
     assert.throws(
       () => assertAndroidDiagnosticsPolicy(mutatedScript, androidWorkflow),
-      /Android cleanup must preserve|failure diagnostic command inventory|non-retried readiness and smoke commands|only the two existing bounded service sleeps|must not dismiss ANR dialogs/,
+      /Android cleanup must preserve|failure diagnostic command inventory|non-retried readiness and smoke commands|exact bounded system, package-service, and Metro sleeps|must not dismiss ANR dialogs/,
     );
   }
 
