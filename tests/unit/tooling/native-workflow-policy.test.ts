@@ -1413,12 +1413,14 @@ async function runAndroidTransientInstallHarness(firstFailure: string, secondFai
   const installCount = join(root, "install-count");
   const firstInstallOutput = join(root, "first-install-output.log");
   const downstreamLog = join(root, "downstream.log");
+  const timeoutLog = join(root, "timeout.log");
   const bashEnv = join(root, "bash-env");
   await mkdir(fakeBin);
   await writeFile(adbLog, "");
   await writeFile(installCount, "0\n");
   await writeFile(firstInstallOutput, `${firstFailure}\n`);
   await writeFile(downstreamLog, "");
+  await writeFile(timeoutLog, "");
   await writeFile(bashEnv, `mapfile() {
   test "$1" = "-t"
   local array_name="$2"
@@ -1456,6 +1458,13 @@ elif [ "\${1:-}" = "-s" ] && [ "\${3:-}" = "logcat" ]; then
   printf 'logcat-sentinel'
 fi
 `);
+  await writeFile(join(fakeBin, "timeout"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$ANDROID_TIMEOUT_LOG"
+if [ "\${1:-}" = "--kill-after=1s" ]; then shift; fi
+shift
+"$@"
+`);
   await writeFile(join(fakeBin, "curl"), "#!/usr/bin/env bash\nexit 0\n");
   for (const command of ["npx", "maestro"]) {
     await writeFile(join(fakeBin, command), `#!/usr/bin/env bash
@@ -1465,6 +1474,7 @@ exit 97
   }
   await Promise.all([
     chmod(join(fakeBin, "adb"), 0o755),
+    chmod(join(fakeBin, "timeout"), 0o755),
     chmod(join(fakeBin, "curl"), 0o755),
     chmod(join(fakeBin, "npx"), 0o755),
     chmod(join(fakeBin, "maestro"), 0o755),
@@ -1478,12 +1488,25 @@ exit 97
       ANDROID_FIRST_INSTALL_OUTPUT: firstInstallOutput,
       ANDROID_INSTALL_COUNT: installCount,
       ANDROID_DOWNSTREAM_LOG: downstreamLog,
+      ANDROID_TIMEOUT_LOG: timeoutLog,
       BASH_ENV: bashEnv,
       PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
     },
     maxBuffer: 4 * 1024 * 1024,
   });
-  return { root, adbLog, downstreamLog, result };
+  return { root, adbLog, downstreamLog, timeoutLog, result };
+}
+
+async function assertExactAndroidTransientReadinessTimeout(timeoutLog: string) {
+  const hardTimeoutCalls = (await readFile(timeoutLog, "utf8"))
+    .trim()
+    .split("\n")
+    .filter((call) => call.startsWith("--kill-after="));
+  assert.deepEqual(
+    hardTimeoutCalls,
+    ["--kill-after=1s 5s adb -s emulator-5554 exec-out uiautomator dump /dev/tty"],
+    "transient-install success must use the harness-owned exact hard-timeout command once",
+  );
 }
 
 type AndroidHierarchyProbe = {
@@ -1964,6 +1987,7 @@ test("Android am start timeout text remains nonblocking until bounded Maestro re
       '-s emulator-5554 shell am start -a android.intent.action.VIEW -d formobile-test://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081 -p com.luyao618.formobile',
     );
     assert.match(await readFile(harness.downstreamLog, "utf8"), /maestro --device emulator-5554 test --debug-output .*android-readiness/);
+    await assertExactAndroidTransientReadinessTimeout(harness.timeoutLog);
   } finally {
     await rm(harness.root, { recursive: true, force: true });
   }
@@ -1979,6 +2003,7 @@ test("Android retries one broken package transport install after renewed readine
     assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 2);
     assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 reverse tcp:8081 tcp:8081").length, 1);
     assert.match(await readFile(harness.downstreamLog, "utf8"), /maestro --device emulator-5554 test --debug-output .*android-readiness/);
+    await assertExactAndroidTransientReadinessTimeout(harness.timeoutLog);
   } finally {
     await rm(harness.root, { recursive: true, force: true });
   }
@@ -1995,6 +2020,7 @@ test("Android retries both exact package transport lines with the adb cmd prefix
       const adbCalls = (await readFile(harness.adbLog, "utf8")).trim().split("\n");
       assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 2);
       assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 reverse tcp:8081 tcp:8081").length, 1);
+      await assertExactAndroidTransientReadinessTimeout(harness.timeoutLog);
     } finally {
       await rm(harness.root, { recursive: true, force: true });
     }
@@ -2013,6 +2039,7 @@ test("Android retries an exact transport line followed by a large benign diagnos
     assert.equal(adbCalls.filter((call) => call.includes(" install ")).length, 2);
     assert.equal(adbCalls.filter((call) => call === "-s emulator-5554 reverse tcp:8081 tcp:8081").length, 1);
     assert.match(await readFile(harness.downstreamLog, "utf8"), /maestro --device emulator-5554 test --debug-output .*android-readiness/);
+    await assertExactAndroidTransientReadinessTimeout(harness.timeoutLog);
   } finally {
     await rm(harness.root, { recursive: true, force: true });
   }
