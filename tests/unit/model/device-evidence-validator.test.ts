@@ -369,7 +369,15 @@ function countsWith(checker: AuditChecker, severity: "high" | "critical") {
 }
 
 function validVulnerabilityReport(checker: AuditChecker, severity: "high" | "critical") {
-  return validAuditReport(countsWith(checker, severity));
+  const report = validAuditReport(countsWith(checker, severity));
+  const advisory = (Object.values(report.vulnerabilities) as { via: unknown[] }[])
+    .flatMap((vulnerability) => vulnerability.via)
+    .find((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry));
+  assert(advisory);
+  const cvss = (advisory as Record<string, unknown>).cvss;
+  assert(cvss && typeof cvss === "object" && !Array.isArray(cvss));
+  (cvss as Record<string, unknown>).vectorString = null;
+  return report;
 }
 
 const DEFAULT_AUDIT_REPORTS = Object.freeze({
@@ -879,8 +887,14 @@ test("G038 audit npm-v2 validation rejects every hostile exact-schema mutation",
     ["advisory cvss above ten", mutateFirstAdvisory((advisory) => {
       advisory.cvss = { score: 10.1, vectorString: "CVSS:3.1/PRIVATE_SENTINEL" };
     })],
-    ["advisory cvss vector", mutateFirstAdvisory((advisory) => {
+    ["advisory cvss vector false", mutateFirstAdvisory((advisory) => {
       advisory.cvss = { score: 5.3, vectorString: false };
+    })],
+    ["advisory cvss vector object", mutateFirstAdvisory((advisory) => {
+      advisory.cvss = { score: 5.3, vectorString: { privateValue: "PRIVATE_BODY_SENTINEL" } };
+    })],
+    ["advisory cvss vector array", mutateFirstAdvisory((advisory) => {
+      advisory.cvss = { score: 5.3, vectorString: ["PRIVATE_BODY_SENTINEL"] };
     })],
     ["advisory range", mutateFirstAdvisory((advisory) => { advisory.range = false; })],
     ["effects container", mutateFirstVulnerability((vulnerability) => { vulnerability.effects = {}; })],
@@ -931,6 +945,14 @@ test("G038 audit npm-v2 validation rejects every hostile exact-schema mutation",
     assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE_|private-package/);
     assert(name.length > 0);
   }
+});
+
+test("G049 audit npm-v2 validation accepts official null CVSS vectors", () => {
+  const report = mutateFirstAdvisory((advisory) => {
+    advisory.cvss = { score: 5.3, vectorString: null };
+  });
+
+  assert.deepEqual(validateAuditCounts(report, "root-app-production", 1), APP_AUDIT_COUNTS);
 });
 
 test("G038 audit npm-v2 validation accepts inclusive advisory source and CVSS boundaries", () => {
