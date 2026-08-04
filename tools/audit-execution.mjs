@@ -413,7 +413,7 @@ function hasNpmAdvisoryShape(value) {
     && Number.isFinite(value.cvss.score)
     && value.cvss.score >= 0
     && value.cvss.score <= 10
-    && typeof value.cvss.vectorString === "string"
+    && (value.cvss.vectorString === null || typeof value.cvss.vectorString === "string")
     && typeof value.range === "string";
 }
 
