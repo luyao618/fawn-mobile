@@ -9,6 +9,7 @@ import { Linter } from "eslint";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 export const FAULT_CONTROLLER_SENTINEL = "FOR_MOBILE_E2E_FAULT_CONTROLLER_REAL_V1";
+export const BOOTSTRAP_TRACE_SENTINEL = "FOR_MOBILE_E2E_BOOTSTRAP_TRACE_V1";
 export const FAULT_BUNDLE_PROOF_PATH = ".artifacts/fault-bundles/proof.json";
 export const FAULT_BUNDLE_PLATFORMS = Object.freeze(["android", "ios"]);
 export const FAULT_BUNDLE_FLAVORS = Object.freeze(["production", "e2e"]);
@@ -26,21 +27,22 @@ const protocolMarker = "formobile-test:";
 const modeMarker = "crash_once";
 export const FAULT_BUNDLE_MARKERS = Object.freeze([
   FAULT_CONTROLLER_SENTINEL,
+  BOOTSTRAP_TRACE_SENTINEL,
   protocolMarker,
   modeMarker,
   ...faultPoints,
 ]);
 assert(FAULT_BUNDLE_MARKERS.every((marker) => marker.length > 0), "Fault bundle markers must be nonempty");
 assert.equal(new Set(FAULT_BUNDLE_MARKERS).size, FAULT_BUNDLE_MARKERS.length, "Fault bundle markers must be unique");
-assert.deepEqual(FAULT_BUNDLE_MARKERS.slice(3), faultPoints, "Fault bundle point markers must preserve the exact registry");
+assert.deepEqual(FAULT_BUNDLE_MARKERS.slice(4), faultPoints, "Fault bundle point markers must preserve the exact registry");
 
 function expectedCounts(flavor) {
-  // Tripwire for the current source topology: sentinel/protocol/mode/each registry point = 1/2/3/1.
+  // Tripwire for the current source topology: both sentinels/protocol/mode/each registry point = 1/1/2/3/1.
   return Object.freeze(Object.fromEntries(FAULT_BUNDLE_MARKERS.map((marker) => [
     marker,
     flavor === "production"
       ? 0
-      : marker === FAULT_CONTROLLER_SENTINEL
+      : marker === FAULT_CONTROLLER_SENTINEL || marker === BOOTSTRAP_TRACE_SENTINEL
         ? 1
         : marker === protocolMarker
           ? 2
@@ -185,10 +187,21 @@ function unwrapChain(node) {
   return node?.type === "ChainExpression" ? node.expression : node;
 }
 
+function staticString(node) {
+  if (node?.type === "Literal" && typeof node.value === "string") return node.value;
+  if (node?.type === "TemplateLiteral" && node.expressions.length === 0 && node.quasis.length === 1) {
+    return node.quasis[0].value.cooked;
+  }
+  if (node?.type !== "BinaryExpression" || node.operator !== "+") return null;
+  const left = staticString(node.left);
+  const right = staticString(node.right);
+  return left === null || right === null ? null : left + right;
+}
+
 function propertyName(member) {
   if (member?.type !== "MemberExpression") return null;
   if (!member.computed && member.property.type === "Identifier") return member.property.name;
-  return member.property.type === "Literal" && typeof member.property.value === "string" ? member.property.value : null;
+  return staticString(member.property);
 }
 
 function member(node, objectName, memberName) {
@@ -372,6 +385,76 @@ function bindingIsImmutable(scope, name, definition, includeMembers = false) {
     && (!includeMembers || bindingMemberWrites(scope, name).length === 0);
 }
 
+const TRACE_INTRINSICS = Object.freeze([
+  "JSON",
+  "console",
+  "Object",
+  "Number",
+  "Math",
+  "Map",
+  "Set",
+  "String",
+  "Reflect",
+  "Error",
+  "AggregateError",
+  "Function",
+  "eval",
+  "Proxy",
+]);
+const INTRINSIC_MUTATORS = new Set(["assign", "defineProperties", "defineProperty", "setPrototypeOf"]);
+const DANGEROUS_MEMBER_NAMES = new Set(["__proto__", "constructor", "prototype", "toJSON"]);
+const DYNAMIC_CODE_NAMES = new Set(["eval", "Function"]);
+
+function assertNoDangerousRuntimeConstruction(module, label) {
+  const scope = module.factory.body;
+  const opaqueComputedMembers = astNodes(scope, (node) => node.type === "MemberExpression"
+    && node.computed && propertyName(node) === null
+    && dependencyMapIndex(node, module.dependencyMapName) === null);
+  assert.equal(opaqueComputedMembers.length, 0,
+    `${label} must not use opaque computed members outside canonical Metro dependency-map indexing`);
+  const dangerousMembers = astNodes(scope, (node) => node.type === "MemberExpression"
+    && DANGEROUS_MEMBER_NAMES.has(propertyName(node)));
+  assert.equal(dangerousMembers.length, 0, `${label} must not use dangerous constructor, prototype, __proto__, or toJSON members`);
+  const dynamicCode = astNodes(scope, (node) => {
+    if (!["CallExpression", "NewExpression", "TaggedTemplateExpression"].includes(node.type)) return false;
+    const target = node.type === "TaggedTemplateExpression" ? node.tag : node.callee;
+    const callee = canonicalCallee(target);
+    return callee?.type === "Identifier" && DYNAMIC_CODE_NAMES.has(callee.name)
+      || callee?.type === "MemberExpression" && propertyName(callee) === "constructor";
+  });
+  assert.equal(dynamicCode.length, 0, `${label} must not evaluate dynamic code`);
+}
+
+function assertNoGlobalObjectReferences(module, label) {
+  const metroGlobal = module.factory.params[0];
+  assert(metroGlobal?.type === "Identifier", `${label} Metro global binding is invalid`);
+  const names = new Set([metroGlobal.name, "global", "globalThis"]);
+  for (const name of names) {
+    const references = astNodes(module.factory.body, (node, parent) => identifier(node, name)
+      && isIdentifierReference(node, parent));
+    assert.equal(references.length, 0, `${label} must not reference the Metro global or globalThis`);
+  }
+}
+
+function assertPristineIntrinsics(module, label) {
+  const scope = module.factory.body;
+  assertNoDangerousRuntimeConstruction(module, label);
+  const intrinsicNames = new Set(TRACE_INTRINSICS);
+  for (const name of TRACE_INTRINSICS) {
+    assert.equal(bindingDefinitions(scope, name).length, 0, `${label} must not shadow the ${name} intrinsic`);
+    assert.equal(bindingWrites(scope, name).length, 0, `${label} must not write the ${name} intrinsic binding`);
+    assert.equal(bindingMemberWrites(scope, name).length, 0, `${label} must not monkeypatch the ${name} intrinsic or prototype`);
+  }
+  const mutationCalls = astNodes(scope, (node) => {
+    if (node.type !== "CallExpression") return false;
+    const callee = canonicalCallee(node.callee);
+    if (callee?.type !== "MemberExpression" || !INTRINSIC_MUTATORS.has(propertyName(callee))) return false;
+    const targetRoot = memberRoot(node.arguments[0]);
+    return targetRoot !== null && intrinsicNames.has(targetRoot);
+  });
+  assert.equal(mutationCalls.length, 0, `${label} must not mutate trace intrinsics through helper calls`);
+}
+
 function isIdentifierReference(node, parent) {
   if (!parent) return true;
   if (parent.type === "MemberExpression" && parent.property === node && !parent.computed) return false;
@@ -387,6 +470,40 @@ function bindingReferences(scope, name, definition) {
   walkAst(definition, (node) => definitionNodes.add(node));
   return astNodes(scope, (node, parent) => identifier(node, name)
     && !definitionNodes.has(node) && isIdentifierReference(node, parent));
+}
+
+function directIntrinsicCall(node, objectName, methodName, argumentCount) {
+  const call = directCall(node);
+  const callee = call ? unwrapChain(call.callee) : null;
+  return call && callee?.type === "MemberExpression" && !callee.computed
+    && identifier(callee.object, objectName) && propertyName(callee) === methodName
+    && call.arguments.length === argumentCount ? { call, object: callee.object } : null;
+}
+
+function assertExactIntrinsicReferences(module, expectedByName, label) {
+  assertNoGlobalObjectReferences(module, label);
+  assertPristineIntrinsics(module, label);
+  const scope = module.factory.body;
+  for (const name of TRACE_INTRINSICS) {
+    const expected = new Set(expectedByName[name] ?? []);
+    assert([...expected].every((node) => identifier(node, name)), `${label} ${name} expected reference set is invalid`);
+    const actual = astNodes(scope, (node, parent) => identifier(node, name) && isIdentifierReference(node, parent));
+    assert(actual.length === expected.size && actual.every((node) => expected.has(node)),
+      `${label} ${name} intrinsic must be closed to its exact canonical references`);
+  }
+}
+
+function assertExactSelectedIntrinsicReferences(module, expectedByName, label) {
+  assertNoGlobalObjectReferences(module, label);
+  assertPristineIntrinsics(module, label);
+  const scope = module.factory.body;
+  for (const [name, expectedNodes] of Object.entries(expectedByName)) {
+    const expected = new Set(expectedNodes);
+    assert([...expected].every((node) => identifier(node, name)), `${label} ${name} expected reference set is invalid`);
+    const actual = astNodes(scope, (node, parent) => identifier(node, name) && isIdentifierReference(node, parent));
+    assert(actual.length === expected.size && actual.every((node) => expected.has(node)),
+      `${label} ${name} intrinsic must be closed to its exact canonical references`);
+  }
 }
 
 function assertExactReferences(scope, name, definition, expectedReferences, label) {
@@ -691,6 +808,8 @@ function jsxCall(node) {
 function renderedComponent(expression, componentName) {
   const matches = [];
   const runtimeReferences = [];
+  const matchesComponent = (node) => identifier(node, componentName)
+    || node?.type === "MemberExpression" && !node.computed && propertyName(node) === componentName;
   const visit = (value) => {
     if (value?.type === "ArrayExpression") {
       return value.elements.every((element) => element && visit(element));
@@ -698,7 +817,7 @@ function renderedComponent(expression, componentName) {
     const call = directCall(value);
     if (!call) return false;
     const callee = canonicalCallee(call.callee);
-    if (identifier(callee, componentName)) {
+    if (matchesComponent(callee)) {
       if (call.arguments.length !== 1 || call.arguments[0]?.type !== "ObjectExpression") return false;
       matches.push({ call, props: call.arguments[0], componentReference: callee });
       return true;
@@ -707,7 +826,7 @@ function renderedComponent(expression, componentName) {
     if (!jsx) return false;
     if (jsx.props.properties.some((property) => property.type !== "Property" || property.kind !== "init" || property.computed)) return false;
     runtimeReferences.push(jsx.runtimeReference);
-    if (identifier(jsx.component, componentName)) {
+    if (matchesComponent(jsx.component)) {
       matches.push({ call, props: jsx.props, componentReference: jsx.component });
     }
     const children = objectProperties(jsx.props, "children");
@@ -909,6 +1028,670 @@ function hostInstallationEvidence(module, host, label) {
   };
 }
 
+function cleanupFailureEvidence(module, label) {
+  const helperLabel = `${label} cleanup failure dependency`;
+  const scope = module.factory.body;
+  const logicalOperands = (node, operator) => node?.type === "LogicalExpression" && node.operator === operator
+    ? [...logicalOperands(node.left, operator), ...logicalOperands(node.right, operator)] : [node];
+  const property = (object, name) => object?.type === "ObjectExpression"
+    ? object.properties.find((candidate) => plainObjectProperty(candidate, name)) : null;
+  const memberOn = (node, objectName, propertyNameValue) => {
+    const value = unwrapChain(node);
+    return value?.type === "MemberExpression" && identifier(value.object, objectName)
+      && propertyName(value) === propertyNameValue ? value : null;
+  };
+
+  assertClosedExports(module, ["cleanupFailure", "isCleanupFailure"], helperLabel);
+  assertCanonicalMetroImports(module, helperLabel);
+  assertNoGlobalObjectReferences(module, helperLabel);
+  assertPristineIntrinsics(module, helperLabel);
+  for (const name of ["console", "JSON", "fetch", "XMLHttpRequest", "WebSocket", "navigator", "network", "output"]) {
+    assert.equal(astNodes(scope, (node) => identifier(node, name)).length, 0,
+      `${helperLabel} must not reference ${name}`);
+  }
+
+  const marker = topLevelVariable(module, "CLEANUP_FAILURE_MARKER", `${helperLabel} marker`);
+  assert(literal(marker.declaration.init, "fawn.cleanup-failure.v1"), `${helperLabel} marker is invalid`);
+
+  const create = exportedFunction(module, "cleanupFailure");
+  assert(hasFunctionFlags(create, false) && create.params.length === 2
+    && create.params.every((parameter) => parameter.type === "Identifier") && create.body.body.length === 3,
+  `${helperLabel} cleanupFailure export must be one synchronous two-parameter function`);
+  const [errorsParameter, messageParameter] = create.params;
+  const failure = standaloneVariable(create.body.body[0], "failure");
+  const aggregate = failure?.init;
+  const define = expressionCall(create.body.body[1]);
+  const defineIntrinsic = directIntrinsicCall(define, "Object", "defineProperty", 3);
+  const descriptor = define?.arguments[2];
+  const configurable = property(descriptor, "configurable");
+  const enumerable = property(descriptor, "enumerable");
+  const markerProperty = property(descriptor, "value");
+  const writable = property(descriptor, "writable");
+  const returnedFailure = create.body.body[2]?.type === "ReturnStatement" ? create.body.body[2].argument : null;
+  assert(failure && aggregate?.type === "NewExpression" && identifier(aggregate.callee, "AggregateError")
+    && aggregate.arguments.length === 2 && identifier(aggregate.arguments[0], errorsParameter.name)
+    && identifier(aggregate.arguments[1], messageParameter.name)
+    && defineIntrinsic && identifier(define.arguments[0], "failure") && literal(define.arguments[1], "cleanupFailure")
+    && descriptor?.type === "ObjectExpression" && descriptor.properties.length === 4
+    && configurable && literal(configurable.value, false)
+    && enumerable && literal(enumerable.value, false)
+    && markerProperty && identifier(markerProperty.value, "CLEANUP_FAILURE_MARKER")
+    && writable && literal(writable.value, false)
+    && identifier(returnedFailure, "failure"),
+  `${helperLabel} cleanupFailure construction must use the exact non-enumerable fixed marker`);
+  assertExactBindingReferences(create, errorsParameter.name, errorsParameter, [aggregate.arguments[0]], `${helperLabel} errors parameter`);
+  assertExactBindingReferences(create, messageParameter.name, messageParameter, [aggregate.arguments[1]], `${helperLabel} message parameter`);
+  assertExactBindingReferences(create, "failure", failure.id, [define.arguments[0], returnedFailure], `${helperLabel} created failure`);
+
+  const classify = exportedFunction(module, "isCleanupFailure");
+  assert(hasFunctionFlags(classify, false) && classify.params.length === 1 && classify.params[0].type === "Identifier"
+    && classify.body.body.length === 3, `${helperLabel} isCleanupFailure export must be one synchronous one-parameter function`);
+  const valueParameter = classify.params[0];
+  const guard = classify.body.body[0];
+  const guardChecks = guard?.type === "IfStatement" ? logicalOperands(guard.test, "||") : [];
+  const typeCheck = guardChecks.find((node) => node.type === "BinaryExpression" && node.operator === "!=="
+    && node.left.type === "UnaryExpression" && node.left.operator === "typeof"
+    && identifier(node.left.argument, valueParameter.name) && literal(node.right, "object"));
+  const nullCheck = guardChecks.find((node) => node.type === "BinaryExpression" && node.operator === "==="
+    && identifier(node.left, valueParameter.name) && literal(node.right, null));
+  assert(guardChecks.length === 2 && typeCheck && nullCheck && !guard.alternate
+    && guard.consequent.type === "ReturnStatement" && literal(guard.consequent.argument, false),
+  `${helperLabel} isCleanupFailure input guard is invalid`);
+  const descriptorBinding = standaloneVariable(classify.body.body[1], "descriptor");
+  const descriptorCall = directIntrinsicCall(descriptorBinding?.init, "Object", "getOwnPropertyDescriptor", 2);
+  assert(descriptorCall && identifier(descriptorCall.call.arguments[0], valueParameter.name)
+    && literal(descriptorCall.call.arguments[1], "cleanupFailure"),
+  `${helperLabel} isCleanupFailure must read only the fixed own marker descriptor`);
+  const markerReturn = classify.body.body[2];
+  const markerChecks = markerReturn?.type === "ReturnStatement" ? logicalOperands(markerReturn.argument, "&&") : [];
+  const descriptorCheck = (node, field, expected) => node.type === "BinaryExpression" && node.operator === "==="
+    && memberOn(node.left, "descriptor", field) && (expected === "marker"
+      ? identifier(node.right, "CLEANUP_FAILURE_MARKER") : literal(node.right, expected));
+  const valueCheck = markerChecks.find((node) => descriptorCheck(node, "value", "marker"));
+  const configurableCheck = markerChecks.find((node) => descriptorCheck(node, "configurable", false));
+  const enumerableCheck = markerChecks.find((node) => descriptorCheck(node, "enumerable", false));
+  const writableCheck = markerChecks.find((node) => descriptorCheck(node, "writable", false));
+  assert(markerChecks.length === 4 && valueCheck && configurableCheck && enumerableCheck && writableCheck,
+    `${helperLabel} isCleanupFailure marker classifier is not exact`);
+  const descriptorReferences = [valueCheck, configurableCheck, enumerableCheck, writableCheck]
+    .map((check) => unwrapChain(check.left).object);
+  assertExactBindingReferences(classify, valueParameter.name, valueParameter,
+    [typeCheck.left.argument, nullCheck.left, descriptorCall.call.arguments[0]], `${helperLabel} classified value`);
+  assertExactBindingReferences(classify, "descriptor", descriptorBinding.id, descriptorReferences,
+    `${helperLabel} marker descriptor`);
+
+  const createExport = finalNamedExport(module, "cleanupFailure");
+  const classifyExport = finalNamedExport(module, "isCleanupFailure");
+  assertExactBindingReferences(scope, create.id.name, create.id, [createExport], `${helperLabel} cleanupFailure final export`);
+  assertExactBindingReferences(scope, classify.id.name, classify.id, [classifyExport], `${helperLabel} isCleanupFailure final export`);
+  assertExactBindingReferences(scope, "CLEANUP_FAILURE_MARKER", marker.declaration.id,
+    [markerProperty.value, valueCheck.right], `${helperLabel} fixed marker`);
+  const exportCalls = astNodes(scope, (node) => directIntrinsicCall(node, "Object", "defineProperty", 3)?.call === node
+    && identifier(node.arguments[0], module.exportsName));
+  assertExactSelectedIntrinsicReferences(module, {
+    Object: [...exportCalls.map((call) => directIntrinsicCall(call, "Object", "defineProperty", 3).object), defineIntrinsic.object, descriptorCall.object],
+    AggregateError: [aggregate.callee],
+    Error: [],
+    Reflect: [],
+  }, helperLabel);
+}
+
+function recoverAndOpenEvidence(module, graph, label) {
+  const recoveryLabel = `${label} recoverAndOpen dependency`;
+  const recoveryScope = module.factory.body;
+  const exactObject = (object, fields) => object?.type === "ObjectExpression"
+    && object.properties.length === fields.length
+    && fields.every(([name, predicate], index) => {
+      const item = object.properties[index];
+      return item?.type === "Property" && item.kind === "init" && !item.computed
+        && propertyName({ type: "MemberExpression", computed: false, property: item.key }) === name
+        && predicate(item.value);
+    });
+  const directIdentifierCall = (node, name, argumentCount) => {
+    const call = directCall(node);
+    return call && identifier(canonicalCallee(call.callee), name) && call.arguments.length === argumentCount ? call : null;
+  };
+  const logicalOperands = (node, operator) => node?.type === "LogicalExpression" && node.operator === operator
+    ? [...logicalOperands(node.left, operator), ...logicalOperands(node.right, operator)] : [node];
+  const memberOn = (node, objectName, field) => {
+    const value = unwrapChain(node);
+    return value?.type === "MemberExpression" && identifier(value.object, objectName)
+      && propertyName(value) === field ? value : null;
+  };
+  const traceMember = (node, dependenciesName) => {
+    const value = unwrapChain(node);
+    return value?.type === "MemberExpression" && propertyName(value) === "traceTerminal"
+      && identifier(value.object, dependenciesName) ? value : null;
+  };
+  const undefinedTest = (node, name) => node?.type === "BinaryExpression" && node.operator === "==="
+    && ((identifier(node.left, name) && identifier(node.right, "undefined"))
+      || (identifier(node.right, name) && identifier(node.left, "undefined")));
+  const record = (node, stage, outcome, closeOutcome) => exactObject(node, [
+    ["stage", (value) => stage === null ? value?.type === "Identifier" : literal(value, stage)],
+    ["outcome", (value) => literal(value, outcome)],
+    ["closeOutcome", (value) => literal(value, closeOutcome)],
+  ]);
+
+  assertClosedExports(module, ["recoverAndOpen"], recoveryLabel);
+  assertCanonicalMetroImports(module, recoveryLabel);
+  assertNoGlobalObjectReferences(module, recoveryLabel);
+  assertPristineIntrinsics(module, recoveryLabel);
+  for (const name of ["console", "JSON", "fetch", "XMLHttpRequest", "WebSocket", "navigator", "network", "output"]) {
+    const references = astNodes(recoveryScope, (node) => identifier(node, name));
+    assert.equal(references.length, 0, `${recoveryLabel} must not reference ${name}`);
+  }
+  const rawErrorMembers = astNodes(recoveryScope, (node) => node.type === "MemberExpression"
+    && ["message", "stack", "cause", "code"].includes(propertyName(node)));
+  assert.equal(rawErrorMembers.length, 0,
+    `${recoveryLabel} must not project raw error message, stack, cause, or code fields`);
+  const parentByNode = new Map();
+  walkAst(recoveryScope, (node, parent) => parentByNode.set(node, parent));
+  const importBindings = recoveryScope.body.flatMap((statement) => statement.type === "VariableDeclaration"
+    ? statement.declarations.filter((declaration) => declaration.id.type === "Identifier"
+      && directCall(declaration.init)?.callee?.type === "Identifier"
+      && directCall(declaration.init).callee.name === module.requireName)
+    : []);
+  for (const binding of importBindings) {
+    const references = bindingReferences(recoveryScope, binding.id.name, binding.id);
+    assert(references.every((reference) => {
+      const parent = parentByNode.get(reference);
+      return parent?.type === "MemberExpression" && parent.object === reference && !parent.computed;
+    }), `${recoveryLabel} imported namespace ${binding.id.name} must not escape through an alias`);
+  }
+  const recovery = exportedFunction(module, "recoverAndOpen");
+  assert(hasFunctionFlags(recovery, true) && recovery.params.length === 2
+    && recovery.params.every((parameter) => parameter.type === "Identifier"),
+  `${recoveryLabel} final export must be one async two-parameter function`);
+  const dependenciesName = recovery.params[0].name;
+  const signalName = recovery.params[1].name;
+  assert(bindingIsImmutable(recovery, dependenciesName, recovery.params[0])
+    && bindingIsImmutable(recovery, signalName, recovery.params[1]),
+  `${recoveryLabel} parameters must be immutable`);
+
+  const category = functionDeclaration(module, "failureCategory");
+  assert(hasFunctionFlags(category, false) && category.params.length === 1 && category.params[0].type === "Identifier"
+    && category.body.body.length === 2, `${recoveryLabel} failure category classifier is invalid`);
+  const categoryError = category.params[0];
+  const categoryTry = category.body.body[0];
+  const categoryFallback = category.body.body[1];
+  assert(categoryTry?.type === "TryStatement" && !categoryTry.finalizer && categoryTry.handler?.param === null
+    && categoryTry.block.body.length === 6 && categoryTry.handler.body.body.length === 1
+    && categoryTry.handler.body.body[0].type === "ReturnStatement"
+    && literal(categoryTry.handler.body.body[0].argument, "uncoded")
+    && categoryFallback.type === "ReturnStatement" && literal(categoryFallback.argument, "uncoded"),
+  `${recoveryLabel} failure category classifier must fail closed to uncoded`);
+  const [cleanupBranch, abortBranch, codeStatement, openCodeBranch, sqliteCodeBranch, aggregateBranch] = categoryTry.block.body;
+  const cleanupCall = cleanupBranch?.type === "IfStatement" ? directCall(cleanupBranch.test) : null;
+  const cleanupCallee = cleanupCall ? canonicalCallee(cleanupCall.callee) : null;
+  assert(cleanupCall && cleanupCallee?.type === "MemberExpression" && !cleanupCallee.computed
+    && cleanupCallee.object.type === "Identifier" && propertyName(cleanupCallee) === "isCleanupFailure"
+    && cleanupCall.arguments.length === 1 && identifier(cleanupCall.arguments[0], categoryError.name)
+    && cleanupBranch.consequent.type === "ReturnStatement" && literal(cleanupBranch.consequent.argument, "cleanup")
+    && !cleanupBranch.alternate, `${recoveryLabel} cleanup category branch is invalid`);
+  const abortChecks = abortBranch?.type === "IfStatement" ? logicalOperands(abortBranch.test, "&&") : [];
+  const errorInstance = abortChecks.find((node) => node.type === "BinaryExpression" && node.operator === "instanceof"
+    && identifier(node.left, categoryError.name) && identifier(node.right, "Error"));
+  const abortName = abortChecks.find((node) => node.type === "BinaryExpression" && node.operator === "==="
+    && memberOn(node.left, categoryError.name, "name") && literal(node.right, "AbortError"));
+  assert(abortChecks.length === 2 && errorInstance && abortName && abortBranch.consequent.type === "ReturnStatement"
+    && literal(abortBranch.consequent.argument, "abort") && !abortBranch.alternate,
+  `${recoveryLabel} abort category branch is invalid`);
+  const code = standaloneVariable(codeStatement, "code");
+  const codeConditional = code?.init;
+  const codeGuards = codeConditional?.type === "ConditionalExpression" ? logicalOperands(codeConditional.test, "&&") : [];
+  const objectGuard = codeGuards.find((node) => node.type === "BinaryExpression" && node.operator === "==="
+    && node.left.type === "UnaryExpression" && node.left.operator === "typeof"
+    && identifier(node.left.argument, categoryError.name) && literal(node.right, "object"));
+  const nullGuard = codeGuards.find((node) => node.type === "BinaryExpression" && node.operator === "!=="
+    && identifier(node.left, categoryError.name) && literal(node.right, null));
+  const ownCodeGuard = codeGuards.find((node) => node.type === "BinaryExpression" && node.operator === "in"
+    && literal(node.left, "code") && identifier(node.right, categoryError.name));
+  const reflectGet = directIntrinsicCall(codeConditional?.consequent, "Reflect", "get", 2);
+  assert(codeGuards.length === 3 && objectGuard && nullGuard && ownCodeGuard && reflectGet
+    && identifier(reflectGet.call.arguments[0], categoryError.name) && literal(reflectGet.call.arguments[1], "code")
+    && identifier(codeConditional.alternate, "undefined"),
+  `${recoveryLabel} SQLite code extraction must use the exact guarded Reflect.get path`);
+  const categoryReturn = (branch, codeValue, result) => branch?.type === "IfStatement" && !branch.alternate
+    && branch.test.type === "BinaryExpression" && branch.test.operator === "==="
+    && identifier(branch.test.left, "code") && literal(branch.test.right, codeValue)
+    && branch.consequent.type === "ReturnStatement" && literal(branch.consequent.argument, result);
+  assert(categoryReturn(openCodeBranch, "E_SQLITE_OPEN_DATABASE", "sqlite-open")
+    && categoryReturn(sqliteCodeBranch, "ERR_INTERNAL_SQLITE_ERROR", "sqlite"),
+  `${recoveryLabel} SQLite category allowlist is invalid`);
+  const aggregateInstance = aggregateBranch?.type === "IfStatement" ? aggregateBranch.test : null;
+  assert(aggregateInstance?.type === "BinaryExpression" && aggregateInstance.operator === "instanceof"
+    && identifier(aggregateInstance.left, categoryError.name) && identifier(aggregateInstance.right, "AggregateError")
+    && aggregateBranch.consequent.type === "ReturnStatement" && literal(aggregateBranch.consequent.argument, "aggregate")
+    && !aggregateBranch.alternate, `${recoveryLabel} aggregate category branch is invalid`);
+  assertExactBindingReferences(category, categoryError.name, categoryError, [
+    cleanupCall.arguments[0], errorInstance.left, unwrapChain(abortName.left).object,
+    objectGuard.left.argument, nullGuard.left, ownCodeGuard.right, reflectGet.call.arguments[0], aggregateInstance.left,
+  ], `${recoveryLabel} classified error`);
+  assertExactBindingReferences(category, "code", code.id, [openCodeBranch.test.left, sqliteCodeBranch.test.left],
+    `${recoveryLabel} classified SQLite code`);
+
+  const abortError = functionDeclaration(module, "abortError");
+  assert(hasFunctionFlags(abortError, false) && abortError.params.length === 0 && abortError.body.body.length === 3,
+    `${recoveryLabel} abort error helper is invalid`);
+  const createdAbort = standaloneVariable(abortError.body.body[0], "error");
+  const abortConstructor = createdAbort?.init;
+  const abortNameWrite = abortError.body.body[1]?.type === "ExpressionStatement"
+    ? abortError.body.body[1].expression : null;
+  const abortReturn = abortError.body.body[2]?.type === "ReturnStatement" ? abortError.body.body[2].argument : null;
+  assert(abortConstructor?.type === "NewExpression" && identifier(abortConstructor.callee, "Error")
+    && abortConstructor.arguments.length === 1 && literal(abortConstructor.arguments[0], "Startup was aborted")
+    && abortNameWrite?.type === "AssignmentExpression" && abortNameWrite.operator === "="
+    && memberOn(abortNameWrite.left, "error", "name") && literal(abortNameWrite.right, "AbortError")
+    && identifier(abortReturn, "error"), `${recoveryLabel} abort error helper construction is invalid`);
+  assertExactReferences(abortError, "error", createdAbort.id,
+    [unwrapChain(abortNameWrite.left).object, abortReturn], `${recoveryLabel} abort error helper value`);
+
+  const emitTerminal = functionDeclaration(module, "emitTerminal");
+  assert(hasFunctionFlags(emitTerminal, false) && emitTerminal.params.length === 2
+    && emitTerminal.params.every((parameter) => parameter.type === "Identifier")
+    && emitTerminal.body.body.length === 1,
+  `${recoveryLabel} terminal helper is invalid`);
+  const [sinkParameter, recordParameter] = emitTerminal.params;
+  const sinkTry = emitTerminal.body.body[0];
+  const sinkCall = sinkTry?.type === "TryStatement" && sinkTry.block.body.length === 1
+    ? expressionCall(sinkTry.block.body[0]) : null;
+  assert(sinkCall && identifier(canonicalCallee(sinkCall.callee), sinkParameter.name)
+    && sinkCall.arguments.length === 1 && identifier(sinkCall.arguments[0], recordParameter.name)
+    && !sinkTry.finalizer && sinkTry.handler?.body.body.length === 0,
+  `${recoveryLabel} terminal helper must synchronously contain the selected sink`);
+  assertExactBindingReferences(emitTerminal, sinkParameter.name, sinkParameter, [canonicalCallee(sinkCall.callee)],
+    `${recoveryLabel} terminal helper sink`);
+  assertExactBindingReferences(emitTerminal, recordParameter.name, recordParameter, [sinkCall.arguments[0]],
+    `${recoveryLabel} terminal helper record`);
+
+  const emitFailureTerminal = functionDeclaration(module, "emitFailureTerminal");
+  assert(hasFunctionFlags(emitFailureTerminal, false) && emitFailureTerminal.params.length === 3
+    && emitFailureTerminal.params.every((parameter) => parameter.type === "Identifier")
+    && emitFailureTerminal.body.body.length === 2,
+  `${recoveryLabel} failure terminal helper is invalid`);
+  const [failureSink, failureRecord, failureError] = emitFailureTerminal.params;
+  const failureGuard = emitFailureTerminal.body.body[0];
+  const failureHelperCall = expressionCall(emitFailureTerminal.body.body[1]);
+  const failureObject = failureHelperCall?.arguments[1];
+  const failureCategoryProperty = failureObject?.type === "ObjectExpression" ? failureObject.properties[1] : null;
+  const categoryCall = failureCategoryProperty?.type === "Property" ? directIdentifierCall(failureCategoryProperty.value, "failureCategory", 1) : null;
+  const failureSinkGuardReference = failureGuard?.type === "IfStatement" && identifier(failureGuard.test?.left, failureSink.name)
+    ? failureGuard.test.left
+    : failureGuard?.type === "IfStatement" && identifier(failureGuard.test?.right, failureSink.name)
+      ? failureGuard.test.right
+      : null;
+  assert(failureGuard?.type === "IfStatement" && !failureGuard.alternate
+    && undefinedTest(failureGuard.test, failureSink.name)
+    && failureGuard.consequent.type === "ReturnStatement" && failureGuard.consequent.argument === null
+    && failureHelperCall && identifier(canonicalCallee(failureHelperCall.callee), "emitTerminal")
+    && failureHelperCall.arguments.length === 2 && identifier(failureHelperCall.arguments[0], failureSink.name)
+    && failureObject?.type === "ObjectExpression" && failureObject.properties.length === 2
+    && failureObject.properties[0].type === "SpreadElement" && identifier(failureObject.properties[0].argument, failureRecord.name)
+    && failureCategoryProperty?.type === "Property" && !failureCategoryProperty.computed
+    && propertyName({ type: "MemberExpression", computed: false, property: failureCategoryProperty.key }) === "failureCategory"
+    && categoryCall && identifier(categoryCall.arguments[0], failureError.name),
+  `${recoveryLabel} failure terminal helper must add only the classified category`);
+  assertExactBindingReferences(
+    emitFailureTerminal,
+    failureSink.name,
+    failureSink,
+    [failureSinkGuardReference, failureHelperCall.arguments[0]],
+    `${recoveryLabel} failure terminal sink`,
+  );
+  assertExactBindingReferences(
+    emitFailureTerminal,
+    failureRecord.name,
+    failureRecord,
+    [failureObject.properties[0].argument],
+    `${recoveryLabel} failure terminal record`,
+  );
+  assertExactBindingReferences(
+    emitFailureTerminal,
+    failureError.name,
+    failureError,
+    [categoryCall.arguments[0]],
+    `${recoveryLabel} failure terminal error`,
+  );
+  const failureCategory = functionDeclaration(module, "failureCategory");
+  assertExactBindingReferences(
+    recoveryScope,
+    "failureCategory",
+    failureCategory.id,
+    [canonicalCallee(categoryCall.callee)],
+    `${recoveryLabel} failure category helper`,
+  );
+
+  const cleanupNamespace = cleanupCallee.object.name;
+  const cleanupApiCalls = astNodes(recoveryScope, (node) => {
+    if (node.type !== "CallExpression") return false;
+    const callee = canonicalCallee(node.callee);
+    return callee?.type === "MemberExpression" && !callee.computed
+      && identifier(callee.object, cleanupNamespace)
+      && ["cleanupFailure", "isCleanupFailure"].includes(propertyName(callee));
+  });
+  const cleanupCalls = cleanupApiCalls.filter((call) => propertyName(canonicalCallee(call.callee)) === "cleanupFailure");
+  const cleanupChecks = cleanupApiCalls.filter((call) => propertyName(canonicalCallee(call.callee)) === "isCleanupFailure");
+  assert(cleanupApiCalls.length === 3 && cleanupCalls.length === 2 && cleanupChecks.length === 1
+    && cleanupChecks[0] === cleanupCall,
+  `${recoveryLabel} cleanup dependency calls are not exact`);
+  const runtimeCleanup = cleanupCalls.find((call) => call.arguments.length === 2
+    && call.arguments[0]?.type === "ArrayExpression" && call.arguments[0].elements.length === 1
+    && literal(call.arguments[1], "Closing the application database failed"));
+  assert(runtimeCleanup && runtimeCleanup.arguments[0].elements[0]?.type === "Identifier",
+    `${recoveryLabel} runtime cleanup failure construction is invalid`);
+  const cleanupBinding = dependencyBinding(
+    module,
+    cleanupNamespace,
+    `${recoveryLabel} cleanup helper dependency`,
+    recovery,
+    cleanupApiCalls.map((call) => canonicalCallee(call.callee).object),
+  );
+  const cleanupModule = resolveDependency(graph, module, cleanupBinding.dependencyIndex,
+    `${recoveryLabel} cleanup helper dependency`);
+  cleanupFailureEvidence(cleanupModule, label);
+  assertExactSelectedIntrinsicReferences(module, {
+    Reflect: [reflectGet.object],
+    Error: [errorInstance.right, abortConstructor.callee],
+    AggregateError: [aggregateInstance.right],
+  }, recoveryLabel);
+
+  const topLevelTry = recovery.body.body.filter((statement) => statement.type === "TryStatement");
+  assert.equal(topLevelTry.length, 1, `${recoveryLabel} must have one startup try/catch`);
+  const startupTry = topLevelTry[0];
+  const startupError = startupTry.handler?.param;
+  assert(startupError?.type === "Identifier" && !startupTry.finalizer, `${recoveryLabel} startup catch is invalid`);
+  const readyCalls = astNodes(startupTry.block, (node) => directIdentifierCall(node, "emitTerminal", 2) === node);
+  assert.equal(readyCalls.length, 1, `${recoveryLabel} must emit one ready terminal`);
+  const readyCall = readyCalls[0];
+  const readySink = traceMember(readyCall.arguments[0], dependenciesName);
+  assert(readySink && record(readyCall.arguments[1], "ready", "success", "not-attempted"),
+    `${recoveryLabel} ready terminal is not correlated`);
+  const readyStatementIndex = startupTry.block.body.findIndex((statement) => expressionCall(statement) === readyCall);
+  assert(readyStatementIndex === startupTry.block.body.length - 2
+    && startupTry.block.body.at(-1)?.type === "ReturnStatement",
+  `${recoveryLabel} ready terminal must immediately precede the successful return`);
+
+  const stageDeclarations = astNodes(recovery.body, (node) => node.type === "VariableDeclarator" && identifier(node.id, "stage"));
+  assert.equal(stageDeclarations.length, 1, `${recoveryLabel} stage binding must be unique`);
+  const stage = stageDeclarations[0];
+  assert(literal(stage.init, "open-configure"), `${recoveryLabel} stage must start at open-configure`);
+  const stageWrites = astNodes(recovery.body, (node) => node.type === "AssignmentExpression"
+    && node.operator === "=" && identifier(node.left, "stage"));
+  assert(stageWrites.length === 2 && literal(stageWrites[0].right, "migrate")
+    && literal(stageWrites[1].right, "post-migrate"),
+  `${recoveryLabel} stage must have only the migrate and post-migrate transitions`);
+  const tryStatements = startupTry.block.body;
+  const awaitedCall = (statement) => statement?.type === "ExpressionStatement"
+    && statement.expression.type === "AwaitExpression" ? directCall(statement.expression.argument) : null;
+  const openIndex = tryStatements.findIndex((statement) => {
+    const assignment = statement?.type === "ExpressionStatement" ? statement.expression : null;
+    const call = assignment?.type === "AssignmentExpression" && assignment.operator === "="
+      && assignment.right.type === "AwaitExpression" ? directCall(assignment.right.argument) : null;
+    const callee = call ? canonicalCallee(call.callee) : null;
+    return identifier(assignment?.left, "database") && callee?.type === "MemberExpression"
+      && memberOn(callee.object, dependenciesName, "database") && propertyName(callee) === "openConfigured"
+      && call.arguments.length === 1 && identifier(call.arguments[0], signalName);
+  });
+  const maintenance = (statement, name) => {
+    const call = awaitedCall(statement);
+    const callee = call ? canonicalCallee(call.callee) : null;
+    return call && callee?.type === "MemberExpression" && propertyName(callee) === "runMaintenance"
+      && memberOn(callee.object, dependenciesName, "coordinator") && call.arguments.length === 2
+      && literal(call.arguments[0], name) && ["ArrowFunctionExpression", "FunctionExpression"].includes(call.arguments[1]?.type)
+      ? call : null;
+  };
+  const migrationIndexes = tryStatements.map((statement, index) => maintenance(statement, "migration") ? index : -1)
+    .filter((index) => index >= 0);
+  const albumIndexes = tryStatements.map((statement, index) => maintenance(statement, "album") ? index : -1)
+    .filter((index) => index >= 0);
+  const migrateIndex = tryStatements.findIndex((statement) => astNodes(statement, (node) => node === stageWrites[0]).length === 1);
+  const postMigrateIndex = tryStatements.findIndex((statement) => astNodes(statement, (node) => node === stageWrites[1]).length === 1);
+  assert(openIndex >= 0 && migrateIndex === openIndex + 1 && migrationIndexes.length === 1
+    && migrationIndexes[0] > migrateIndex && postMigrateIndex === migrationIndexes[0] + 1
+    && albumIndexes.length === 1 && albumIndexes[0] > postMigrateIndex,
+  `${recoveryLabel} stage transitions must occur only after open-configure and migration complete`);
+  const migrationCall = maintenance(tryStatements[migrationIndexes[0]], "migration");
+  const migrateCalls = astNodes(migrationCall.arguments[1].body, (node) => {
+    if (node.type !== "CallExpression") return false;
+    const callee = canonicalCallee(node.callee);
+    return callee?.type === "MemberExpression" && identifier(callee.object, "database")
+      && propertyName(callee) === "migrate" && node.arguments.length === 1 && identifier(node.arguments[0], signalName);
+  });
+  const albumCall = maintenance(tryStatements[albumIndexes[0]], "album");
+  const reconcileCalls = astNodes(albumCall.arguments[1].body, (node) => {
+    if (node.type !== "CallExpression") return false;
+    const callee = canonicalCallee(node.callee);
+    return callee?.type === "MemberExpression" && propertyName(callee) === "reconcile"
+      && memberOn(callee.object, dependenciesName, "album") && node.arguments.length === 2
+      && identifier(node.arguments[0], "database") && identifier(node.arguments[1], signalName);
+  });
+  assert(migrateCalls.length === 1 && reconcileCalls.length === 1,
+    `${recoveryLabel} stage transition sites must guard the exact migration and album operations`);
+
+  const catchBody = startupTry.handler.body.body;
+  assert.equal(catchBody.length, 4, `${recoveryLabel} failure control flow is invalid`);
+  const [noDatabase, closeTry, succeededStatement, startupThrow] = catchBody;
+  assert(noDatabase.type === "IfStatement" && !noDatabase.alternate
+    && noDatabase.test.type === "UnaryExpression" && noDatabase.test.operator === "!"
+    && noDatabase.test.argument.type === "Identifier" && noDatabase.consequent.type === "BlockStatement"
+    && noDatabase.consequent.body.length === 2,
+  `${recoveryLabel} pre-open failure branch is invalid`);
+  const unobservedCall = expressionCall(noDatabase.consequent.body[0]);
+  assert(unobservedCall && directIdentifierCall(unobservedCall, "emitFailureTerminal", 3) === unobservedCall
+    && traceMember(unobservedCall.arguments[0], dependenciesName)
+    && record(unobservedCall.arguments[1], null, "failure", "unobserved")
+    && identifier(unobservedCall.arguments[2], startupError.name)
+    && noDatabase.consequent.body[1].type === "ThrowStatement"
+    && identifier(noDatabase.consequent.body[1].argument, startupError.name),
+  `${recoveryLabel} pre-open failure terminal is not correlated`);
+
+  const closeCall = closeTry?.type === "TryStatement" && closeTry.block.body.length === 1
+    && closeTry.block.body[0].type === "ExpressionStatement"
+    && closeTry.block.body[0].expression.type === "AwaitExpression"
+    ? directCall(closeTry.block.body[0].expression.argument) : null;
+  const closeError = closeTry?.handler?.param;
+  const closeBody = closeTry?.handler?.body.body;
+  assert(closeCall && canonicalCallee(closeCall.callee)?.type === "MemberExpression"
+    && propertyName(canonicalCallee(closeCall.callee)) === "close" && closeCall.arguments.length === 0
+    && closeError?.type === "Identifier" && Array.isArray(closeBody) && closeBody.length === 3 && !closeTry.finalizer,
+  `${recoveryLabel} close observation branch is invalid`);
+  const failureDeclaration = standaloneVariable(closeBody[0], "failure");
+  const startupCleanup = directCall(failureDeclaration?.init);
+  const startupCleanupCallee = startupCleanup ? canonicalCallee(startupCleanup.callee) : null;
+  const failedCall = expressionCall(closeBody[1]);
+  assert(failureDeclaration && startupCleanup && startupCleanupCallee?.type === "MemberExpression"
+    && identifier(startupCleanupCallee.object, cleanupNamespace) && propertyName(startupCleanupCallee) === "cleanupFailure"
+    && startupCleanup.arguments.length === 2 && startupCleanup.arguments[0]?.type === "ArrayExpression"
+    && startupCleanup.arguments[0].elements.length === 2
+    && identifier(startupCleanup.arguments[0].elements[0], startupError.name)
+    && identifier(startupCleanup.arguments[0].elements[1], closeError.name)
+    && literal(startupCleanup.arguments[1], "Application startup failed and closing the database also failed")
+    && cleanupCalls.includes(startupCleanup) && failedCall
+    && directIdentifierCall(failedCall, "emitFailureTerminal", 3) === failedCall
+    && traceMember(failedCall.arguments[0], dependenciesName)
+    && record(failedCall.arguments[1], null, "failure", "failed")
+    && identifier(failedCall.arguments[2], "failure")
+    && closeBody[2].type === "ThrowStatement" && identifier(closeBody[2].argument, "failure"),
+  `${recoveryLabel} failed-close terminal is not correlated`);
+
+  const succeededCall = expressionCall(succeededStatement);
+  assert(succeededCall && directIdentifierCall(succeededCall, "emitFailureTerminal", 3) === succeededCall
+    && traceMember(succeededCall.arguments[0], dependenciesName)
+    && record(succeededCall.arguments[1], null, "failure", "succeeded")
+    && identifier(succeededCall.arguments[2], startupError.name)
+    && startupThrow.type === "ThrowStatement" && identifier(startupThrow.argument, startupError.name),
+  `${recoveryLabel} successful-close failure terminal is not correlated`);
+
+  const failureCalls = [unobservedCall, failedCall, succeededCall];
+  const failureStageReferences = failureCalls.flatMap((call) => {
+    const property = call.arguments[1].properties[0];
+    return property.shorthand ? [property.key, property.value] : [property.value];
+  });
+  assertExactReferences(recovery, "stage", stage.id,
+    [...stageWrites.map((assignment) => assignment.left), ...failureStageReferences], `${recoveryLabel} stage state`);
+  const traceReferences = astNodes(recovery, (node) => traceMember(node, dependenciesName));
+  const expectedTraceReferences = [readyCall.arguments[0], ...failureCalls.map((call) => call.arguments[0])];
+  assert(traceReferences.length === expectedTraceReferences.length
+    && traceReferences.every((reference) => expectedTraceReferences.includes(reference)),
+  `${recoveryLabel} trace dependency must be consumed only by correlated terminals`);
+  assertExactBindingReferences(
+    module.factory.body,
+    "emitTerminal",
+    emitTerminal.id,
+    [canonicalCallee(failureHelperCall.callee), canonicalCallee(readyCall.callee)],
+    `${recoveryLabel} terminal helper`,
+  );
+  assertExactBindingReferences(
+    module.factory.body,
+    "emitFailureTerminal",
+    emitFailureTerminal.id,
+    failureCalls.map((call) => canonicalCallee(call.callee)),
+    `${recoveryLabel} failure terminal helper`,
+  );
+  const recoveryExport = finalNamedExport(module, "recoverAndOpen");
+  assertExactBindingReferences(module.factory.body, recovery.id.name, recovery.id, [recoveryExport],
+    `${recoveryLabel} final export`);
+}
+
+function productionBootstrapEvidence(module, graph, label) {
+  const undefinedValue = (node) => identifier(node, "undefined")
+    || node?.type === "UnaryExpression" && node.operator === "void" && literal(node.argument, 0);
+  const undefinedTest = (node, name) => {
+    if (node?.type !== "BinaryExpression" || node.operator !== "===") return null;
+    if (identifier(node.left, name) && undefinedValue(node.right)) return node.left;
+    if (undefinedValue(node.left) && identifier(node.right, name)) return node.right;
+    return null;
+  };
+  const namedVariables = (scope, name) => astNodes(scope, (node) => node.type === "VariableDeclarator" && identifier(node.id, name));
+  const property = (object, name) => object?.type === "ObjectExpression"
+    ? object.properties.filter((candidate) => candidate.type === "Property" && !candidate.computed
+      && propertyName({ type: "MemberExpression", computed: false, property: candidate.key }) === name) : [];
+
+  assertClosedExports(module, ["createProductionBootstrap"], `${label} live bootstrap module`);
+  const factory = exportedFunction(module, "createProductionBootstrap");
+  assert(hasFunctionFlags(factory, false) && factory.params.length === 1 && factory.params[0].type === "Identifier",
+    `${label} live bootstrap factory must be one synchronous single-sink export`);
+  const traceName = factory.params[0].name;
+  assert(bindingIsImmutable(factory, traceName, factory.params[0]), `${label} live bootstrap trace parameter must be immutable`);
+
+  const tracingMatches = namedVariables(factory.body, "tracing");
+  assert.equal(tracingMatches.length, 1, `${label} live bootstrap tracing binding must be unique`);
+  const tracing = tracingMatches[0];
+  const guardReference = tracing.init?.type === "ConditionalExpression" ? undefinedTest(tracing.init.test, traceName) : null;
+  const setupCall = tracing.init?.type === "ConditionalExpression" ? directCall(tracing.init.alternate) : null;
+  const setup = setupCall && setupCall.arguments.length === 0 ? unwrapChain(setupCall.callee) : null;
+  assert(guardReference && undefinedValue(tracing.init.consequent)
+    && ["ArrowFunctionExpression", "FunctionExpression"].includes(setup?.type)
+    && hasFunctionFlags(setup, false) && setup.params.length === 0 && setup.body.type === "BlockStatement",
+  `${label} live bootstrap tracing must be created only when its sink is defined`);
+
+  const emitMatches = namedVariables(setup.body, "emit");
+  assert.equal(emitMatches.length, 1, `${label} live bootstrap emit binding must be unique`);
+  const emit = emitMatches[0];
+  const emitFunction = emit.init;
+  const sinkTry = emitFunction?.body?.type === "BlockStatement" && emitFunction.body.body.length === 1
+    ? emitFunction.body.body[0] : null;
+  const sinkStatement = sinkTry?.type === "TryStatement" && sinkTry.block.body.length === 1 ? sinkTry.block.body[0] : null;
+  const sinkCall = sinkStatement?.type === "ExpressionStatement" ? directCall(sinkStatement.expression) : null;
+  assert(["ArrowFunctionExpression", "FunctionExpression"].includes(emitFunction?.type)
+    && hasFunctionFlags(emitFunction, false) && emitFunction.params.length === 1 && emitFunction.params[0].type === "Identifier"
+    && sinkCall && identifier(unwrapChain(sinkCall.callee), traceName) && sinkCall.arguments.length === 1
+    && identifier(sinkCall.arguments[0], emitFunction.params[0].name)
+    && !sinkTry.finalizer && sinkTry.handler?.body.body.length === 0,
+  `${label} live bootstrap emit wrapper must contain and call only the selected sink`);
+
+  const setupReturns = setup.body.body.filter((statement) => statement.type === "ReturnStatement");
+  const setupObject = setupReturns.length === 1 ? setupReturns[0].argument : null;
+  const startProperties = property(setupObject, "startAttempt");
+  const startAttempt = startProperties.length === 1 ? startProperties[0].value : null;
+  assert(setupObject?.type === "ObjectExpression" && setupObject.properties.length === 1
+    && ["ArrowFunctionExpression", "FunctionExpression"].includes(startAttempt?.type)
+    && hasFunctionFlags(startAttempt, false) && startAttempt.params.length === 0 && startAttempt.body.type === "BlockStatement",
+  `${label} live bootstrap setup must expose exactly one startAttempt path`);
+  const emitCalls = astNodes(startAttempt.body, (node) => node.type === "CallExpression" && identifier(unwrapChain(node.callee), "emit"));
+  assert.equal(emitCalls.length, 2, `${label} live bootstrap start and terminal must share one emit sink`);
+  const startCall = emitCalls.find((call) => property(call.arguments[0], "kind").some((item) => literal(item.value, "start")));
+  const terminalReturns = astNodes(startAttempt.body, (node) => node.type === "ReturnStatement"
+    && ["ArrowFunctionExpression", "FunctionExpression"].includes(node.argument?.type));
+  const terminalFunction = terminalReturns.length === 1 ? terminalReturns[0].argument : null;
+  const terminalBody = terminalFunction?.body?.type === "BlockStatement"
+    ? terminalFunction.body.body.find((statement) => statement.type === "ReturnStatement")?.argument
+    : terminalFunction?.body;
+  const terminalCall = directCall(terminalBody);
+  const terminalRecord = terminalCall?.arguments.length === 1 ? terminalCall.arguments[0] : null;
+  assert(startCall && startCall.arguments.length === 1
+    && terminalFunction?.params.length === 1 && terminalFunction.params[0].type === "Identifier"
+    && terminalCall && identifier(unwrapChain(terminalCall.callee), "emit")
+    && property(terminalRecord, "kind").some((item) => literal(item.value, "terminal"))
+    && terminalRecord.properties.some((item) => item.type === "SpreadElement" && identifier(item.argument, terminalFunction.params[0].name)),
+  `${label} live bootstrap terminal must flow through the shared sink`);
+  assertExactBindingReferences(setup.body, "emit", emit.id, [unwrapChain(startCall.callee), unwrapChain(terminalCall.callee)],
+    `${label} live bootstrap shared emit sink`);
+
+  const factoryReturns = factory.body.body.filter((statement) => statement.type === "ReturnStatement");
+  const live = factoryReturns.length === 1 ? factoryReturns[0].argument : null;
+  assert(["ArrowFunctionExpression", "FunctionExpression"].includes(live?.type)
+    && hasFunctionFlags(live, true) && live.params.length === 1 && live.params[0].type === "Identifier"
+    && live.body.type === "BlockStatement", `${label} live bootstrap factory must return one async bootstrap`);
+  const terminalMatches = namedVariables(live.body, "traceTerminal");
+  assert.equal(terminalMatches.length, 1, `${label} live bootstrap terminal binding must be unique`);
+  const terminal = terminalMatches[0];
+  const startTerminalCall = directCall(terminal.init);
+  const startTerminalCallee = startTerminalCall ? unwrapChain(startTerminalCall.callee) : null;
+  const tracingReference = startTerminalCallee?.type === "MemberExpression" ? unwrapChain(startTerminalCallee.object) : null;
+  assert(terminal.init?.type === "ChainExpression" && startTerminalCall?.arguments.length === 0
+    && startTerminalCallee?.type === "MemberExpression" && propertyName(startTerminalCallee) === "startAttempt"
+    && identifier(tracingReference, "tracing"), `${label} live bootstrap start sink must be optional`);
+
+  const recoveryCalls = astNodes(live.body, (node) => node.type === "CallExpression"
+    && canonicalCallee(node.callee)?.type === "MemberExpression"
+    && !canonicalCallee(node.callee).computed && propertyName(canonicalCallee(node.callee)) === "recoverAndOpen");
+  assert.equal(recoveryCalls.length, 1, `${label} live bootstrap must call one recoverAndOpen`);
+  const recoveryCall = recoveryCalls[0];
+  const recoveryCallee = canonicalCallee(recoveryCall.callee);
+  assert(recoveryCallee.object.type === "Identifier" && recoveryCall.arguments.length === 2
+    && recoveryCall.arguments[0].type === "ObjectExpression" && identifier(recoveryCall.arguments[1], live.params[0].name),
+  `${label} live bootstrap recoverAndOpen call is malformed`);
+  const terminalSpreads = recoveryCall.arguments[0].properties.filter((item) => item.type === "SpreadElement"
+    && item.argument?.type === "ConditionalExpression" && undefinedTest(item.argument.test, "traceTerminal"));
+  assert.equal(terminalSpreads.length, 1, `${label} live bootstrap must conditionally pass traceTerminal`);
+  const terminalConditional = terminalSpreads[0].argument;
+  const terminalTestReference = undefinedTest(terminalConditional.test, "traceTerminal");
+  const terminalProperties = property(terminalConditional.alternate, "traceTerminal");
+  assert(terminalConditional.consequent?.type === "ObjectExpression" && terminalConditional.consequent.properties.length === 0
+    && terminalConditional.alternate?.type === "ObjectExpression" && terminalConditional.alternate.properties.length === 1
+    && terminalProperties.length === 1 && identifier(terminalProperties[0].value, "traceTerminal"),
+  `${label} live bootstrap must pass the exact terminal sink only when defined`);
+  const recoveryBinding = dependencyBinding(module, recoveryCallee.object.name, `${label} recoverAndOpen dependency`, factory, [recoveryCallee.object]);
+  const recoveryModule = resolveDependency(graph, module, recoveryBinding.dependencyIndex, `${label} recoverAndOpen dependency`);
+  recoverAndOpenEvidence(recoveryModule, graph, label);
+  assertExactBindingReferences(factory, traceName, factory.params[0], [guardReference, unwrapChain(sinkCall.callee)], `${label} selected trace sink`);
+  assertExactBindingReferences(factory, "tracing", tracing.id, [tracingReference], `${label} tracing path`);
+  const terminalReferences = new Set(bindingReferences(live, "traceTerminal", terminal.id));
+  const expectedTerminalReferences = new Set([terminalTestReference, terminalProperties[0].value]);
+  if (terminalProperties[0].shorthand) expectedTerminalReferences.add(terminalProperties[0].key);
+  assert(bindingIsImmutable(live, "traceTerminal", terminal.id)
+    && terminalReferences.size === expectedTerminalReferences.size
+    && [...terminalReferences].every((reference) => expectedTerminalReferences.has(reference)),
+  `${label} terminal sink must be closed to recoverAndOpen`);
+
+  const processNonce = topLevelVariable(module, "processNonce", `${label} process nonce`, { before: factory });
+  const randomCalls = astNodes(processNonce.declaration.init, (node) => directIntrinsicCall(node, "Math", "random", 0)?.call === node);
+  const freezeCalls = astNodes(factory.body, (node) => directIntrinsicCall(node, "Object", "freeze", 1)?.call === node
+    && node.arguments[0]?.type === "ObjectExpression");
+  const exportCalls = astNodes(module.factory.body, (node) => directIntrinsicCall(node, "Object", "defineProperty", 3)?.call === node
+    && identifier(node.arguments[0], module.exportsName));
+  assert.equal(randomCalls.length, 1, `${label} live bootstrap Math.random site is invalid`);
+  assert.equal(freezeCalls.length, 2, `${label} live bootstrap Object.freeze sites are invalid`);
+  assertExactIntrinsicReferences(module, {
+    Math: [directIntrinsicCall(randomCalls[0], "Math", "random", 0).object],
+    Object: [
+      ...exportCalls.map((call) => directIntrinsicCall(call, "Object", "defineProperty", 3).object),
+      ...freezeCalls.map((call) => directIntrinsicCall(call, "Object", "freeze", 1).object),
+    ],
+  }, `${label} live bootstrap module`);
+}
+
 function appEvidence(module, graph, label) {
   const appComposition = exportedFunction(module, "AppComposition");
   if (!appComposition) return null;
@@ -930,19 +1713,64 @@ function appEvidence(module, graph, label) {
     ? installPattern.right : null;
   if (defaultValue?.type !== "MemberExpression" || defaultValue.computed || propertyName(defaultValue) !== "installFaultController"
     || defaultValue.object.type !== "Identifier" || !bindingIsImmutable(appComposition, "installFaults", parameter)) return null;
+  const bootstrapDeclaration = topLevelVariable(module, "productionBootstrap", `${label} App production bootstrap`, { before: appComposition });
+  const bootstrapCall = directCall(bootstrapDeclaration.declaration.init);
+  const bootstrapCallee = bootstrapCall ? canonicalCallee(bootstrapCall.callee) : null;
+  const traceArgument = bootstrapCall?.arguments.length === 1 ? unwrapChain(bootstrapCall.arguments[0]) : null;
+  if (bootstrapCallee?.type !== "MemberExpression" || bootstrapCallee.object.type !== "Identifier"
+    || propertyName(bootstrapCallee) !== "createProductionBootstrap"
+    || traceArgument?.type !== "MemberExpression" || traceArgument.computed
+    || traceArgument.object.type !== "Identifier" || traceArgument.object.name !== defaultValue.object.name
+    || propertyName(traceArgument) !== "traceBootstrap") return null;
   const controllerBinding = dependencyBinding(
     module,
     defaultValue.object.name,
     `${label} App controller`,
     appComposition,
-    [defaultValue.object],
+    [traceArgument.object, defaultValue.object],
   );
+  const bootstrapBinding = dependencyBinding(
+    module,
+    bootstrapCallee.object.name,
+    `${label} App bootstrap factory`,
+    bootstrapDeclaration.statement,
+    [bootstrapCallee.object],
+  );
+  const bootstrapModule = resolveDependency(graph, module, bootstrapBinding.dependencyIndex, `${label} App bootstrap factory`);
+  productionBootstrapEvidence(bootstrapModule, graph, label);
 
   if (appComposition.body.body.length !== 1 || appComposition.body.body[0].type !== "ReturnStatement") return null;
   const hostRender = renderedComponent(appComposition.body.body[0].argument, "FaultControllerHost");
   if (!hostRender.validRoot || hostRender.matches.length !== 1) return null;
   const installProperties = objectProperties(hostRender.matches[0].props, "installFaults");
-  if (installProperties.length !== 1 || !identifier(installProperties[0].value, "installFaults")) return null;
+  const childrenProperties = objectProperties(hostRender.matches[0].props, "children");
+  if (installProperties.length !== 1 || !identifier(installProperties[0].value, "installFaults")
+    || childrenProperties.length !== 1) return null;
+  const navigatorRender = renderedComponent(childrenProperties[0].value, "RootNavigator");
+  if (!navigatorRender.validRoot || navigatorRender.matches.length !== 1) return null;
+  const navigatorMatch = navigatorRender.matches[0];
+  const navigatorReference = navigatorMatch.componentReference;
+  const navigatorNamespace = navigatorReference?.type === "MemberExpression" && !navigatorReference.computed
+    && propertyName(navigatorReference) === "RootNavigator" && navigatorReference.object.type === "Identifier"
+    ? navigatorReference.object : null;
+  const bootstrapProperties = objectProperties(navigatorMatch.props, "bootstrap");
+  if (!navigatorNamespace || bootstrapProperties.length !== 1
+    || !identifier(bootstrapProperties[0].value, "productionBootstrap")) return null;
+  const navigatorBinding = dependencyBinding(
+    module,
+    navigatorNamespace.name,
+    `${label} App RootNavigator`,
+    appComposition,
+    [navigatorNamespace],
+  );
+  resolveDependency(graph, module, navigatorBinding.dependencyIndex, `${label} App RootNavigator`);
+  assertExactBindingReferences(
+    module.factory.body,
+    "productionBootstrap",
+    bootstrapDeclaration.declaration.id,
+    [bootstrapProperties[0].value],
+    `${label} App live production bootstrap`,
+  );
 
   const host = functionDeclaration(module, "FaultControllerHost");
   if (!hasFunctionFlags(host, false)) return null;
@@ -955,7 +1783,7 @@ function appEvidence(module, graph, label) {
     host,
     hostInstallation.runtimeReferences,
   );
-  assertJsxRuntimeBinding(module, [appRender, hostRender], host, `${label} App render chain`);
+  assertJsxRuntimeBinding(module, [appRender, hostRender, navigatorRender], host, `${label} App render chain`);
 
   const appCompositionExport = finalNamedExport(module, "AppComposition");
   const defaultExport = finalNamedExport(module, "default");
@@ -981,7 +1809,11 @@ function appEvidence(module, graph, label) {
     [installProperties[0].value],
     `${label} AppComposition installFaults`,
   );
-  return { module, controller: resolveDependency(graph, module, controllerBinding.dependencyIndex, `${label} App controller`) };
+  return {
+    module,
+    bootstrap: bootstrapModule,
+    controller: resolveDependency(graph, module, controllerBinding.dependencyIndex, `${label} App controller`),
+  };
 }
 
 function rootRegistersApp(graph, app, label) {
@@ -1058,8 +1890,327 @@ function expressionCall(statement) {
   return statement?.type === "ExpressionStatement" ? directCall(statement.expression) : null;
 }
 
+function bootstrapTraceEvidence(module, label) {
+  assertPristineIntrinsics(module, `${label} bootstrap trace module`);
+  const trace = exportedFunction(module, "traceBootstrap");
+  assert(hasFunctionFlags(trace, false) && trace.params.length === 1 && trace.params[0].type === "Identifier",
+    `${label} bootstrap trace export must be one synchronous function`);
+  const recordName = trace.params[0].name;
+  const variable = (name) => {
+    const matches = astNodes(trace.body, (node) => node.type === "VariableDeclarator" && identifier(node.id, name));
+    assert.equal(matches.length, 1, `${label} bootstrap trace ${name} binding must be unique`);
+    return matches[0];
+  };
+  const callMethod = (node, objectName, methodName, argumentCount) => {
+    const call = directCall(node);
+    const callee = call ? canonicalCallee(call.callee) : null;
+    return call && callee?.type === "MemberExpression" && identifier(callee.object, objectName)
+      && propertyName(callee) === methodName && call.arguments.length === argumentCount ? call : null;
+  };
+  const recordMember = (node, field) => node?.type === "MemberExpression" && !node.computed
+    && identifier(node.object, recordName) && propertyName(node) === field;
+  const bareReturn = (statement) => statement?.type === "ReturnStatement" && statement.argument === null;
+  const expressionStatementCall = (statement, objectName, methodName, argumentCount) => {
+    const call = expressionCall(statement);
+    return callMethod(call, objectName, methodName, argumentCount);
+  };
+  const binary = (node, operator, left, right) => node?.type === "BinaryExpression" && node.operator === operator
+    && left(node.left) && right(node.right);
+  const logicalOperands = (node, operator) => node?.type === "LogicalExpression" && node.operator === operator
+    ? [...logicalOperands(node.left, operator), ...logicalOperands(node.right, operator)] : [node];
+  const objectField = (object, name) => object?.type === "ObjectExpression"
+    ? object.properties.find((property) => property.type === "Property" && property.kind === "init" && !property.computed
+      && propertyName({ type: "MemberExpression", computed: false, property: property.key }) === name) : null;
+  const exactObject = (object, fields) => object?.type === "ObjectExpression" && object.properties.length === fields.length
+    && fields.every(([name, predicate]) => {
+      const property = objectField(object, name);
+      return property && predicate(property.value);
+    });
+
+  const allowedRecordFields = new Set(["attempt", "kind", "stage", "outcome", "closeOutcome", "failureCategory"]);
+  const recordMembers = astNodes(trace.body, (node) => node.type === "MemberExpression"
+    && !node.computed && identifier(node.object, recordName));
+  assert(recordMembers.length > 0, `${label} bootstrap trace must read its typed record`);
+  for (const reference of recordMembers) {
+    assert(allowedRecordFields.has(propertyName(reference)),
+      `${label} bootstrap trace record access is outside the serialization whitelist`);
+  }
+  assert.equal(astNodes(trace.body, (node) => identifier(node, "global")).length, 0,
+    `${label} bootstrap trace must not alias global payloads`);
+  const spreads = astNodes(trace.body, (node) => node.type === "SpreadElement" || node.type === "ExperimentalSpreadProperty");
+  assert.equal(spreads.length, 0, `${label} bootstrap trace must not spread untrusted records`);
+
+  const maximum = topLevelVariable(module, "MAX_BOOTSTRAP_ATTEMPTS", `${label} bootstrap trace attempt bound`, { before: trace });
+  assert(literal(maximum.declaration.init, 32), `${label} bootstrap trace attempt bound must remain 32`);
+  const session = topLevelVariable(module, "traceSession", `${label} bootstrap trace session`, { before: trace });
+  const padEnd = directCall(session.declaration.init);
+  const padEndCallee = padEnd ? canonicalCallee(padEnd.callee) : null;
+  const slice = padEndCallee?.type === "MemberExpression" && propertyName(padEndCallee) === "padEnd"
+    ? directCall(padEndCallee.object) : null;
+  const sliceCallee = slice ? canonicalCallee(slice.callee) : null;
+  const toString = sliceCallee?.type === "MemberExpression" && propertyName(sliceCallee) === "slice"
+    ? directCall(sliceCallee.object) : null;
+  const toStringCallee = toString ? canonicalCallee(toString.callee) : null;
+  const random = toStringCallee?.type === "MemberExpression" && propertyName(toStringCallee) === "toString"
+    ? directCall(toStringCallee.object) : null;
+  assert(padEnd?.arguments.length === 2 && literal(padEnd.arguments[0], 12) && literal(padEnd.arguments[1], "0")
+    && slice?.arguments.length === 2 && literal(slice.arguments[0], 2) && literal(slice.arguments[1], 14)
+    && toString?.arguments.length === 1 && literal(toString.arguments[0], 36)
+    && random?.arguments.length === 0 && member(canonicalCallee(random.callee), "Math", "random"),
+  `${label} bootstrap trace session must use the bounded random 12-character construction`);
+
+  const attempts = topLevelVariable(module, "traceAttempts", `${label} bootstrap trace attempt state`, { before: trace });
+  assert(attempts.declaration.init?.type === "NewExpression" && identifier(attempts.declaration.init.callee, "Map")
+    && attempts.declaration.init.arguments.length === 0, `${label} bootstrap trace attempt state must be a private Map`);
+  const expectedSets = [
+    ["traceFailureStages", ["open-configure", "migrate", "post-migrate"]],
+    ["traceFailureCloseOutcomes", ["unobserved", "succeeded", "failed"]],
+    ["traceFailureCategories", ["abort", "cleanup", "sqlite-open", "sqlite", "aggregate", "uncoded"]],
+  ];
+  const validationSets = new Map();
+  for (const [name, values] of expectedSets) {
+    const binding = topLevelVariable(module, name, `${label} bootstrap trace ${name}`, { before: trace });
+    const init = binding.declaration.init;
+    assert(init?.type === "NewExpression" && identifier(init.callee, "Set") && init.arguments.length === 1
+      && init.arguments[0]?.type === "ArrayExpression"
+      && init.arguments[0].elements.length === values.length
+      && init.arguments[0].elements.every((element, index) => literal(element, values[index])),
+    `${label} bootstrap trace ${name} validation set is invalid`);
+    validationSets.set(name, binding);
+  }
+  const sequenceMatches = module.factory.body.body.flatMap((statement) => statement.type === "VariableDeclaration"
+    ? statement.declarations.filter((declaration) => identifier(declaration.id, "traceSequence")) : []);
+  assert.equal(sequenceMatches.length, 1, `${label} bootstrap trace sequence binding must be unique`);
+  assert(literal(sequenceMatches[0].init, 0), `${label} bootstrap trace sequence must start at zero`);
+
+  const attempt = variable("attempt");
+  assert(recordMember(attempt.init, "attempt") && bindingIsImmutable(trace.body, "attempt", attempt.id),
+    `${label} bootstrap trace attempt must be an immutable typed-record projection`);
+  const attemptGuard = trace.body.body.find((statement) => statement.type === "IfStatement"
+    && statement.consequent.type === "ReturnStatement" && statement.consequent.argument === null
+    && logicalOperands(statement.test, "||").length === 3);
+  const attemptChecks = attemptGuard ? logicalOperands(attemptGuard.test, "||") : [];
+  const safeInteger = attemptChecks.some((node) => node.type === "UnaryExpression" && node.operator === "!"
+    && callMethod(node.argument, "Number", "isSafeInteger", 1)?.arguments.some((argument) => identifier(argument, "attempt")));
+  const lowerBound = attemptChecks.some((node) => binary(node, "<", (value) => identifier(value, "attempt"), (value) => literal(value, 1)));
+  const upperBound = attemptChecks.some((node) => binary(node, ">", (value) => identifier(value, "attempt"),
+    (value) => identifier(value, "MAX_BOOTSTRAP_ATTEMPTS")));
+  assert(attemptGuard && safeInteger && lowerBound && upperBound,
+    `${label} bootstrap trace attempt validation must remain safe, one-based, and bounded`);
+
+  const startBranch = trace.body.body.find((statement) => statement.type === "IfStatement"
+    && binary(statement.test, "===", (value) => recordMember(value, "kind"), (value) => literal(value, "start")));
+  assert(startBranch?.consequent.type === "BlockStatement" && startBranch.alternate?.type === "IfStatement",
+    `${label} bootstrap trace must preserve explicit start and terminal-kind branches`);
+  const startBody = startBranch.consequent.body;
+  const duplicateGuard = startBody.find((statement) => statement.type === "IfStatement" && bareReturn(statement.consequent)
+    && callMethod(statement.test, "traceAttempts", "has", 1)?.arguments.some((argument) => identifier(argument, "attempt")));
+  const duplicateCall = duplicateGuard ? callMethod(duplicateGuard.test, "traceAttempts", "has", 1) : null;
+  const startTransition = startBody.map((statement) => expressionStatementCall(statement, "traceAttempts", "set", 2))
+    .find((call) => call && identifier(call.arguments[0], "attempt") && literal(call.arguments[1], "started"));
+  assert(duplicateCall && startTransition, `${label} bootstrap trace start-state validation is invalid`);
+
+  const terminalBranch = startBranch.alternate;
+  assert(binary(terminalBranch.test, "===", (value) => recordMember(value, "kind"), (value) => literal(value, "terminal"))
+    && terminalBranch.consequent.type === "BlockStatement"
+    && terminalBranch.alternate?.type === "BlockStatement"
+    && terminalBranch.alternate.body.length === 1 && bareReturn(terminalBranch.alternate.body[0]),
+  `${label} bootstrap trace must reject every non-terminal alternate kind`);
+  const terminalBody = terminalBranch.consequent.body;
+  const terminalGuard = terminalBody.find((statement) => statement.type === "IfStatement" && bareReturn(statement.consequent));
+  const terminalChecks = terminalGuard ? logicalOperands(terminalGuard.test, "||") : [];
+  const stateCheck = terminalChecks.find((node) => binary(node, "!==", (value) => {
+    const call = callMethod(value, "traceAttempts", "get", 1);
+    return call && identifier(call.arguments[0], "attempt");
+  }, (value) => literal(value, "started")));
+  const stateGet = stateCheck ? callMethod(stateCheck.left, "traceAttempts", "get", 1) : null;
+  const truthCheck = terminalChecks.find((node) => node.type === "UnaryExpression" && node.operator === "!"
+    && logicalOperands(node.argument, "||").length === 2);
+  const truthArms = truthCheck ? logicalOperands(truthCheck.argument, "||") : [];
+  const recordEquals = (node, field, value) => binary(node, "===",
+    (candidate) => recordMember(candidate, field), (candidate) => literal(candidate, value));
+  const successArm = truthArms.find((arm) => logicalOperands(arm, "&&")
+    .some((node) => recordEquals(node, "outcome", "success")));
+  const failureArm = truthArms.find((arm) => logicalOperands(arm, "&&")
+    .some((node) => recordEquals(node, "outcome", "failure")));
+  const successChecks = successArm ? logicalOperands(successArm, "&&") : [];
+  const failureChecks = failureArm ? logicalOperands(failureArm, "&&") : [];
+  const categoryAbsent = successChecks.some((node) => node.type === "UnaryExpression" && node.operator === "!"
+    && node.argument?.type === "BinaryExpression" && node.argument.operator === "in"
+    && literal(node.argument.left, "failureCategory") && identifier(node.argument.right, recordName));
+  const setCheck = (checks, setName, field) => checks.map((node) => callMethod(node, setName, "has", 1))
+    .find((call) => call && recordMember(call.arguments[0], field));
+  const stageCall = setCheck(failureChecks, "traceFailureStages", "stage");
+  const closeCall = setCheck(failureChecks, "traceFailureCloseOutcomes", "closeOutcome");
+  const categoryCall = setCheck(failureChecks, "traceFailureCategories", "failureCategory");
+  assert(terminalChecks.length === 2 && stateGet && truthCheck
+    && successChecks.length === 4
+    && successChecks.some((node) => recordEquals(node, "outcome", "success"))
+    && successChecks.some((node) => recordEquals(node, "stage", "ready"))
+    && successChecks.some((node) => recordEquals(node, "closeOutcome", "not-attempted"))
+    && categoryAbsent
+    && failureChecks.length === 4
+    && failureChecks.some((node) => recordEquals(node, "outcome", "failure"))
+    && stageCall && closeCall && categoryCall,
+  `${label} bootstrap trace terminal validation must preserve the exact correlated truth table`);
+  const terminalTransition = terminalBody.map((statement) => expressionStatementCall(statement, "traceAttempts", "set", 2))
+    .find((call) => call && identifier(call.arguments[0], "attempt") && literal(call.arguments[1], "terminal"));
+  assert(terminalTransition, `${label} bootstrap trace terminal state transition is invalid`);
+
+  const callReceiver = (call) => canonicalCallee(call.callee).object;
+  assertExactBindingReferences(
+    module.factory.body,
+    "traceAttempts",
+    attempts.declaration.id,
+    [callReceiver(duplicateCall), callReceiver(startTransition), callReceiver(stateGet), callReceiver(terminalTransition)],
+    `${label} bootstrap trace attempt state`,
+  );
+  for (const [name, call] of [
+    ["traceFailureStages", stageCall],
+    ["traceFailureCloseOutcomes", closeCall],
+    ["traceFailureCategories", categoryCall],
+  ]) {
+    assertExactBindingReferences(
+      module.factory.body,
+      name,
+      validationSets.get(name).declaration.id,
+      [callReceiver(call)],
+      `${label} bootstrap trace ${name} validation set`,
+    );
+  }
+
+  const allowedOutputFields = new Set([
+    "schemaVersion", "session", "sequence", "attempt", "kind", "stage", "outcome", "closeOutcome", "failureCategory",
+  ]);
+  const outputObjects = astNodes(trace.body, (node) => node.type === "ObjectExpression");
+  for (const object of outputObjects) {
+    for (const property of object.properties) {
+      assert(property.type === "Property" && !property.computed && allowedOutputFields.has(propertyName({
+        type: "MemberExpression",
+        computed: false,
+        property: property.key,
+      })), `${label} bootstrap trace output contains a non-whitelist field`);
+    }
+  }
+  const output = variable("output");
+  assert(output.init === null, `${label} bootstrap trace output must be built only in validated branches`);
+  const outputAssignments = astNodes(trace.body, (node) => node.type === "AssignmentExpression"
+    && node.operator === "=" && identifier(node.left, "output"));
+  assert.equal(outputAssignments.length, 2, `${label} bootstrap trace output must have exactly two validated constructions`);
+  const frozenValue = (node) => {
+    const call = directCall(node);
+    return callMethod(call, "Object", "freeze", 1) ? call.arguments[0] : null;
+  };
+  const startOutput = outputAssignments.map((assignment) => frozenValue(assignment.right))
+    .find((value) => value?.type === "ObjectExpression");
+  const terminal = variable("terminal");
+  const terminalOutput = outputAssignments.find((assignment) => identifier(frozenValue(assignment.right), "terminal"));
+  const sequenceUpdates = [];
+  const sequenceValue = (value) => {
+    if (value?.type !== "UpdateExpression" || value.operator !== "++" || !value.prefix || !identifier(value.argument, "traceSequence")) return false;
+    sequenceUpdates.push(value.argument);
+    return true;
+  };
+  assert(exactObject(startOutput, [
+    ["schemaVersion", (value) => literal(value, 1)],
+    ["session", (value) => identifier(value, "traceSession")],
+    ["sequence", sequenceValue],
+    ["attempt", (value) => identifier(value, "attempt")],
+    ["kind", (value) => literal(value, "start")],
+  ]), `${label} bootstrap trace start output is not the exact whitelist object`);
+  assert(exactObject(terminal.init, [
+    ["schemaVersion", (value) => literal(value, 1)],
+    ["session", (value) => identifier(value, "traceSession")],
+    ["sequence", sequenceValue],
+    ["attempt", (value) => identifier(value, "attempt")],
+    ["kind", (value) => literal(value, "terminal")],
+    ["stage", (value) => recordMember(value, "stage")],
+    ["outcome", (value) => recordMember(value, "outcome")],
+    ["closeOutcome", (value) => recordMember(value, "closeOutcome")],
+  ]) && terminalOutput, `${label} bootstrap trace terminal output is not the exact immutable whitelist object`);
+  const categoryAssignments = astNodes(trace.body, (node) => node.type === "AssignmentExpression" && node.operator === "="
+    && node.left.type === "MemberExpression" && !node.left.computed && identifier(node.left.object, "terminal")
+    && propertyName(node.left) === "failureCategory" && recordMember(node.right, "failureCategory"));
+  assert.equal(categoryAssignments.length, 1, `${label} bootstrap trace failure category projection is invalid`);
+  const categoryGuard = terminalBody.find((statement) => statement.type === "IfStatement"
+    && binary(statement.test, "===", (value) => recordMember(value, "outcome"), (value) => literal(value, "failure"))
+    && astNodes(statement.consequent, (node) => node === categoryAssignments[0]).length === 1);
+  assert(categoryGuard, `${label} bootstrap trace failure category must be emitted only for failures`);
+  const sequenceReferences = bindingReferences(module.factory.body, "traceSequence", sequenceMatches[0].id);
+  assert(sequenceReferences.length === 2 && sequenceReferences.every((reference) => sequenceUpdates.includes(reference)),
+    `${label} bootstrap trace sequence must be used only by two prefix increments`);
+
+  const stringifyCalls = astNodes(trace.body, (node) => directIntrinsicCall(node, "JSON", "stringify", 1)?.call === node);
+  assert.equal(stringifyCalls.length, 1, `${label} bootstrap trace must serialize exactly one whitelist-built output`);
+  assert(stringifyCalls[0].arguments.length === 1 && identifier(stringifyCalls[0].arguments[0], "output"),
+    `${label} bootstrap trace serializer must consume the exact whitelist-built output binding`);
+  const outputReferences = bindingReferences(trace.body, "output", output.id);
+  const expectedOutputReferences = [...outputAssignments.map((assignment) => assignment.left), stringifyCalls[0].arguments[0]];
+  assert(outputReferences.length === expectedOutputReferences.length
+    && outputReferences.every((reference) => expectedOutputReferences.includes(reference)),
+  `${label} bootstrap trace whitelist output must not escape through aliases or extra reads`);
+
+  const consoleCalls = astNodes(trace.body, (node) => directIntrinsicCall(node, "console", "info", 1)?.call === node);
+  assert.equal(consoleCalls.length, 1, `${label} bootstrap trace must use exactly one console sink`);
+  const message = consoleCalls[0].arguments.length === 1 ? consoleCalls[0].arguments[0] : null;
+  assert(message?.type === "TemplateLiteral" && message.expressions.length === 2 && message.quasis.length === 3
+    && message.quasis[0].value.cooked === "" && message.quasis[1].value.cooked === " " && message.quasis[2].value.cooked === ""
+    && identifier(message.expressions[0], "E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL")
+    && message.expressions[1] === stringifyCalls[0],
+  `${label} bootstrap trace console argument must be exactly sentinel, one space, and the whitelist serializer`);
+  const guardedSinks = astNodes(trace.body, (node) => node.type === "TryStatement"
+    && !node.finalizer && node.handler?.body.body.length === 0
+    && astNodes(node.block, (candidate) => candidate === consoleCalls[0]).length === 1);
+  assert.equal(guardedSinks.length, 1, `${label} bootstrap trace console sink must be synchronously contained`);
+
+  const sentinelExport = finalNamedExport(module, "E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL");
+  assert(identifier(sentinelExport, "E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL"), `${label} bootstrap trace sentinel export is invalid`);
+  const sentinel = topLevelVariable(module, "E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL", `${label} bootstrap trace sentinel`, { before: trace });
+  assert(literal(sentinel.declaration.init, BOOTSTRAP_TRACE_SENTINEL), `${label} bootstrap trace sentinel binding is invalid`);
+  assertExactBindingReferences(
+    module.factory.body,
+    "traceBootstrap",
+    trace.id,
+    [finalNamedExport(module, "traceBootstrap")],
+    `${label} bootstrap trace export`,
+  );
+  const sentinelReferences = astNodes(trace.body, (node, parent) => identifier(node, "E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL")
+    && isIdentifierReference(node, parent));
+  assertExactBindingReferences(
+    module.factory.body,
+    "E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL",
+    sentinel.declaration.id,
+    [sentinelExport, ...sentinelReferences],
+    `${label} bootstrap trace sentinel`,
+  );
+  const sentinelLiterals = astNodes(module.factory.body, (node) => literal(node, BOOTSTRAP_TRACE_SENTINEL));
+  assert.equal(sentinelLiterals.length, 1, `${label} bootstrap trace sentinel must be one live literal`);
+  const randomIntrinsic = directIntrinsicCall(random, "Math", "random", 0);
+  const safeIntegerCalls = attemptChecks.map((node) => node.type === "UnaryExpression" && node.operator === "!"
+    ? directIntrinsicCall(node.argument, "Number", "isSafeInteger", 1) : null).filter(Boolean);
+  const freezeCalls = outputAssignments.map((assignment) => directIntrinsicCall(assignment.right, "Object", "freeze", 1));
+  const exportCalls = astNodes(module.factory.body, (node) => directIntrinsicCall(node, "Object", "defineProperty", 3)?.call === node
+    && identifier(node.arguments[0], module.exportsName));
+  assert(randomIntrinsic && safeIntegerCalls.length === 1 && freezeCalls.length === 2 && freezeCalls.every(Boolean),
+    `${label} bootstrap trace intrinsic call sites are noncanonical`);
+  assertExactIntrinsicReferences(module, {
+    JSON: [directIntrinsicCall(stringifyCalls[0], "JSON", "stringify", 1).object],
+    console: [directIntrinsicCall(consoleCalls[0], "console", "info", 1).object],
+    Object: [
+      ...exportCalls.map((call) => directIntrinsicCall(call, "Object", "defineProperty", 3).object),
+      ...freezeCalls.map((call) => call.object),
+    ],
+    Number: [safeIntegerCalls[0].object],
+    Math: [randomIntrinsic.object],
+    Map: [attempts.declaration.init.callee],
+    Set: [...validationSets.values()].map((binding) => binding.declaration.init.callee),
+  }, `${label} bootstrap trace module`);
+  return trace;
+}
+
 function listenerEvidence(module, graph, label) {
-  assertClosedExports(module, ["E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL", "installFaultController"], `${label} listener`);
+  assertClosedExports(module, ["E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL", "E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL", "installFaultController", "traceBootstrap"], `${label} listener`);
+  bootstrapTraceEvidence(module, label);
   const install = exportedFunction(module, "installFaultController");
   assert(hasFunctionFlags(install, true) && install.params.length === 2
     && install.params.every((parameter) => parameter.type === "Identifier"),
@@ -1382,8 +2533,9 @@ function registryValue(module) {
 }
 
 function noOpController(module) {
-  assertClosedExports(module, ["installFaultController"], "production controller");
+  assertClosedExports(module, ["installFaultController", "traceBootstrap"], "production controller");
   assertCanonicalMetroImports(module, "production controller");
+  assertPristineIntrinsics(module, "production controller trace module");
   const install = exportedFunction(module, "installFaultController");
   if (!hasFunctionFlags(install, true) || install.body.body.length !== 1
     || install.body.body[0].type !== "ReturnStatement" || install.body.body[0].argument?.type !== "Identifier") return false;
@@ -1408,6 +2560,22 @@ function noOpController(module) {
     [install.body.body[0].argument],
     "production controller no-op",
   );
+  const traceExport = unwrapExpression(finalNamedExport(module, "traceBootstrap"));
+  const undefinedExpression = (value) => identifier(value, "undefined")
+    || value?.type === "UnaryExpression" && value.operator === "void" && literal(value.argument, 0);
+  if (bindingDefinitions(module.factory.body, "undefined").length !== 0
+    || bindingWrites(module.factory.body, "undefined").length !== 0) return false;
+  if (undefinedExpression(traceExport)) return true;
+  if (traceExport?.type !== "Identifier") return false;
+  const traceBinding = topLevelVariable(module, traceExport.name, "production controller absent trace");
+  if (!undefinedExpression(traceBinding.declaration.init)) return false;
+  assertExactBindingReferences(
+    module.factory.body,
+    traceExport.name,
+    traceBinding.declaration.id,
+    [traceExport],
+    "production controller absent trace",
+  );
   return true;
 }
 
@@ -1421,7 +2589,7 @@ function moduleGraph(bytes, label, flavor) {
   assert.notEqual(app.module.moduleId, app.controller.moduleId, `${label} App and controller modules must be distinct`);
   if (flavor === "production") {
     assert(noOpController(app.controller), `${label} production App must reach the exact exported no-op controller`);
-    const reachableSentinels = [...reachable.values()].flatMap((module) => astNodes(module.factory.body, (node) => literal(node, FAULT_CONTROLLER_SENTINEL)));
+    const reachableSentinels = [...reachable.values()].flatMap((module) => astNodes(module.factory.body, (node) => literal(node, FAULT_CONTROLLER_SENTINEL) || literal(node, BOOTSTRAP_TRACE_SENTINEL)));
     const reachableParsers = [...reachable.values()].filter((module) => finalNamedExport(module, "parseFaultUrl"));
     const reachableRegistries = [...reachable.values()].filter((module) => JSON.stringify(registryValue(module)) === JSON.stringify(faultPoints));
     assert.equal(reachableSentinels.length, 0, `${label} production reachable graph contains an E2E listener sentinel`);

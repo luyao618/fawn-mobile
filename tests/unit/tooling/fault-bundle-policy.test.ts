@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   FAULT_BUNDLE_EXPORT_FLAGS,
   FAULT_BUNDLE_PLATFORMS,
+  BOOTSTRAP_TRACE_SENTINEL,
   FAULT_CONTROLLER_SENTINEL,
   validateFaultBundleProof,
 } from "../../../tools/check-fault-bundles.mjs";
@@ -18,7 +19,7 @@ const protocolMarker = "formobile-test:";
 const modeMarker = "crash_once";
 const platforms = FAULT_BUNDLE_PLATFORMS as readonly ("android" | "ios")[];
 const faultPoints = JSON.parse(await readFile("src/testing/faultPoints.json", "utf8")) as string[];
-const markers = [FAULT_CONTROLLER_SENTINEL, protocolMarker, modeMarker, ...faultPoints];
+const markers = [FAULT_CONTROLLER_SENTINEL, BOOTSTRAP_TRACE_SENTINEL, protocolMarker, modeMarker, ...faultPoints];
 const listenerModuleId = 101;
 const parserModuleId = 202;
 const registryModuleId = 303;
@@ -28,11 +29,17 @@ const runtimeModuleId = 900;
 const rootRuntimeModuleId = 901;
 const alternateRuntimeModuleId = 902;
 const appRuntimeModuleId = 903;
+const bootstrapModuleId = 904;
+const navigatorModuleId = 905;
+const recoveryModuleId = 906;
+const alternateRecoveryModuleId = 907;
+const cleanupFailureModuleId = 908;
+const alternateCleanupFailureModuleId = 909;
 const expectedMarkerCounts = {
   production: Object.fromEntries(markers.map((marker) => [marker, 0])),
   e2e: Object.fromEntries(markers.map((marker) => [
     marker,
-    marker === FAULT_CONTROLLER_SENTINEL ? 1 : marker === protocolMarker ? 2 : marker === modeMarker ? 3 : 1,
+    marker === FAULT_CONTROLLER_SENTINEL || marker === BOOTSTRAP_TRACE_SENTINEL ? 1 : marker === protocolMarker ? 2 : marker === modeMarker ? 3 : 1,
   ])),
 };
 
@@ -101,9 +108,38 @@ const listenerBody = [
   "  get: function () { return E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL; },",
   "});",
   "exports.installFaultController = installFaultController;",
+  "exports.traceBootstrap = traceBootstrap;",
   'var _reactNative = require(_dependencyMap[0]);',
   'var _faultContract = require(_dependencyMap[1]);',
   `var E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL = "${FAULT_CONTROLLER_SENTINEL}";`,
+  `var E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL = "${BOOTSTRAP_TRACE_SENTINEL}";`,
+  'Object.defineProperty(exports, "E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL", { enumerable: true, get: function () { return E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL; } });',
+  "var MAX_BOOTSTRAP_ATTEMPTS = 32;",
+  'var traceSession = Math.random().toString(36).slice(2, 14).padEnd(12, "0");',
+  "var traceAttempts = new Map();",
+  'var traceFailureStages = new Set(["open-configure", "migrate", "post-migrate"]);',
+  'var traceFailureCloseOutcomes = new Set(["unobserved", "succeeded", "failed"]);',
+  'var traceFailureCategories = new Set(["abort", "cleanup", "sqlite-open", "sqlite", "aggregate", "uncoded"]);',
+  "var traceSequence = 0;",
+  "function traceBootstrap(record) {",
+  "  var attempt = record.attempt;",
+  "  if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > MAX_BOOTSTRAP_ATTEMPTS) return;",
+  "  var output;",
+  '  if (record.kind === "start") {',
+  "    if (traceAttempts.has(attempt)) return;",
+  '    traceAttempts.set(attempt, "started");',
+  '    output = Object.freeze({ schemaVersion: 1, session: traceSession, sequence: ++traceSequence, attempt: attempt, kind: "start" });',
+  '  } else if (record.kind === "terminal") {',
+  '    if (traceAttempts.get(attempt) !== "started" || !((record.outcome === "success" && record.stage === "ready" && record.closeOutcome === "not-attempted" && !("failureCategory" in record)) || (record.outcome === "failure" && traceFailureStages.has(record.stage) && traceFailureCloseOutcomes.has(record.closeOutcome) && traceFailureCategories.has(record.failureCategory)))) return;',
+  '    traceAttempts.set(attempt, "terminal");',
+  '    var terminal = { schemaVersion: 1, session: traceSession, sequence: ++traceSequence, attempt: attempt, kind: "terminal", stage: record.stage, outcome: record.outcome, closeOutcome: record.closeOutcome };',
+  '    if (record.outcome === "failure") terminal.failureCategory = record.failureCategory;',
+  "    output = Object.freeze(terminal);",
+  "  } else {",
+  "    return;",
+  "  }",
+  "  try { console.info(`${E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL} ${JSON.stringify(output)}`); } catch {}",
+  "}",
   "var noOp = () => {};",
   "async function installFaultController(onFault, signal) {",
   "  if (signal?.aborted) return noOp;",
@@ -184,7 +220,7 @@ const hostBody = [
 
 const compositionBody = [
   "function AppComposition({ installFaults = _forMobileFaultController.installFaultController }) {",
-  "  return FaultControllerHost({ installFaults: installFaults });",
+  "  return FaultControllerHost({ installFaults: installFaults, children: _navigation.RootNavigator({ bootstrap: productionBootstrap }) });",
   "}",
 ].join("\n");
 
@@ -197,6 +233,9 @@ const appBody = [
   "exports.AppComposition = AppComposition;",
   "var _forMobileFaultController = require(_dependencyMap[0]);",
   "var _react = require(_dependencyMap[1]);",
+  "var _bootstrap = require(_dependencyMap[2]);",
+  "var _navigation = require(_dependencyMap[3]);",
+  "var productionBootstrap = (0, _bootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap);",
   'function asError(reason) { return reason instanceof Error ? reason : new Error("synthetic setup failure", { cause: reason }); }',
   hostBody,
   compositionBody,
@@ -206,8 +245,124 @@ const appBody = [
 const productionControllerBody = [
   'Object.defineProperty(exports, "__esModule", { value: true });',
   "exports.installFaultController = installFaultController;",
+  "exports.traceBootstrap = undefined;",
   "var noOp = () => {};",
   "async function installFaultController() { return noOp; }",
+].join("\n");
+
+const bootstrapBody = [
+  'Object.defineProperty(exports, "__esModule", { value: true });',
+  "exports.createProductionBootstrap = createProductionBootstrap;",
+  "var _recover = require(_dependencyMap[0]);",
+  'var processNonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;',
+  "function createProductionBootstrap(traceBootstrap) {",
+  "  var tracing = traceBootstrap === undefined ? undefined : (() => {",
+  "    var attempt = 0;",
+  "    var emit = (record) => { try { traceBootstrap(record); } catch {} };",
+  "    return { startAttempt() {",
+  "      attempt += 1;",
+  "      var currentAttempt = attempt;",
+  '      emit({ kind: "start", attempt: currentAttempt });',
+  '      return (record) => emit({ kind: "terminal", attempt: currentAttempt, ...record });',
+  "    } };",
+  "  })();",
+  "  return async function bootstrap(signal) {",
+  "    var traceTerminal = tracing?.startAttempt();",
+  "    var services = Object.freeze({});",
+  "    var runtime = await (0, _recover.recoverAndOpen)({ ...(traceTerminal === undefined ? {} : { traceTerminal: traceTerminal }) }, signal);",
+  "    return Object.freeze({ services: services, close: runtime.close });",
+  "  };",
+  "}",
+].join("\n");
+
+const recoveryBody = [
+  'Object.defineProperty(exports, "__esModule", { value: true });',
+  "exports.recoverAndOpen = recoverAndOpen;",
+  "var _cleanupFailure = require(_dependencyMap[0]);",
+  "function failureCategory(error) {",
+  "  try {",
+  '    if ((0, _cleanupFailure.isCleanupFailure)(error)) return "cleanup";',
+  '    if (error instanceof Error && error.name === "AbortError") return "abort";',
+  '    var code = typeof error === "object" && error !== null && "code" in error ? Reflect.get(error, "code") : undefined;',
+  '    if (code === "E_SQLITE_OPEN_DATABASE") return "sqlite-open";',
+  '    if (code === "ERR_INTERNAL_SQLITE_ERROR") return "sqlite";',
+  '    if (error instanceof AggregateError) return "aggregate";',
+  '  } catch { return "uncoded"; }',
+  '  return "uncoded";',
+  "}",
+  "function emitTerminal(sink, record) { try { sink?.(record); } catch {} }",
+  "function emitFailureTerminal(sink, record, error) {",
+  "  if (sink === undefined) return;",
+  "  emitTerminal(sink, { ...record, failureCategory: failureCategory(error) });",
+  "}",
+  "function abortError() {",
+  '  var error = new Error("Startup was aborted");',
+  '  error.name = "AbortError";',
+  "  return error;",
+  "}",
+  "function idempotentRuntime(database, services) {",
+  "  return { services: services, close: async function close() {",
+  "    try { await database.close(); } catch (closeError) {",
+  '      throw (0, _cleanupFailure.cleanupFailure)([closeError], "Closing the application database failed");',
+  "    }",
+  "  } };",
+  "}",
+  "async function recoverAndOpen(dependencies, signal) {",
+  "  var database;",
+  '  var stage = "open-configure";',
+  "  try {",
+  "    database = await dependencies.database.openConfigured(signal);",
+  '    stage = "migrate";',
+  '    await dependencies.coordinator.runMaintenance("migration", async function () { await database.migrate(signal); });',
+  '    stage = "post-migrate";',
+  '    await dependencies.coordinator.runMaintenance("album", async function () { await dependencies.album.reconcile(database, signal); });',
+  '    emitTerminal(dependencies.traceTerminal, { stage: "ready", outcome: "success", closeOutcome: "not-attempted" });',
+  "    return idempotentRuntime(database, {});",
+  "  } catch (startupError) {",
+  "    if (!database) {",
+  '      emitFailureTerminal(dependencies.traceTerminal, { stage: stage, outcome: "failure", closeOutcome: "unobserved" }, startupError);',
+  "      throw startupError;",
+  "    }",
+  "    try {",
+  "      await database.close();",
+  "    } catch (closeError) {",
+  '      var failure = (0, _cleanupFailure.cleanupFailure)([startupError, closeError], "Application startup failed and closing the database also failed");',
+  '      emitFailureTerminal(dependencies.traceTerminal, { stage: stage, outcome: "failure", closeOutcome: "failed" }, failure);',
+  "      throw failure;",
+  "    }",
+  '    emitFailureTerminal(dependencies.traceTerminal, { stage: stage, outcome: "failure", closeOutcome: "succeeded" }, startupError);',
+  "    throw startupError;",
+  "  }",
+  "}",
+].join("\n");
+
+const cleanupFailureBody = [
+  'Object.defineProperty(exports, "__esModule", { value: true });',
+  "exports.cleanupFailure = cleanupFailure;",
+  "exports.isCleanupFailure = isCleanupFailure;",
+  'var CLEANUP_FAILURE_MARKER = "fawn.cleanup-failure.v1";',
+  "function cleanupFailure(errors, message) {",
+  "  var failure = new AggregateError(errors, message);",
+  '  Object.defineProperty(failure, "cleanupFailure", { configurable: false, enumerable: false, value: CLEANUP_FAILURE_MARKER, writable: false });',
+  "  return failure;",
+  "}",
+  "function isCleanupFailure(value) {",
+  '  if (typeof value !== "object" || value === null) return false;',
+  '  var descriptor = Object.getOwnPropertyDescriptor(value, "cleanupFailure");',
+  "  return descriptor?.value === CLEANUP_FAILURE_MARKER && descriptor.configurable === false && descriptor.enumerable === false && descriptor.writable === false;",
+  "}",
+].join("\n");
+
+const alternateCleanupFailureBody = [
+  'Object.defineProperty(exports, "__esModule", { value: true });',
+  "exports.cleanupFailure = function cleanupFailure(error) { return error; };",
+  "exports.isCleanupFailure = function isCleanupFailure() { return false; };",
+].join("\n");
+
+const alternateRecoveryBody = [
+  'Object.defineProperty(exports, "__esModule", { value: true });',
+  "exports.recoverAndOpen = alternateRecoverAndOpen;",
+  "async function alternateRecoverAndOpen() { return { services: {}, close: async function close() {} }; }",
 ].join("\n");
 
 const appRuntimeBody = [
@@ -226,9 +381,20 @@ function rootedBundle(controllerId: number, modules: string[]) {
       "var App = _interopDefault(_App);",
       "_expo.registerRootComponent(App.default);",
     ].join("\n")),
-    metroModule(appModuleId, [controllerId, appRuntimeModuleId], appBody),
+    metroModule(appModuleId, [controllerId, appRuntimeModuleId, bootstrapModuleId, navigatorModuleId], appBody),
     ...modules,
     metroModule(appRuntimeModuleId, [], appRuntimeBody),
+    metroModule(bootstrapModuleId, [recoveryModuleId], bootstrapBody),
+    metroModule(recoveryModuleId, [cleanupFailureModuleId], recoveryBody),
+    metroModule(alternateRecoveryModuleId, [], alternateRecoveryBody),
+    metroModule(cleanupFailureModuleId, [], cleanupFailureBody),
+    metroModule(alternateCleanupFailureModuleId, [], alternateCleanupFailureBody),
+    metroModule(navigatorModuleId, [], [
+      "exports.RootNavigator = function RootNavigator({ bootstrap }) {",
+      "  global.__liveBootstrap = bootstrap;",
+      "  return null;",
+      "};",
+    ].join("\n")),
     metroModule(rootRuntimeModuleId, [], [
       "exports.registerRootComponent = function registerRootComponent(App) {",
       "  global.__registeredDefaultApp = App;",
@@ -280,7 +446,7 @@ function jsxCompositionBundleSource(hostProp = "children") {
     "function Shell({ children }) { return children; }",
     "function AppComposition({ installFaults = _forMobileFaultController.installFaultController }) {",
     "  return (0, _reactJsxRuntime.jsx)(Shell, {",
-    `    ${hostProp}: (0, _reactJsxRuntime.jsx)(FaultControllerHost, { installFaults: installFaults }),`,
+    `    ${hostProp}: (0, _reactJsxRuntime.jsx)(FaultControllerHost, { installFaults: installFaults, children: (0, _reactJsxRuntime.jsx)(_navigation.RootNavigator, { bootstrap: productionBootstrap }) }),`,
     "  });",
     "}",
   ].join("\n");
@@ -469,7 +635,7 @@ test("fault registry and marker projection stay exact, unique, nonempty, ordered
   assert.equal(faultPoints.length, 13);
   assert.equal(new Set(faultPoints).size, 13);
   assert(faultPoints.every((point) => point.length > 0 && /^[a-z][a-z0-9_.]*$/.test(point)));
-  assert.deepEqual(markers, [FAULT_CONTROLLER_SENTINEL, "formobile-test:", "crash_once", ...faultPoints]);
+  assert.deepEqual(markers, [FAULT_CONTROLLER_SENTINEL, BOOTSTRAP_TRACE_SENTINEL, "formobile-test:", "crash_once", ...faultPoints]);
   assert.equal(new Set(markers).size, markers.length);
   assert(markers.every((marker) => marker.length > 0));
 });
@@ -1167,7 +1333,7 @@ test("selected imported namespaces reject aliases and call-based mutators", asyn
     await t.test(name, async () => {
       await withFixture(async ({ root, proof }) => {
         await replaceBundle(root, proof, "ios", "e2e", mutate(e2eBundleSource()));
-        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /binding|namespace|alias|mutation|runtime|parser|App/i);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /binding|namespace|alias|mutation|runtime|parser|App|intrinsic|reference|canonical/i);
       });
     });
   }
@@ -1330,6 +1496,533 @@ test("production App reaches the exact exported no-op controller", async () => {
   });
 });
 
+test("production App reaches an explicitly absent bootstrap trace sink", async () => {
+  const hostile = replaceOnce(
+    productionBundleSource(),
+    "exports.traceBootstrap = undefined;",
+    "exports.traceBootstrap = function traceBootstrap() { throw new Error('live trace'); };",
+  );
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "ios", "production", hostile);
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /production|trace|absent|undefined/i);
+  });
+});
+
+test("App must wire the flavor-selected bootstrap trace into bootstrap creation", async () => {
+  const hostile = replaceOnce(
+    e2eBundleSource(),
+    "(0, _bootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap)",
+    "(0, _bootstrap.createProductionBootstrap)(function hostileTrace() {})",
+  );
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "ios", "e2e", hostile);
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /App|bootstrap|trace|controller/i);
+  });
+});
+
+test("App binds the exact live bootstrap result to RootNavigator", async (t) => {
+  const mutations = [
+    [
+      "dead canonical bootstrap",
+      "var productionBootstrap = (0, _bootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap);",
+      "var deadBootstrap = (0, _bootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap); var productionBootstrap = async function alternateBootstrap() {};",
+    ],
+    [
+      "alternate RootNavigator bootstrap prop",
+      "_navigation.RootNavigator({ bootstrap: productionBootstrap })",
+      "_navigation.RootNavigator({ bootstrap: async function alternateBootstrap() {} })",
+    ],
+    [
+      "discarded canonical factory result",
+      "var productionBootstrap = (0, _bootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap);",
+      "var productionBootstrap = ((0, _bootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap), async function alternateBootstrap() {});",
+    ],
+    [
+      "post-factory bootstrap reassignment",
+      "var productionBootstrap = (0, _bootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap);",
+      "var productionBootstrap = (0, _bootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap); productionBootstrap = async function alternateBootstrap() {};",
+    ],
+    [
+      "dependency-internal alternate factory export",
+      "exports.createProductionBootstrap = createProductionBootstrap;",
+      "exports.createProductionBootstrap = function alternateFactory() { return async function alternateBootstrap() {}; };",
+    ],
+    [
+      "alternate bootstrap dependency namespace",
+      "(0, _bootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap)",
+      "(0, _alternateBootstrap.createProductionBootstrap)(_forMobileFaultController.traceBootstrap)",
+    ],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /App|bootstrap|RootNavigator|live|exact|binding/i);
+      });
+    });
+  }
+});
+
+test("trace and live bootstrap modules reject intrinsic shadows, writes, and prototype monkeypatches", async (t) => {
+  const mutations = [
+    ["local JSON serializer shadow", "function traceBootstrap(record) {", "function traceBootstrap(record) { var JSON = { stringify: function () { return global.__secret; } };"],
+    ["top-level console shadow", "function traceBootstrap(record) {", "var console = { info: function () {} };\nfunction traceBootstrap(record) {"],
+    ["top-level Object shadow", "function traceBootstrap(record) {", "var Object = global.Object;\nfunction traceBootstrap(record) {"],
+    ["local Number shadow", "function traceBootstrap(record) {", "function traceBootstrap(record) { var Number = global.Number;"],
+    ["top-level Math shadow", "var traceSession =", "var Math = global.Math;\nvar traceSession ="],
+    ["top-level Map shadow", "var traceAttempts =", "var Map = global.Map;\nvar traceAttempts ="],
+    ["top-level Set shadow", "var traceFailureStages =", "var Set = global.Set;\nvar traceFailureStages ="],
+    ["JSON intrinsic write", "function traceBootstrap(record) {", "function traceBootstrap(record) { JSON.stringify = JSON.stringify;"],
+    ["console intrinsic write", "function traceBootstrap(record) {", "function traceBootstrap(record) { console.info = console.info;"],
+    ["Object intrinsic write", "function traceBootstrap(record) {", "function traceBootstrap(record) { Object.freeze = Object.freeze;"],
+    ["Number intrinsic write", "function traceBootstrap(record) {", "function traceBootstrap(record) { Number.isSafeInteger = Number.isSafeInteger;"],
+    ["Math intrinsic write", "var traceSession =", "Math.random = Math.random;\nvar traceSession ="],
+    ["Map prototype monkeypatch", "var traceAttempts =", "Map.prototype.set = Map.prototype.set;\nvar traceAttempts ="],
+    ["Set prototype monkeypatch", "var traceFailureStages =", "Set.prototype.has = Set.prototype.has;\nvar traceFailureStages ="],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /trace|intrinsic|shadow|write|prototype|binding/i);
+      });
+    });
+  }
+});
+
+test("live bootstrap module rejects intrinsic monkeypatches", async () => {
+  const hostile = replaceOnce(
+    e2eBundleSource(),
+    "function createProductionBootstrap(traceBootstrap) {",
+    "Object.freeze = Object.freeze;\nfunction createProductionBootstrap(traceBootstrap) {",
+  );
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "ios", "e2e", hostile);
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /bootstrap|intrinsic|write|monkeypatch/i);
+  });
+});
+
+test("trace and live bootstrap modules reject indirect global and prototype corruption", async (t) => {
+  const mutations = [
+    [
+      "Metro global JSON corruption",
+      "function traceBootstrap(record) {",
+      "global.JSON.stringify = function hostileStringify() { return global.__secret; };\nfunction traceBootstrap(record) {",
+    ],
+    [
+      "globalThis JSON corruption",
+      "function traceBootstrap(record) {",
+      "globalThis.JSON.stringify = function hostileStringify() { return globalThis.__secret; };\nfunction traceBootstrap(record) {",
+    ],
+    [
+      "Metro global alias JSON corruption",
+      "function traceBootstrap(record) {",
+      "var globalAlias = global; globalAlias.JSON.stringify = function hostileStringify() { return globalAlias.__secret; };\nfunction traceBootstrap(record) {",
+    ],
+    [
+      "Reflect JSON corruption",
+      "function traceBootstrap(record) {",
+      'Reflect.set(global.JSON, "stringify", function hostileStringify() { return "secret"; });\nfunction traceBootstrap(record) {',
+    ],
+    [
+      "String.prototype.padEnd corruption",
+      "var traceSession =",
+      'String.prototype.padEnd = function hostilePadEnd() { return "000000000000"; };\nvar traceSession =',
+    ],
+    [
+      "String alias padEnd corruption",
+      "var traceSession =",
+      'var StringAlias = String; StringAlias.prototype.padEnd = function hostilePadEnd() { return "000000000000"; };\nvar traceSession =',
+    ],
+    [
+      "Reflect String padEnd corruption",
+      "var traceSession =",
+      'Reflect.set(String.prototype, "padEnd", function hostilePadEnd() { return "000000000000"; });\nvar traceSession =',
+    ],
+    [
+      "Metro global Number.prototype.toString corruption",
+      "var traceSession =",
+      'global.Number.prototype.toString = function hostileToString() { return "0"; };\nvar traceSession =',
+    ],
+    [
+      "globalThis Number.prototype.toString corruption",
+      "var traceSession =",
+      'globalThis.Number.prototype.toString = function hostileToString() { return "0"; };\nvar traceSession =',
+    ],
+    [
+      "Metro global Number alias corruption",
+      "var traceSession =",
+      'var NumberAlias = global.Number; NumberAlias.prototype.toString = function hostileToString() { return "0"; };\nvar traceSession =',
+    ],
+    [
+      "Reflect Number toString corruption",
+      "var traceSession =",
+      'Reflect.set(global.Number.prototype, "toString", function hostileToString() { return "0"; });\nvar traceSession =',
+    ],
+    [
+      "live bootstrap Metro global Number corruption",
+      "var processNonce =",
+      'global.Number.prototype.toString = function hostileToString() { return "0"; };\nvar processNonce =',
+    ],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /bootstrap|trace|global|intrinsic|prototype|reference|canonical/i);
+      });
+    });
+  }
+});
+
+test("trace and live bootstrap modules reject literal-rooted dangerous members and dynamic code", async (t) => {
+  const mutations = [
+    [
+      "trace object-literal constructor chain",
+      "function traceBootstrap(record) {",
+      'function traceBootstrap(record) { ({}).constructor.constructor("return 1")();',
+    ],
+    [
+      "trace computed constructor chain",
+      "function traceBootstrap(record) {",
+      'function traceBootstrap(record) { ({})["con" + "structor"]["constructor"]("return 1")();',
+    ],
+    [
+      "trace literal prototype toJSON mutation",
+      "function traceBootstrap(record) {",
+      'function traceBootstrap(record) { ({})["constructor"]["pro" + "totype"]["to" + "JSON"] = function hostileToJSON() { return 1; };',
+    ],
+    [
+      "trace array __proto__ toJSON mutation",
+      "function traceBootstrap(record) {",
+      'function traceBootstrap(record) { []["__pro" + "to__"]["toJSON"] = function hostileToJSON() { return 1; };',
+    ],
+    [
+      "live bootstrap arrow constructor dynamic code",
+      "function createProductionBootstrap(traceBootstrap) {",
+      'function createProductionBootstrap(traceBootstrap) { (() => {})["con" + "structor"]("return 1")();',
+    ],
+    [
+      "live bootstrap literal prototype mutation",
+      "function createProductionBootstrap(traceBootstrap) {",
+      'function createProductionBootstrap(traceBootstrap) { ({})["constructor"]["prototype"]["toJSON"] = function hostileToJSON() { return 1; };',
+    ],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /bootstrap|trace|dangerous|constructor|prototype|dynamic|toJSON/i);
+      });
+    });
+  }
+});
+
+test("selected bootstrap modules reject opaque computed dangerous members", async (t) => {
+  const mutations = [
+    [
+      "trace sequence-expression constructor",
+      "function traceBootstrap(record) {",
+      'function traceBootstrap(record) { void ({})[(0, "constructor")];',
+    ],
+    [
+      "trace call-expression prototype",
+      "function traceBootstrap(record) {",
+      'function traceBootstrap(record) { void ({})[["pro", "totype"].join("")];',
+    ],
+    [
+      "trace computed toJSON",
+      "function traceBootstrap(record) {",
+      'function traceBootstrap(record) { void ({})[(() => "toJSON")()];',
+    ],
+    [
+      "recovery sequence-expression constructor",
+      "function failureCategory(error) {",
+      'function failureCategory(error) { void ({})[(0, "constructor")];',
+    ],
+    [
+      "recovery call-expression prototype",
+      "function failureCategory(error) {",
+      'function failureCategory(error) { void ({})[["pro", "totype"].join("")];',
+    ],
+    [
+      "recovery computed toJSON",
+      "function failureCategory(error) {",
+      'function failureCategory(error) { void ({})[(() => "toJSON")()];',
+    ],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /bootstrap|trace|recovery|computed|member|opaque/i);
+      });
+    });
+  }
+});
+
+test("bootstrap trace intrinsics are closed to exact canonical references", async (t) => {
+  const mutations = [
+    ["JSON alias", "function traceBootstrap(record) {", "function traceBootstrap(record) { var jsonAlias = JSON;"],
+    ["console escape", "function traceBootstrap(record) {", "function traceBootstrap(record) { global.__console = console;"],
+    ["Object extra read", "function traceBootstrap(record) {", "function traceBootstrap(record) { void Object;"],
+    ["Number alias", "function traceBootstrap(record) {", "function traceBootstrap(record) { var safeNumber = Number;"],
+    ["Math escape", "var traceSession =", "global.__math = Math;\nvar traceSession ="],
+    ["Map alias", "var traceAttempts =", "var MapAlias = Map;\nvar traceAttempts ="],
+    ["Set escape", "var traceFailureStages =", 'Reflect.set(global, "__Set", Set);\nvar traceFailureStages ='],
+    ["String alias", "var traceSession =", "var StringAlias = String;\nvar traceSession ="],
+    ["Reflect alias", "function traceBootstrap(record) {", "var ReflectAlias = Reflect;\nfunction traceBootstrap(record) {"],
+    ["Function alias", "function traceBootstrap(record) {", "var FunctionAlias = Function;\nfunction traceBootstrap(record) {"],
+    ["eval alias", "function traceBootstrap(record) {", "var evalAlias = eval;\nfunction traceBootstrap(record) {"],
+    ["Proxy alias", "function traceBootstrap(record) {", "var ProxyAlias = Proxy;\nfunction traceBootstrap(record) {"],
+    ["Reflect JSON mutation", "function traceBootstrap(record) {", 'function traceBootstrap(record) { Reflect.set(JSON, "stringify", JSON.stringify);'],
+    ["JSON prototype path", "function traceBootstrap(record) {", "function traceBootstrap(record) { void JSON.prototype?.toJSON;"],
+    ["Object toJSON path", "function traceBootstrap(record) {", "function traceBootstrap(record) { void Object.prototype.toJSON;"],
+    ["indirect JSON call", "JSON.stringify(output)", "(0, JSON.stringify)(output)"],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /trace|intrinsic|reference|canonical/i);
+      });
+    });
+  }
+});
+
+test("live bootstrap factory consumes the selected sink through its returned recovery path", async (t) => {
+  const mutations = [
+    ["unused trace parameter", "traceBootstrap(record);", "void record;"],
+    ["start bypasses shared sink", 'emit({ kind: "start", attempt: currentAttempt });', 'traceBootstrap({ kind: "start", attempt: currentAttempt });'],
+    ["terminal bypasses shared sink", 'return (record) => emit({ kind: "terminal", attempt: currentAttempt, ...record });', 'return (record) => traceBootstrap({ kind: "terminal", attempt: currentAttempt, ...record });'],
+    ["unconditional start sink", "var traceTerminal = tracing?.startAttempt();", "var traceTerminal = tracing.startAttempt();"],
+    ["discarded terminal", "var traceTerminal = tracing?.startAttempt();", "tracing?.startAttempt(); var traceTerminal = undefined;"],
+    ["terminal omitted", "{ ...(traceTerminal === undefined ? {} : { traceTerminal: traceTerminal }) }", "{}"],
+    ["alternate terminal", "{ traceTerminal: traceTerminal }", "{ traceTerminal: function alternateTerminal() {} }"],
+    ["alternate recovery", "(0, _recover.recoverAndOpen)", "(0, _recover.alternateRecoverAndOpen)"],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /bootstrap|trace|sink|terminal|recoverAndOpen|factory/i);
+      });
+    });
+  }
+});
+
+test("live bootstrap recovery proof binds the exact dependency export and terminal control flow", async (t) => {
+  const readyTerminal = 'emitTerminal(dependencies.traceTerminal, { stage: "ready", outcome: "success", closeOutcome: "not-attempted" });';
+  const mutations = [
+    [
+      "dependency target rewired",
+      `},${bootstrapModuleId},[${recoveryModuleId}]);`,
+      `},${bootstrapModuleId},[${alternateRecoveryModuleId}]);`,
+    ],
+    [
+      "final recoverAndOpen export replaced",
+      "exports.recoverAndOpen = recoverAndOpen;",
+      "exports.recoverAndOpen = alternateRecoverAndOpen;\nasync function alternateRecoverAndOpen() { return { services: {}, close: async function close() {} }; }",
+    ],
+    [
+      "ready terminal ignores dependencies",
+      readyTerminal,
+      'emitTerminal(undefined, { stage: "ready", outcome: "success", closeOutcome: "not-attempted" });',
+    ],
+    [
+      "ready terminal omitted",
+      readyTerminal,
+      "void dependencies.traceTerminal;",
+    ],
+    [
+      "stage initializer omitted",
+      'var stage = "open-configure";',
+      "var stage;",
+    ],
+    [
+      "migrate stage transition omitted",
+      'stage = "migrate";',
+      "void stage;",
+    ],
+    [
+      "stage transitions reordered",
+      'stage = "migrate";\n    await dependencies.coordinator.runMaintenance("migration", async function () { await database.migrate(signal); });\n    stage = "post-migrate";',
+      'stage = "post-migrate";\n    await dependencies.coordinator.runMaintenance("migration", async function () { await database.migrate(signal); });\n    stage = "migrate";',
+    ],
+    [
+      "cleanup helper dependency target rewired",
+      `},${recoveryModuleId},[${cleanupFailureModuleId}]);`,
+      `},${recoveryModuleId},[${alternateCleanupFailureModuleId}]);`,
+    ],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /bootstrap|recoverAndOpen|dependency|export|terminal|ready|failure|close|sink/i);
+      });
+    });
+  }
+});
+
+test("selected recovery and cleanup modules reject classifier drift and private-value sinks", async (t) => {
+  const mutations = [
+    ["cleanup helper raw-error console sink", "var failure = new AggregateError(errors, message);", "var failure = new AggregateError(errors, message); console.error(errors);"],
+    ["cleanup helper raw-error JSON serialization", "var failure = new AggregateError(errors, message);", "var failure = new AggregateError(errors, message); JSON.stringify(errors);"],
+    ["cleanup helper Metro global escape", "var failure = new AggregateError(errors, message);", "var failure = new AggregateError(errors, message); global.__cleanupErrors = errors;"],
+    ["cleanup helper network escape", "var failure = new AggregateError(errors, message);", 'var failure = new AggregateError(errors, message); fetch("/leak", { method: "POST", body: message });'],
+    ["Reflect.get wrong property", 'Reflect.get(error, "code")', 'Reflect.get(error, "message")'],
+    ["extra allowed SQLite code", 'if (code === "ERR_INTERNAL_SQLITE_ERROR") return "sqlite";', 'if (code === "ERR_INTERNAL_SQLITE_ERROR" || code === "SQLITE_BUSY") return "sqlite";'],
+    ["message-dependent category", 'if (error instanceof AggregateError) return "aggregate";', 'if (error.message === "cleanup") return "cleanup";\n    if (error instanceof AggregateError) return "aggregate";'],
+    ["stack-dependent category", 'if (error instanceof AggregateError) return "aggregate";', 'if (error.stack) return "aggregate";\n    if (error instanceof AggregateError) return "aggregate";'],
+    ["cause-dependent category", 'if (error instanceof AggregateError) return "aggregate";', 'if (error.cause) return "aggregate";\n    if (error instanceof AggregateError) return "aggregate";'],
+    ["cleanupFailure final export replaced", "exports.cleanupFailure = cleanupFailure;", "exports.cleanupFailure = function cleanupFailure(error) { return error; };"],
+    ["isCleanupFailure final export replaced", "exports.isCleanupFailure = isCleanupFailure;", "exports.isCleanupFailure = function isCleanupFailure() { return false; };"],
+    ["cleanup helper extra marker code", 'descriptor?.value === CLEANUP_FAILURE_MARKER', 'descriptor?.value === CLEANUP_FAILURE_MARKER || descriptor?.value === "foreign"'],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(
+          validateFaultBundleProof(proof, { root, expectedSha: sha }),
+          /bootstrap|recoverAndOpen|recovery|cleanup|classifier|marker|privacy|console|JSON|global|network|output|import|serializ|reference|export/i,
+        );
+      });
+    });
+  }
+});
+
+test("E2E bootstrap trace rejects non-whitelist serialization from the input record", async () => {
+  const hostile = replaceOnce(
+    e2eBundleSource(),
+    "JSON.stringify(output)",
+    "JSON.stringify(record)",
+  );
+  await withFixture(async ({ root, proof }) => {
+    await replaceBundle(root, proof, "ios", "e2e", hostile);
+    await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /trace|whitelist|serializ|record/i);
+  });
+});
+
+test("E2E bootstrap trace rejects serializer aliases and global payloads", async (t) => {
+  const mutations = [
+    ["whitelist output alias", "var payload = output;\n  try { console.info(`${E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL} ${JSON.stringify(payload)}`); } catch {}"],
+    ["global payload alias", "var payload = global.__secretPayload;\n  try { console.info(`${E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL} ${JSON.stringify(payload)}`); } catch {}"],
+  ] as const;
+  for (const [name, replacement] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(
+        e2eBundleSource(),
+        "try { console.info(`${E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL} ${JSON.stringify(output)}`); } catch {}",
+        replacement,
+      );
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /trace|whitelist|serializ|payload|alias/i);
+      });
+    });
+  }
+});
+
+test("E2E bootstrap trace rejects prefixed and appended template data", async (t) => {
+  const mutations = [
+    ["prefixed secret", "`${global.__secret}${E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL} ${JSON.stringify(output)}`"],
+    ["appended secret", "`${E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL} ${JSON.stringify(output)}${global.__secret}`"],
+  ] as const;
+  for (const [name, replacement] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(
+        e2eBundleSource(),
+        "`${E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL} ${JSON.stringify(output)}`",
+        replacement,
+      );
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /trace|console|sentinel|template|payload/i);
+      });
+    });
+  }
+});
+
+test("E2E bootstrap trace rejects weakened attempt, session, sequence, and start-terminal validation", async (t) => {
+  const mutations = [
+    ["attempt bound removed", "if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > MAX_BOOTSTRAP_ATTEMPTS) return;", "if (false) return;"],
+    ["session made constant", 'var traceSession = Math.random().toString(36).slice(2, 14).padEnd(12, "0");', 'var traceSession = "000000000000";'],
+    ["sequence increment removed", "sequence: ++traceSequence", "sequence: traceSequence"],
+    ["immutable terminal output removed", "Object.freeze(terminal)", "terminal"],
+    ["start duplicate guard removed", "if (traceAttempts.has(attempt)) return;", "if (false) return;"],
+    ["terminal state guard removed", 'traceAttempts.get(attempt) !== "started"', "false"],
+    ["terminal state transition removed", 'traceAttempts.set(attempt, "terminal");', "void traceAttempts;"],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /trace|attempt|session|sequence|state|terminal/i);
+      });
+    });
+  }
+});
+
+test("E2E bootstrap trace binds alternate-kind rejection and the correlated terminal truth table", async (t) => {
+  const mutations = [
+    ["alternate kind accepted", 'record.kind === "terminal"', "true"],
+    ["success stage guard removed", 'record.stage === "ready"', "true"],
+    ["success close guard removed", 'record.closeOutcome === "not-attempted"', "true"],
+    ["success category absence guard removed", '&& !("failureCategory" in record)', ""],
+    ["failure stage guard removed", "traceFailureStages.has(record.stage)", "true"],
+    ["failure close guard removed", "traceFailureCloseOutcomes.has(record.closeOutcome)", "true"],
+    ["failure category guard removed", "traceFailureCategories.has(record.failureCategory)", "true"],
+    ["duplicate terminal accepted", 'traceAttempts.get(attempt) !== "started"', "false"],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /trace|kind|terminal|truth|state|stage|close|category/i);
+      });
+    });
+  }
+});
+
+test("E2E bootstrap trace closes attempt-state and validation-set references", async (t) => {
+  const mutations = [
+    ["attempt state cleared", 'traceAttempts.set(attempt, "started");', 'traceAttempts.set(attempt, "started"); traceAttempts.clear();'],
+    ["attempt state deleted", 'traceAttempts.set(attempt, "started");', 'traceAttempts.set(attempt, "started"); traceAttempts.delete(attempt);'],
+    ["attempt state extra set", 'traceAttempts.set(attempt, "started");', 'traceAttempts.set(attempt, "started"); traceAttempts.set(attempt + 1, "started");'],
+    ["attempt state alias escape", 'traceAttempts.set(attempt, "started");', 'traceAttempts.set(attempt, "started"); var attemptsAlias = traceAttempts;'],
+    ["attempt state global escape", 'traceAttempts.set(attempt, "started");', 'traceAttempts.set(attempt, "started"); global.__traceAttempts = traceAttempts;'],
+    ["validation set cleared", "traceFailureStages.has(record.stage)", "(traceFailureStages.clear(), traceFailureStages.has(record.stage))"],
+    ["validation set deleted", "traceFailureCloseOutcomes.has(record.closeOutcome)", '(traceFailureCloseOutcomes.delete("failed"), traceFailureCloseOutcomes.has(record.closeOutcome))'],
+    ["failure stage enum expanded", 'var traceFailureStages = new Set(["open-configure", "migrate", "post-migrate"]);', 'var traceFailureStages = new Set(["open-configure", "migrate", "post-migrate", "ready"]);'],
+    ["failure close enum expanded", 'var traceFailureCloseOutcomes = new Set(["unobserved", "succeeded", "failed"]);', 'var traceFailureCloseOutcomes = new Set(["unobserved", "succeeded", "failed", "not-attempted"]);'],
+    ["failure category enum expanded", 'var traceFailureCategories = new Set(["abort", "cleanup", "sqlite-open", "sqlite", "aggregate", "uncoded"]);', 'var traceFailureCategories = new Set(["abort", "cleanup", "sqlite-open", "sqlite", "aggregate", "uncoded", "foreign"]);'],
+    ["validation set add", "traceFailureCategories.has(record.failureCategory)", '(traceFailureCategories.add("foreign"), traceFailureCategories.has(record.failureCategory))'],
+    ["validation set alias escape", "traceFailureStages.has(record.stage)", "(global.__traceStages = traceFailureStages, traceFailureStages.has(record.stage))"],
+  ] as const;
+  for (const [name, before, after] of mutations) {
+    await t.test(name, async () => {
+      const hostile = replaceOnce(e2eBundleSource(), before, after);
+      await withFixture(async ({ root, proof }) => {
+        await replaceBundle(root, proof, "ios", "e2e", hostile);
+        await assert.rejects(validateFaultBundleProof(proof, { root, expectedSha: sha }), /trace|binding|reference|state|validation|set|enum|global/i);
+      });
+    });
+  }
+});
+
 test("marker-only token bags cannot impersonate Metro listener-parser-registry evidence", async () => {
   await withFixture(async ({ root, proof }) => {
     await replaceBundle(root, proof, "android", "e2e", sourceFor("e2e"));
@@ -1345,10 +2038,9 @@ test("every executable __d call must be a top-level Metro wrapper", async () => 
 });
 
 test("production rejects marker-free listener behavior", async () => {
-  const markerFreeListener = listenerBody.replace(
-    `var E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL = "${FAULT_CONTROLLER_SENTINEL}";\n`,
-    "",
-  );
+  const markerFreeListener = listenerBody
+    .replace(`var E2E_FAULT_CONTROLLER_BUNDLE_SENTINEL = "${FAULT_CONTROLLER_SENTINEL}";\n`, "")
+    .replace(`var E2E_BOOTSTRAP_TRACE_BUNDLE_SENTINEL = "${BOOTSTRAP_TRACE_SENTINEL}";\n`, "");
   const productionWithListener = rootedBundle(listenerModuleId, [
     metroModule(listenerModuleId, [runtimeModuleId, parserModuleId], markerFreeListener),
     metroModule(parserModuleId, [], "exports.parseFaultUrl = function () { return null; };"),

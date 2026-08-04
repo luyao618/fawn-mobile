@@ -113,3 +113,70 @@ test("production bootstrap exposes profile and tracker services only on its read
   await first;
   expect(closeAsync).toHaveBeenCalledTimes(1);
 });
+
+
+test("production bootstrap traces exactly start and ready terminal records for each one-based attempt", async () => {
+  const closeAsync = jest.fn(async () => {});
+  mockOpenConfiguredDatabase.mockResolvedValue(database(closeAsync));
+  const trace = jest.fn();
+  const bootstrap = createProductionBootstrap(trace);
+
+  const first = await bootstrap(new AbortController().signal);
+  await first.close();
+  const second = await bootstrap(new AbortController().signal);
+
+  expect(trace.mock.calls.map(([record]) => record)).toEqual([
+    { kind: "start", attempt: 1 },
+    { kind: "terminal", attempt: 1, stage: "ready", outcome: "success", closeOutcome: "not-attempted" },
+    { kind: "start", attempt: 2 },
+    { kind: "terminal", attempt: 2, stage: "ready", outcome: "success", closeOutcome: "not-attempted" },
+  ]);
+  await second.close();
+});
+
+test("production bootstrap without an E2E trace sink never classifies startup errors", async () => {
+  let codeAccesses = 0;
+  const startupError = new Error("private startup failure");
+  Object.defineProperty(startupError, "code", {
+    get() {
+      codeAccesses += 1;
+      return "ERR_INTERNAL_SQLITE_ERROR";
+    },
+  });
+  mockOpenConfiguredDatabase.mockRejectedValueOnce(startupError);
+
+  await expect(createProductionBootstrap()(new AbortController().signal)).rejects.toBe(startupError);
+  expect(codeAccesses).toBe(0);
+});
+
+test("bootstrap trace sink failure never alters successful bootstrap or close", async () => {
+  const closeAsync = jest.fn(async () => {});
+  mockOpenConfiguredDatabase.mockResolvedValue(database(closeAsync));
+  const bootstrap = createProductionBootstrap(() => { throw new Error("synthetic sink failure"); });
+  const runtime = await bootstrap(new AbortController().signal);
+  await expect(runtime.close()).resolves.toBeUndefined();
+  expect(closeAsync).toHaveBeenCalledTimes(1);
+});
+
+test("migration rejection traces a sanitized migrate terminal after successful cleanup", async () => {
+  const closeAsync = jest.fn(async () => {});
+  const migrationError = Object.assign(new Error("private SQL and path"), { code: "ERR_INTERNAL_SQLITE_ERROR" });
+  mockOpenConfiguredDatabase.mockResolvedValue(database(closeAsync));
+  mockApplyUserDatabaseMigrations.mockRejectedValueOnce(migrationError);
+  const trace = jest.fn();
+  const bootstrap = createProductionBootstrap(trace);
+
+  await expect(bootstrap(new AbortController().signal)).rejects.toBe(migrationError);
+  expect(trace.mock.calls.map(([record]) => record)).toEqual([
+    { kind: "start", attempt: 1 },
+    {
+      kind: "terminal",
+      attempt: 1,
+      stage: "migrate",
+      outcome: "failure",
+      closeOutcome: "succeeded",
+      failureCategory: "sqlite",
+    },
+  ]);
+  expect(closeAsync).toHaveBeenCalledTimes(1);
+});

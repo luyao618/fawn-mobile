@@ -1,5 +1,11 @@
 import type { AppRuntime, AppServices, ReadyAppServices } from "../../application/bootstrap/appRuntime.ts";
-import { recoverAndOpen, type StartupDatabaseHandle } from "../../application/bootstrap/recoverAndOpen.ts";
+import {
+  recoverAndOpen,
+  type BootstrapTraceRecord,
+  type BootstrapTraceSink,
+  type BootstrapTraceTerminal,
+  type StartupDatabaseHandle,
+} from "../../application/bootstrap/recoverAndOpen.ts";
 import { DataMutationCoordinator } from "../../application/data/DataMutationCoordinator.ts";
 import { BabyProfileService } from "../../application/profile/babyProfileService.ts";
 import { ManualTrackerService, type LocalIdGenerator } from "../../application/tracker/manualTrackerService.ts";
@@ -30,7 +36,7 @@ class ProcessLocalIdGenerator implements LocalIdGenerator {
   }
 }
 
-export function createProductionBootstrap(): ProductionBootstrap<ReadyAppServices> {
+export function createProductionBootstrap(traceBootstrap?: BootstrapTraceSink): ProductionBootstrap<ReadyAppServices> {
   const coordinator = new DataMutationCoordinator();
   const recovery = new StartupRecoveryRepository();
   const profiles = new BabyProfileRepository();
@@ -41,9 +47,28 @@ export function createProductionBootstrap(): ProductionBootstrap<ReadyAppService
   const trackerIds = new ProcessLocalIdGenerator();
   let blocked: CleanupFailure | undefined;
   let pendingCleanup: Promise<void> | undefined;
+  const tracing = traceBootstrap === undefined ? undefined : (() => {
+    let attempt = 0;
+    const emit = (record: BootstrapTraceRecord): void => {
+      try {
+        traceBootstrap(record);
+      } catch {
+        // Diagnostics must never alter bootstrap behavior.
+      }
+    };
+    return {
+      startAttempt(): (record: BootstrapTraceTerminal) => void {
+        attempt += 1;
+        const currentAttempt = attempt;
+        emit({ kind: "start", attempt: currentAttempt });
+        return (record) => emit({ kind: "terminal", attempt: currentAttempt, ...record });
+      },
+    };
+  })();
   return async (signal) => {
     if (pendingCleanup) await pendingCleanup;
     if (blocked) throw blocked;
+    const traceTerminal = tracing?.startAttempt();
     try {
       const runtime = await recoverAndOpen({
         coordinator,
@@ -61,6 +86,7 @@ export function createProductionBootstrap(): ProductionBootstrap<ReadyAppService
         album: new RejectPendingAlbumRecovery(),
         recovery,
         clock,
+        ...(traceTerminal === undefined ? {} : { traceTerminal }),
         services: {
           create(transactions, operations): ReadyAppServices {
             return Object.freeze({

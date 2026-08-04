@@ -28,7 +28,7 @@ import {
   USER_DATABASE_OPEN_OPTIONS,
   type UserDatabaseConnection,
 } from "../../../src/infrastructure/db/initializeDatabase.ts";
-import { isCleanupFailure } from "../../../src/shared/errors/cleanupFailure.ts";
+import { cleanupFailure, isCleanupFailure } from "../../../src/shared/errors/cleanupFailure.ts";
 
 const noServices = { create: () => Object.freeze({}) };
 
@@ -718,4 +718,136 @@ test("album boundary fails closed while any photo mutation is noncommitted", asy
   await assert.rejects(album.reconcile({ transactions, async migrate() {}, async close() {} }), /Album reconciliation is required/);
   await database.runAsync("UPDATE photos SET import_state = 'committed' WHERE id = 'photo'");
   await album.reconcile({ transactions, async migrate() {}, async close() {} });
+});
+
+
+test("startup trace keeps no-handle ordinary and cleanup open failures bounded without inspecting nested errors", async () => {
+  const dependencies = (openConfigured: () => Promise<never>, trace: unknown[]) => ({
+    coordinator: new DataMutationCoordinator(),
+    restore: { async recover() {} },
+    services: noServices,
+    database: { openConfigured },
+    album: { async reconcile() {} },
+    recovery: {
+      async recoverExpiredLeases() {},
+      async assertInterruptedTurnsConsistent() {},
+      async failInterruptedTurns() {},
+      async expireStaleTasks() {},
+      async validateCoreInvariants() {},
+    },
+    clock: { now: fixedNow },
+    traceTerminal(record: unknown) { trace.push(record); },
+  });
+
+  const ordinaryError = Object.assign(new Error("private open path"), {
+    code: "E_SQLITE_OPEN_DATABASE",
+    path: "/private/user.db",
+  });
+  const ordinaryTrace: unknown[] = [];
+  await assert.rejects(
+    recoverAndOpen(dependencies(async () => { throw ordinaryError; }, ordinaryTrace), new AbortController().signal),
+    (error) => error === ordinaryError,
+  );
+  assert.deepEqual(ordinaryTrace, [{
+    stage: "open-configure",
+    outcome: "failure",
+    closeOutcome: "unobserved",
+    failureCategory: "sqlite-open",
+  }]);
+
+  const nestedPrivateError = new Error("private configure details");
+  Object.defineProperty(nestedPrivateError, "code", {
+    get() { throw new Error("nested private errors must not be inspected"); },
+  });
+  const cleanupError = cleanupFailure(
+    [nestedPrivateError, new Error("private close details")],
+    "private configure and close failure",
+  );
+  const cleanupTrace: unknown[] = [];
+  await assert.rejects(
+    recoverAndOpen(dependencies(async () => { throw cleanupError; }, cleanupTrace), new AbortController().signal),
+    (error) => error === cleanupError,
+  );
+  assert.deepEqual(cleanupTrace, [{
+    stage: "open-configure",
+    outcome: "failure",
+    closeOutcome: "unobserved",
+    failureCategory: "cleanup",
+  }]);
+});
+
+test("startup trace reports truthful open, post-migrate, and ready terminals without private error fields", async () => {
+  const openError = Object.assign(new Error("private open path"), { code: "E_SQLITE_OPEN_DATABASE", path: "/private/user.db" });
+  const openTrace: unknown[] = [];
+  await assert.rejects(recoverAndOpen({
+    coordinator: new DataMutationCoordinator(), restore: { async recover() {} }, services: noServices,
+    database: { async openConfigured() { throw openError; } },
+    album: { async reconcile() {} },
+    recovery: { async recoverExpiredLeases() {}, async assertInterruptedTurnsConsistent() {}, async failInterruptedTurns() {}, async expireStaleTasks() {}, async validateCoreInvariants() {} },
+    clock: { now: fixedNow },
+    traceTerminal(record) { openTrace.push(record); },
+  }, new AbortController().signal), (error) => error === openError);
+  assert.deepEqual(openTrace, [{ stage: "open-configure", outcome: "failure", closeOutcome: "unobserved", failureCategory: "sqlite-open" }]);
+
+  const postError = new Error("private recovery row");
+  const postTrace: unknown[] = [];
+  let postCloseCount = 0;
+  await assert.rejects(recoverAndOpen({
+    coordinator: new DataMutationCoordinator(), restore: { async recover() {} }, services: noServices,
+    database: { async openConfigured() { return {
+      transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
+      async migrate() {}, async close() { postCloseCount += 1; },
+    }; } },
+    album: { async reconcile() { throw postError; } },
+    recovery: { async recoverExpiredLeases() {}, async assertInterruptedTurnsConsistent() {}, async failInterruptedTurns() {}, async expireStaleTasks() {}, async validateCoreInvariants() {} },
+    clock: { now: fixedNow },
+    traceTerminal(record) { postTrace.push(record); },
+  }, new AbortController().signal), (error) => error === postError);
+  assert.deepEqual(postTrace, [{ stage: "post-migrate", outcome: "failure", closeOutcome: "succeeded", failureCategory: "uncoded" }]);
+  assert.equal(postCloseCount, 1);
+
+  const readyTrace: unknown[] = [];
+  const runtime = await recoverAndOpen({
+    coordinator: new DataMutationCoordinator(), restore: { async recover() {} }, services: noServices,
+    database: { async openConfigured() { return {
+      transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
+      async migrate() {}, async close() {},
+    }; } },
+    album: { async reconcile() {} },
+    recovery: { async recoverExpiredLeases() {}, async assertInterruptedTurnsConsistent() {}, async failInterruptedTurns() {}, async expireStaleTasks() {}, async validateCoreInvariants() {} },
+    clock: { now: fixedNow },
+    traceTerminal(record) { readyTrace.push(record); },
+  }, new AbortController().signal);
+  assert.deepEqual(readyTrace, [{ stage: "ready", outcome: "success", closeOutcome: "not-attempted" }]);
+  await runtime.close();
+});
+
+test("throwing startup trace sink preserves success and original failure identity", async () => {
+  const throwingTrace = () => { throw new Error("synthetic trace sink failure"); };
+  const migrationError = new Error("private migration failure");
+  const dependencies = (fail: boolean) => ({
+    coordinator: new DataMutationCoordinator(), restore: { async recover() {} }, services: noServices,
+    database: { async openConfigured() { return {
+      transactions: { async runExclusive<T>(operation: (transaction: never) => Promise<T>) { return operation({} as never); } },
+      async migrate() { if (fail) throw migrationError; }, async close() {},
+    }; } },
+    album: { async reconcile() {} },
+    recovery: { async recoverExpiredLeases() {}, async assertInterruptedTurnsConsistent() {}, async failInterruptedTurns() {}, async expireStaleTasks() {}, async validateCoreInvariants() {} },
+    clock: { now: fixedNow },
+    traceTerminal: throwingTrace,
+  });
+  await assert.rejects(recoverAndOpen(dependencies(true), new AbortController().signal), (error) => error === migrationError);
+  const runtime = await recoverAndOpen(dependencies(false), new AbortController().signal);
+  await runtime.close();
+
+  const hostileError = new Error("private hostile code");
+  Object.defineProperty(hostileError, "code", { get() { throw new Error("hostile getter"); } });
+  const hostileTrace: unknown[] = [];
+  const hostileDependencies = {
+    ...dependencies(false),
+    database: { async openConfigured() { throw hostileError; } },
+    traceTerminal(record: unknown) { hostileTrace.push(record); },
+  };
+  await assert.rejects(recoverAndOpen(hostileDependencies, new AbortController().signal), (error) => error === hostileError);
+  assert.deepEqual(hostileTrace, [{ stage: "open-configure", outcome: "failure", closeOutcome: "unobserved", failureCategory: "uncoded" }]);
 });

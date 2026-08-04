@@ -1,3 +1,4 @@
+import type { BootstrapTraceSink } from "../application/bootstrap/recoverAndOpen";
 import type { FaultRequest } from "./faultContract";
 
 const noOp = () => {};
@@ -8,3 +9,5 @@ export async function installFaultController(
 ): Promise<() => void> {
   return noOp;
 }
+
+export const traceBootstrap: BootstrapTraceSink | undefined = undefined;

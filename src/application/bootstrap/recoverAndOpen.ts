@@ -5,7 +5,7 @@ import {
 } from "./appRuntime.ts";
 import type { DataMutationCoordinator } from "../data/DataMutationCoordinator.ts";
 import type { ExclusiveTransactionPort, QueryRunHandle } from "../data/ExclusiveTransactionPort.ts";
-import { cleanupFailure } from "../../shared/errors/cleanupFailure.ts";
+import { cleanupFailure, isCleanupFailure } from "../../shared/errors/cleanupFailure.ts";
 
 export interface RestoreRecoveryPort {
   recover(signal: AbortSignal): Promise<void>;
@@ -39,6 +39,30 @@ export interface ClockPort {
 
 export type { AppRuntime } from "./appRuntime.ts";
 
+export type BootstrapTraceStage = "open-configure" | "migrate" | "post-migrate" | "ready";
+export type BootstrapTraceCloseOutcome = "unobserved" | "succeeded" | "failed" | "not-attempted";
+export type BootstrapTraceFailureCategory = "abort" | "cleanup" | "sqlite-open" | "sqlite" | "aggregate" | "uncoded";
+
+export type BootstrapTraceTerminal = Readonly<{
+  stage: "ready";
+  outcome: "success";
+  closeOutcome: "not-attempted";
+} | {
+  stage: Exclude<BootstrapTraceStage, "ready">;
+  outcome: "failure";
+  closeOutcome: Exclude<BootstrapTraceCloseOutcome, "not-attempted">;
+  failureCategory: BootstrapTraceFailureCategory;
+}>;
+
+export type BootstrapTraceRecord = Readonly<
+  { kind: "start"; attempt: number }
+  | ({ kind: "terminal"; attempt: number } & BootstrapTraceTerminal)
+>;
+
+export type BootstrapTraceSink = (record: BootstrapTraceRecord) => void;
+
+type BootstrapTraceTerminalSink = (record: BootstrapTraceTerminal) => void;
+
 export type RecoverAndOpenDependencies<TServices> = Readonly<{
   coordinator: DataMutationCoordinator;
   restore: RestoreRecoveryPort;
@@ -47,7 +71,45 @@ export type RecoverAndOpenDependencies<TServices> = Readonly<{
   recovery: StartupRecoveryPort;
   clock: ClockPort;
   services: AppServicesFactory<TServices>;
+  traceTerminal?: BootstrapTraceTerminalSink;
 }>;
+
+
+function failureCategory(error: unknown): BootstrapTraceFailureCategory {
+  try {
+    if (isCleanupFailure(error)) return "cleanup";
+    if (error instanceof Error && error.name === "AbortError") return "abort";
+    const code = typeof error === "object" && error !== null && "code" in error
+      ? Reflect.get(error, "code")
+      : undefined;
+    if (code === "E_SQLITE_OPEN_DATABASE") return "sqlite-open";
+    if (code === "ERR_INTERNAL_SQLITE_ERROR") return "sqlite";
+    if (error instanceof AggregateError) return "aggregate";
+  } catch {
+    return "uncoded";
+  }
+  return "uncoded";
+}
+
+function emitTerminal(
+  sink: BootstrapTraceTerminalSink | undefined,
+  record: BootstrapTraceTerminal,
+): void {
+  try {
+    sink?.(record);
+  } catch {
+    // Diagnostics must never alter bootstrap behavior.
+  }
+}
+
+function emitFailureTerminal(
+  sink: BootstrapTraceTerminalSink | undefined,
+  record: Omit<Extract<BootstrapTraceTerminal, { outcome: "failure" }>, "failureCategory">,
+  error: unknown,
+): void {
+  if (sink === undefined) return;
+  emitTerminal(sink, { ...record, failureCategory: failureCategory(error) });
+}
 
 function abortError(): Error {
   const error = new Error("Startup was aborted");
@@ -90,6 +152,7 @@ export async function recoverAndOpen<TServices>(
   signal: AbortSignal,
 ): Promise<AppRuntime<TServices>> {
   let database: StartupDatabaseHandle | undefined;
+  let stage: Exclude<BootstrapTraceStage, "ready"> = "open-configure";
   try {
     assertNotAborted(signal);
     await dependencies.coordinator.runMaintenance("restore", async () => {
@@ -98,11 +161,13 @@ export async function recoverAndOpen<TServices>(
     });
     assertNotAborted(signal);
     database = await dependencies.database.openConfigured(signal);
+    stage = "migrate";
     assertNotAborted(signal);
     await dependencies.coordinator.runMaintenance("migration", async () => {
       assertNotAborted(signal);
       await database!.migrate(signal);
     });
+    stage = "post-migrate";
     assertNotAborted(signal);
     await dependencies.coordinator.runMaintenance("album", async () => {
       assertNotAborted(signal);
@@ -123,17 +188,40 @@ export async function recoverAndOpen<TServices>(
     assertNotAborted(signal);
     const operations = new RuntimeOperationGate();
     const services = dependencies.services.create(database.transactions, operations);
+    emitTerminal(dependencies.traceTerminal, {
+      stage: "ready",
+      outcome: "success",
+      closeOutcome: "not-attempted",
+    });
     return idempotentRuntime(database, services, operations);
   } catch (startupError) {
-    if (!database) throw startupError;
+    if (!database) {
+      emitFailureTerminal(dependencies.traceTerminal, {
+        stage,
+        outcome: "failure",
+        closeOutcome: "unobserved",
+      }, startupError);
+      throw startupError;
+    }
     try {
       await database.close();
     } catch (closeError) {
-      throw cleanupFailure(
+      const failure = cleanupFailure(
         [startupError, closeError],
         "Application startup failed and closing the database also failed",
       );
+      emitFailureTerminal(dependencies.traceTerminal, {
+        stage,
+        outcome: "failure",
+        closeOutcome: "failed",
+      }, failure);
+      throw failure;
     }
+    emitFailureTerminal(dependencies.traceTerminal, {
+      stage,
+      outcome: "failure",
+      closeOutcome: "succeeded",
+    }, startupError);
     throw startupError;
   }
 }
