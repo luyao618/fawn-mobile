@@ -6,9 +6,13 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { ReadyAppServices } from "../application/bootstrap/appRuntime";
 import { type Bootstrap, BootstrapHost } from "../features/bootstrap/BootstrapHost";
+import { ChatServiceProvider } from "../features/chat/ChatServiceContext";
 import { BabyProfileScreen } from "../features/profile/BabyProfileScreen";
 import { BabyProfileServiceProvider } from "../features/profile/BabyProfileServiceContext";
-import { AlbumScreen, GrowthScreen, StewardScreen } from "../features/shell/ShellScreens";
+import { AlbumScreen, StewardScreen } from "../features/shell/ShellScreens";
+import { RecentRecordsScreen } from "../features/insights/RecentRecordsScreen";
+import { RecentRecordsServiceProvider } from "../features/insights/RecentRecordsServiceContext";
+import { ModelSettingsServiceProvider } from "../features/settings/model/ModelSettingsServiceContext";
 import { ManualTrackerScreen } from "../features/tracker/ManualTrackerScreen";
 import { ManualTrackerServiceProvider } from "../features/tracker/ManualTrackerServiceContext";
 import { colors } from "../shared/theme/tokens";
@@ -29,7 +33,7 @@ const navigationTheme: Theme = {
 const tabs: readonly { name: keyof RootTabParamList; label: string; icon: LucideIconName; component: React.ComponentType }[] = [
   { name: ROUTES.steward, label: "管家", icon: "message-circle", component: StewardScreen },
   { name: ROUTES.records, label: "记录", icon: "clipboard-list", component: ManualTrackerScreen },
-  { name: ROUTES.growth, label: "成长", icon: "chart-line", component: GrowthScreen },
+  { name: ROUTES.growth, label: "成长", icon: "chart-line", component: RecentRecordsScreen },
   { name: ROUTES.album, label: "相册", icon: "images", component: AlbumScreen },
   { name: ROUTES.me, label: "我的", icon: "circle-user-round", component: BabyProfileScreen },
 ];
@@ -87,7 +91,13 @@ export function RootNavigator({ bootstrap }: { bootstrap: Bootstrap<ReadyAppServ
       {(services) => (
         <BabyProfileServiceProvider service={services.babyProfile}>
           <ManualTrackerServiceProvider service={services.tracker}>
-            {navigation}
+            <RecentRecordsServiceProvider service={services.recentRecords}>
+              <ModelSettingsServiceProvider service={services.modelSettings}>
+                <ChatServiceProvider service={services.chat}>
+                  {navigation}
+                </ChatServiceProvider>
+              </ModelSettingsServiceProvider>
+            </RecentRecordsServiceProvider>
           </ManualTrackerServiceProvider>
         </BabyProfileServiceProvider>
       )}

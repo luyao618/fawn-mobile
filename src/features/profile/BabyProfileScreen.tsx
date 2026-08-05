@@ -25,6 +25,7 @@ import { AppFrame } from "../../shared/ui/AppFrame";
 import { InlineNotice } from "../../shared/ui/InlineNotice";
 import { useBabyProfileService } from "./BabyProfileServiceContext";
 import { useActiveLocalDayRefresh } from "./useActiveLocalDayRefresh";
+import { ModelSettingsPanel } from "../settings/model/ModelSettingsPanel";
 
 type Draft = Readonly<{
   name: string;
@@ -385,6 +386,7 @@ export function BabyProfileScreen() {
   const age = !ageRefreshFailed && snapshot ? formatExactAge(snapshot.exactAge) : null;
   return (
     <AppFrame keyboardDismissMode="on-drag" localOnly title="我的">
+      <ModelSettingsPanel />
       <View style={styles.headingGroup}>
         <Text accessibilityRole="header" allowFontScaling style={styles.sectionTitle}>宝宝资料</Text>
         <Text allowFontScaling style={styles.description}>资料只保存在本机；其他项目可以暂不填写，出生状态需选择足月或早产。</Text>

@@ -36,6 +36,13 @@ function readyRuntime(load = jest.fn(async () => ({
         async save() { throw new Error("not used"); },
       },
       tracker,
+      recentRecords: { list: jest.fn(async () => []) },
+      modelSettings: {
+        load: jest.fn(async () => null),
+        save: jest.fn(async () => { throw new Error("not used"); }),
+        clear: jest.fn(async () => ({ deletedRevisions: [], failedRevisions: [], pendingRevisions: [] })),
+      },
+      chat: { send: jest.fn(async () => { throw new Error("not used"); }) },
     },
     async close() {},
   };
@@ -72,7 +79,7 @@ test("renders exactly five accessible tabs with 管家 selected initially", asyn
 
 test.each([
   ["记录", "生长记录"],
-  ["成长", "还没有可展示的成长数据"],
+  ["成长", "最近动态"],
   ["相册", "还没有照片"],
   ["我的", "宝宝资料"],
 ])("visits %s through its accessible tab", async (label, heading) => {

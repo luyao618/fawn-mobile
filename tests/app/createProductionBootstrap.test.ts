@@ -20,7 +20,7 @@ function database(closeAsync: () => Promise<void>) {
     async withExclusiveTransactionAsync(operation: (transaction: unknown) => Promise<void>) {
       await operation({
         async getAllAsync(source: string) {
-          return source.includes("baby_profile") || source.includes("_records") ? [] : [{ total: 0 }];
+          return source.includes("baby_profile") || source.includes("_records") || source.includes("model_config") ? [] : [{ total: 0 }];
         },
         async runAsync() { return { changes: 0, lastInsertRowId: 0 }; },
       });
@@ -68,6 +68,9 @@ test("production bootstrap exposes profile and tracker services only on its read
     exactAge: expect.objectContaining({ status: "unknown", reason: "birth_date_missing" }),
   });
   const tracker = runtime.services.tracker;
+  await expect(runtime.services.recentRecords.list(50)).resolves.toEqual([]);
+  await expect(runtime.services.modelSettings.load()).resolves.toBeNull();
+  await expect(runtime.services.chat.send("宝宝今天怎么样？")).rejects.toMatchObject({ code: "not_configured" });
   await expect(tracker.list("feeding", 10)).resolves.toEqual([]);
   await expect(tracker.create("health", {
     recordDate: "2026-07-20",
@@ -110,6 +113,8 @@ test("production bootstrap exposes profile and tracker services only on its read
     "feeding-1",
     "2026-07-20T01:00:00.000Z",
   )).rejects.toBeInstanceOf(RuntimeClosingError);
+  await expect(runtime.services.recentRecords.list(50)).rejects.toBeInstanceOf(RuntimeClosingError);
+  await expect(runtime.services.modelSettings.load()).rejects.toBeInstanceOf(RuntimeClosingError);
   await first;
   expect(closeAsync).toHaveBeenCalledTimes(1);
 });
