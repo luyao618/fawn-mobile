@@ -4,8 +4,10 @@ import { StyleSheet, Text, View } from "react-native";
 
 import type { OptionalBabyProfileSnapshot } from "../../application/profile/babyProfileService";
 import { formatExactAge } from "../../domain/baby/age";
+import { AlphaChatPanel } from "../chat/AlphaChatPanel";
 import { useBabyProfileService } from "../profile/BabyProfileServiceContext";
 import { useActiveLocalDayRefresh } from "../profile/useActiveLocalDayRefresh";
+import { useOptionalModelSettingsService } from "../settings/model/ModelSettingsServiceContext";
 import { colors, radius, spacing } from "../../shared/theme/tokens";
 import { AppFrame } from "../../shared/ui/AppFrame";
 import { EmptyState } from "../../shared/ui/EmptyState";
@@ -22,6 +24,7 @@ function ReadinessRow({ label, status }: { label: string; status: string }) {
 
 export function StewardScreen() {
   const service = useBabyProfileService();
+  const modelSettings = useOptionalModelSettingsService();
   const [snapshot, setSnapshot] = useState<OptionalBabyProfileSnapshot | null>(null);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
   const requestGeneration = useRef(0);
@@ -32,6 +35,8 @@ export function StewardScreen() {
   const hasCommittedSnapshot = useRef(false);
   const mountedRef = useRef(true);
   const [ageRefreshFailed, setAgeRefreshFailed] = useState(false);
+  const [modelStatus, setModelStatus] = useState<"loading" | "missing" | "ready" | "error">("loading");
+  const [modelId, setModelId] = useState("");
 
   useEffect(() => {
     mountedRef.current = true;
@@ -73,6 +78,23 @@ export function StewardScreen() {
       replaceLoadInFlight.current = null;
     };
   }, [load]));
+
+  useFocusEffect(useCallback(() => {
+    let active = true;
+    if (!modelSettings) {
+      setModelStatus("missing");
+      return () => { active = false; };
+    }
+    setModelStatus("loading");
+    void modelSettings.load().then((settings) => {
+      if (!active) return;
+      setModelId(settings?.config.modelId ?? "");
+      setModelStatus(settings ? "ready" : "missing");
+    }).catch(() => {
+      if (active) setModelStatus("error");
+    });
+    return () => { active = false; };
+  }, [modelSettings]));
 
   const refreshCommitted = useCallback(async (): Promise<void> => {
     const generation = requestGeneration.current + 1;
@@ -117,19 +139,27 @@ export function StewardScreen() {
           localDate: "",
           timeZone: "",
         }) ?? "出生日期待填";
+  const modelStatusText = modelStatus === "loading"
+    ? "读取中"
+    : modelStatus === "ready"
+      ? modelId
+      : modelStatus === "error"
+        ? "暂不可用"
+        : "未设置";
   return (
     <AppFrame localOnly title="管家">
       <EmptyState
-        description={snapshot?.profile ? "宝宝资料已从本机读取；模型连接尚未设置。" : "填写宝宝资料后，可在这里查看准确的本地年龄状态。"}
+        description={snapshot?.profile ? "宝宝资料已从本机读取，可用于下方问答。" : "填写宝宝资料后，管家回答会获得准确年龄上下文。"}
         title={snapshot?.profile ? "宝宝资料已保存在本机" : "照护空间尚未设置"}
       >
         <View style={styles.readiness}>
           <ReadinessRow label="宝宝资料" status={profileStatus} />
           <ReadinessRow label="宝宝年龄" status={ageStatus} />
-          <ReadinessRow label="模型连接" status="未设置" />
+          <ReadinessRow label="模型连接" status={modelStatusText} />
         </View>
         <InlineNotice>宝宝资料只从本机读取；当前页面不会发送宝宝数据。</InlineNotice>
       </EmptyState>
+      <AlphaChatPanel />
     </AppFrame>
   );
 }
@@ -138,7 +168,6 @@ function DestinationScreen({ title, heading, description }: { title: string; hea
   return <AppFrame title={title}><EmptyState description={description} title={heading} /></AppFrame>;
 }
 
-export const GrowthScreen = () => <DestinationScreen description="有真实的本地记录后，成长信息才会显示在这里。" heading="还没有可展示的成长数据" title="成长" />;
 export const AlbumScreen = () => <DestinationScreen description="照片导入功能尚未启用，当前不会请求相册权限。" heading="还没有照片" title="相册" />;
 
 const styles = StyleSheet.create({

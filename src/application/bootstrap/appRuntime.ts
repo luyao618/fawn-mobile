@@ -1,5 +1,8 @@
 import type { ExclusiveTransactionPort } from "../data/ExclusiveTransactionPort.ts";
+import type { AlphaChatServicePort } from "../chat/alphaChatService.ts";
+import type { RecentRecordsServicePort } from "../insights/recentRecordsService.ts";
 import type { BabyProfileServicePort } from "../profile/babyProfileService.ts";
+import type { ModelSettingsServicePort } from "../settings/modelSettingsService.ts";
 import type { ManualTrackerServicePort } from "../tracker/manualTrackerService.ts";
 
 export interface AppServices {
@@ -8,6 +11,9 @@ export interface AppServices {
 
 export interface ReadyAppServices extends AppServices {
   readonly tracker: ManualTrackerServicePort;
+  readonly recentRecords: RecentRecordsServicePort;
+  readonly modelSettings: ModelSettingsServicePort;
+  readonly chat: AlphaChatServicePort;
 }
 
 export interface RuntimeOperationPort {

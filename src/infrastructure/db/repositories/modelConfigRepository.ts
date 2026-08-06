@@ -89,4 +89,13 @@ export class ModelConfigRepository {
     );
     return Object.freeze({ ...config, secretRevision, updatedAt });
   }
+
+  async clear(transaction: QueryRunHandle): Promise<number | null> {
+    const current = await this.load(transaction);
+    if (!current) return null;
+    await transaction.run("DELETE FROM model_capabilities");
+    const result = await transaction.run("DELETE FROM model_config WHERE singleton_id = ? AND secret_revision = ?", [1, current.secretRevision]);
+    if (result.changes !== 1) throw new Error("Model settings changed while being cleared");
+    return current.secretRevision;
+  }
 }

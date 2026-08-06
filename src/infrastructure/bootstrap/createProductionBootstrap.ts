@@ -1,8 +1,16 @@
 import type { AppRuntime, AppServices, ReadyAppServices } from "../../application/bootstrap/appRuntime.ts";
+import { AlphaChatService } from "../../application/chat/alphaChatService.ts";
 import { recoverAndOpen, type StartupDatabaseHandle } from "../../application/bootstrap/recoverAndOpen.ts";
 import { DataMutationCoordinator } from "../../application/data/DataMutationCoordinator.ts";
+import { RecentRecordsService } from "../../application/insights/recentRecordsService.ts";
 import { BabyProfileService } from "../../application/profile/babyProfileService.ts";
+import {
+  ModelSettingsService,
+  type ModelSecretInput,
+  type ModelSettingsServicePort,
+} from "../../application/settings/modelSettingsService.ts";
 import { ManualTrackerService, type LocalIdGenerator } from "../../application/tracker/manualTrackerService.ts";
+import type { ModelConfigInput } from "../../domain/model/config.ts";
 import { ExpoSqliteExclusiveTransactionAdapter } from "../db/exclusiveTransaction.ts";
 import { applyUserDatabaseMigrations } from "../db/migrations/index.ts";
 import { openConfiguredDatabase } from "../db/openDatabase.ts";
@@ -10,6 +18,10 @@ import { StartupRecoveryRepository } from "../db/repositories/startupRecoveryRep
 import { BabyProfileRepository } from "../db/repositories/babyProfileRepository.ts";
 import { RepositoryTrackerConflictClassifier } from "../db/repositories/trackerConflictClassifier.ts";
 import { TrackerRepository } from "../db/repositories/trackerRepository.ts";
+import { ModelConfigRepository } from "../db/repositories/modelConfigRepository.ts";
+import { expoSecureStoreAdapter } from "../secrets/expoSecureStoreAdapter.ts";
+import { RevisionedSecureStore } from "../secrets/revisionedSecureStore.ts";
+import { ChatCompletionsClient } from "../model/chatCompletionsClient.ts";
 import { IntlDeviceCalendar } from "../time/deviceCalendar.ts";
 import { RejectPendingAlbumRecovery } from "./albumRecoveryBoundary.ts";
 import { isCleanupFailure, cleanupFailure, type CleanupFailure } from "../../shared/errors/cleanupFailure.ts";
@@ -35,6 +47,8 @@ export function createProductionBootstrap(): ProductionBootstrap<ReadyAppService
   const recovery = new StartupRecoveryRepository();
   const profiles = new BabyProfileRepository();
   const trackers = new TrackerRepository();
+  const modelConfigs = new ModelConfigRepository();
+  const modelSecrets = new RevisionedSecureStore(expoSecureStoreAdapter);
   const trackerConflicts = new RepositoryTrackerConflictClassifier();
   const calendar = new IntlDeviceCalendar();
   const clock = { now: () => new Date().toISOString() };
@@ -63,23 +77,42 @@ export function createProductionBootstrap(): ProductionBootstrap<ReadyAppService
         clock,
         services: {
           create(transactions, operations): ReadyAppServices {
-            return Object.freeze({
-              babyProfile: new BabyProfileService(
-                transactions,
-                coordinator,
-                profiles,
-                calendar,
-                operations,
+            const tracker = new ManualTrackerService(
+              transactions,
+              coordinator,
+              trackers,
+              trackers,
+              trackerConflicts,
+              clock,
+              trackerIds,
+              operations,
+            );
+            const storedModelSettings = new ModelSettingsService(transactions, coordinator, modelConfigs, modelSecrets);
+            const modelSettings: ModelSettingsServicePort = Object.freeze({
+              load: () => operations.run(() => storedModelSettings.load()),
+              save: (input: ModelConfigInput, secrets: ModelSecretInput, updatedAt: string) => (
+                operations.run(() => storedModelSettings.save(input, secrets, updatedAt))
               ),
-              tracker: new ManualTrackerService(
-                transactions,
-                coordinator,
-                trackers,
-                trackers,
-                trackerConflicts,
-                clock,
-                trackerIds,
-                operations,
+              clear: (updatedAt: string) => operations.run(() => storedModelSettings.clear(updatedAt)),
+            });
+            const babyProfile = new BabyProfileService(
+              transactions,
+              coordinator,
+              profiles,
+              calendar,
+              operations,
+            );
+            const recentRecords = new RecentRecordsService(tracker, calendar);
+            return Object.freeze({
+              babyProfile,
+              tracker,
+              recentRecords,
+              modelSettings,
+              chat: new AlphaChatService(
+                modelSettings,
+                babyProfile,
+                recentRecords,
+                new ChatCompletionsClient((input, init) => fetch(input, init)),
               ),
             });
           },

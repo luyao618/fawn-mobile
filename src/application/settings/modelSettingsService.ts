@@ -11,6 +11,7 @@ export interface ModelConfigStore {
     secretRevision: number,
     updatedAt: string,
   ): Promise<ModelConfig & Readonly<{ secretRevision: number; updatedAt: string }>>;
+  clear(transaction: QueryRunHandle): Promise<number | null>;
 }
 
 export interface ModelSecretStore {
@@ -32,6 +33,12 @@ export type SecretCleanupResult = Readonly<{
   failedRevisions: readonly number[];
   pendingRevisions: readonly number[];
 }>;
+
+export interface ModelSettingsServicePort {
+  save(input: ModelConfigInput, secretInput: ModelSecretInput, updatedAt: string): Promise<LoadedModelSettings>;
+  load(): Promise<LoadedModelSettings | null>;
+  clear(updatedAt: string): Promise<SecretCleanupResult>;
+}
 
 export class ModelSettingsUnavailableError extends Error {
   constructor() {
@@ -186,7 +193,7 @@ async function coordinationState(
 
 class PublicationConflictError extends Error {}
 
-export class ModelSettingsService {
+export class ModelSettingsService implements ModelSettingsServicePort {
   constructor(
     private readonly transactions: ExclusiveTransactionPort,
     private readonly coordinator: DataMutationCoordinator,
@@ -298,6 +305,21 @@ export class ModelSettingsService {
       }
     }
     throw new ModelSettingsUnavailableError();
+  }
+
+  async clear(updatedAt: string): Promise<SecretCleanupResult> {
+    return this.coordinator.runUserWrite(async () => {
+      await this.transactions.runExclusive(async (transaction) => {
+        const current = await this.configs.load(transaction);
+        if (!current) return null;
+        const state = await coordinationState(transaction, current.secretRevision, updatedAt);
+        const revision = await this.configs.clear(transaction);
+        if (revision !== current.secretRevision) throw new PublicationConflictError();
+        await putMeta(transaction, CLEANUP_PENDING_KEY, appendPendingRevision(state.pending, revision), updatedAt);
+        return revision;
+      });
+      return this.cleanupUnreferencedSecretsAlreadyAdmitted(16, updatedAt);
+    });
   }
 
   async cleanupUnreferencedSecrets(limit = 16, updatedAt = new Date().toISOString()): Promise<SecretCleanupResult> {

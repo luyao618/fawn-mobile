@@ -596,6 +596,29 @@ test("rollback plus cleanup failure preserves both errors and later restart remo
   assert.deepEqual(Object.keys(controlled.persistent.entries()), ["fawn-mobile.model-secrets.v1.3"]);
 });
 
+test("clearing model settings removes the SQLite pointer and active SecureStore revision", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "fawn-settings-clear-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const database = new SQLiteTestDatabase(join(directory, "user.db"));
+  context.after(() => database.closeAsync());
+  await database.migrate();
+  const persistent = new PersistentFakeSecureStore(join(directory, "secure.json"));
+  const settings = service(database, persistent);
+  const saved = await settings.save(bearerConfig, { bearerToken: apiSentinel }, timestamp);
+
+  const cleanup = await settings.clear(later);
+
+  assert.deepEqual(cleanup, {
+    deletedRevisions: [saved.secrets.revision],
+    failedRevisions: [],
+    pendingRevisions: [],
+  });
+  assert.equal(await settings.load(), null);
+  assert.equal(await new RevisionedSecureStore(persistent).load(saved.secrets.revision), null);
+  const [row] = await database.getAllAsync<{ total: number }>("SELECT COUNT(*) AS total FROM model_config");
+  assert.equal(row?.total, 0);
+});
+
 test("IT-001/profile reopens the singleton with its local date unchanged and recomputes exact age", async (context) => {
   const directory = mkdtempSync(join(tmpdir(), "fawn-profile-reopen-"));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
